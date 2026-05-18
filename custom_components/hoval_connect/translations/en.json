@@ -97,6 +97,9 @@
       "weather_condition": {
         "name": "Weather"
       },
+      "weather_temperature": {
+        "name": "Forecast temperature"
+      },
       "flow_temp_actual": {
         "name": "Flow temperature"
       },
