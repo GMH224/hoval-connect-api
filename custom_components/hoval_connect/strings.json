@@ -124,6 +124,21 @@
       "operating_hours_over_50": {
         "name": "Operating hours >50%"
       },
+      "operating_hours_el_heater": {
+        "name": "Electric auxiliary heater operating hours"
+      },
+      "operation_cycles_el_heater": {
+        "name": "Electric auxiliary heater switching cycles"
+      },
+      "heat_amount_el_heater": {
+        "name": "Electric auxiliary heater heat produced"
+      },
+      "energy_el_heater": {
+        "name": "Electric auxiliary heater energy consumed"
+      },
+      "el_heater_active": {
+        "name": "Electric auxiliary heater active"
+      },
       "operation_cycles": {
         "name": "Switching cycles"
       },
