@@ -220,14 +220,14 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         circuit_types=frozenset({CIRCUIT_TYPE_BL}),
         value_fn=lambda c: c.live_values.get("totalEnergy"),
     ),
-    # Status diagnostic sensors
+    # Status diagnostic sensors — sourced from the circuit list response, not live values
     HovalSensorEntityDescription(
         key="circuit_status_bl",
         translation_key="circuit_status_bl",
         icon="mdi:heat-pump",
         entity_category=EntityCategory.DIAGNOSTIC,
         circuit_types=frozenset({CIRCUIT_TYPE_BL}),
-        value_fn=lambda c: c.live_values.get("circuitStatus"),
+        value_fn=lambda c: c.circuit_status,
     ),
     HovalSensorEntityDescription(
         key="circuit_status_hk",
@@ -235,7 +235,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         icon="mdi:radiator",
         entity_category=EntityCategory.DIAGNOSTIC,
         circuit_types=frozenset({CIRCUIT_TYPE_HK}),
-        value_fn=lambda c: c.live_values.get("circuitStatus"),
+        value_fn=lambda c: c.circuit_status,
     ),
     HovalSensorEntityDescription(
         key="circuit_status_ww",
@@ -243,7 +243,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         icon="mdi:water-boiler",
         entity_category=EntityCategory.DIAGNOSTIC,
         circuit_types=frozenset({CIRCUIT_TYPE_WW}),
-        value_fn=lambda c: c.live_values.get("circuitStatus"),
+        value_fn=lambda c: c.circuit_status,
     ),
     # WW (Warm Water) sensors
     HovalSensorEntityDescription(

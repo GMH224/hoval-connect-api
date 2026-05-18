@@ -116,6 +116,7 @@ class HovalCircuitData:
     target_value: float | None = None
     is_air_quality_guided: bool = False
     has_error: bool = False
+    circuit_status: str | None = None
     live_values: dict[str, str] = field(default_factory=dict)
     active_week_name: str | None = None
     active_day_program_name: str | None = None
@@ -358,6 +359,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                         target_value=circuit.get("targetValue"),
                         is_air_quality_guided=bool(air_quality.get("isAirQualityGuided")),
                         has_error=circuit.get("hasError", False),
+                        circuit_status=circuit.get("circuitStatus"),
                     )
 
                     # Check program cache
