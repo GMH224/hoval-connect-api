@@ -29,7 +29,7 @@ The integration lives in `custom_components/hoval_connect/`. User setup is email
 - `climate.py` — HK heating: target temp, HVAC modes (heat/auto/off)
 - `fan.py` — HV ventilation: speed slider 0–100%, on/off (standby ↔ temporary-change), debounced 1.5s
 - `select.py` — Program selection (week1/week2/ecoMode/standby/constant) with user-defined names; applies to HV, HK, **and WW** circuits
-- `sensor.py` — Circuit-type-filtered sensors (HV/HK/BL/WW) + 6 plant-level sensors (events, weather); includes `circuit_status` diagnostic sensor for BL, HK, and WW
+- `sensor.py` — Circuit-type-filtered sensors (HV/HK/BL/WW) + 6 plant-level sensors (events, weather); includes `circuit_status` diagnostic sensor for BL, HK, and WW (sourced from the circuit list response `circuitStatus` field, stored on `HovalCircuitData.circuit_status`)
 - `binary_sensor.py` — Plant online status + error/warning status
 - `diagnostics.py` — Diagnostic export with PII redaction
 - `const.py` — API URLs, OAuth client ID, token TTLs, polling interval, circuit types, duration enums
@@ -130,7 +130,10 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
+### v0.15.1
+- **Bugfix — circuit status sensors**: v0.15.0 read `circuitStatus` from `live_values` (the statistics API key-value pairs), but this field is not part of the live-values response. It is returned by the circuit list endpoint (`CircuitV3DTO.circuitStatus`). Fix: added `circuit_status: str | None` field to `HovalCircuitData`, populated from `circuit.get("circuitStatus")` in `coordinator.py`, and updated all three sensor `value_fn` lambdas to read `c.circuit_status` directly.
+
 ### v0.15.0
-- **WW program control**: Hot water (Warmwasser) circuits now expose a `Program` select entity (same week1/week2/ecoMode/standby/constant options as heating circuits). Implementation: `select.py` now includes `CIRCUIT_TYPE_WW` in the supported circuit types filter.
-- **Circuit status diagnostics**: Added a `circuit_status` diagnostic sensor for heat generator (BL), heating circuit (HK), and hot water (WW) devices. Each reads the `circuitStatus` live value and appears under the respective device's Diagnostic section in HA. New translation keys: `circuit_status_bl`, `circuit_status_hk`, `circuit_status_ww`.
-- **Translation fix**: `translations/en.json` now includes all HK/BL/WW sensor names that were already present in `strings.json` (they were missing from the English translation file).
+- **WW program control**: Hot water (Warmwasser) circuits now expose a `Program` select entity (same week1/week2/ecoMode/standby/constant options as heating circuits).
+- **Circuit status diagnostics**: Added a `circuit_status` diagnostic sensor for heat generator (BL), heating circuit (HK), and hot water (WW) devices.
+- **Translation fix**: `translations/en.json` now includes all HK/BL/WW sensor names that were already present in `strings.json`.
