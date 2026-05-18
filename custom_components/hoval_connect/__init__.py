@@ -25,6 +25,7 @@ PLATFORMS = [
     Platform.FAN,
     Platform.SELECT,
     Platform.SENSOR,
+    Platform.WATER_HEATER,
 ]
 
 type HovalConnectConfigEntry = ConfigEntry[HovalRuntimeData]
