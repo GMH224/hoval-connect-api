@@ -29,7 +29,8 @@ The integration lives in `custom_components/hoval_connect/`. User setup is email
 - `climate.py` — HK heating: target temp, HVAC modes (heat/auto/off)
 - `fan.py` — HV ventilation: speed slider 0–100%, on/off (standby ↔ temporary-change), debounced 1.5s
 - `select.py` — Program selection (week1/week2/ecoMode/standby/constant) with user-defined names; applies to HV, HK, **and WW** circuits
-- `sensor.py` — Circuit-type-filtered sensors (HV/HK/BL/WW) + 6 plant-level sensors (events, weather); includes `circuit_status` diagnostic sensor for BL, HK, and WW (sourced from the circuit list response `circuitStatus` field, stored on `HovalCircuitData.circuit_status`)
+- `sensor.py` — Circuit-type-filtered sensors (HV/HK/BL/WW) + 6 plant-level sensors (events, weather); includes `circuit_status` diagnostic sensor for BL, HK, and WW (sourced from `HovalCircuitData.circuit_status`, populated from `CircuitV3DTO.circuitStatus` in the circuit list response)
+- `water_heater.py` — WW hot water entity (`WaterHeaterEntity`); exposes current/target temperature and operation modes heat_pump / high_demand / off; `set_temperature` posts a `midnight`-duration temporary-change override; `set_operation_mode` switches between week-program and standby
 - `binary_sensor.py` — Plant online status + error/warning status
 - `diagnostics.py` — Diagnostic export with PII redaction
 - `const.py` — API URLs, OAuth client ID, token TTLs, polling interval, circuit types, duration enums
@@ -130,10 +131,16 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
+### v0.15.2
+- **WaterHeater entity for WW circuits** (`water_heater.py`, new file): Adds a proper `WaterHeaterEntity` for each WW circuit. Exposes current temperature (`tempSf1Actual`), target temperature (`tempTarget`), and three operation modes: `heat_pump` (normal week-program), `high_demand` (temporary override active), `off` (standby). `set_temperature()` calls `set_temporary_change` with `duration=midnight` so the override auto-expires at 00:00 with no cleanup needed. `set_operation_mode()` maps heat_pump/high_demand → `reset_circuit` and off → standby program.
+- **Solar boost automation** (`automations.yaml`): Two automations — one fires at `input_datetime.max_solar_start_time` and calls `water_heater.set_temperature` with the value from `input_number.ww_boost_temperature`; the second fires at 11:00 and calls `water_heater.set_operation_mode: heat_pump` to cancel the override.
+- **Boost temperature helper** (`helpers.yaml`): `input_number.ww_boost_temperature` (40–65 °C, default 50 °C) for setting the boost target from the HA UI.
+- Also includes all changes from v0.15.0 and v0.15.1.
+
 ### v0.15.1
-- **Bugfix — circuit status sensors**: v0.15.0 read `circuitStatus` from `live_values` (the statistics API key-value pairs), but this field is not part of the live-values response. It is returned by the circuit list endpoint (`CircuitV3DTO.circuitStatus`). Fix: added `circuit_status: str | None` field to `HovalCircuitData`, populated from `circuit.get("circuitStatus")` in `coordinator.py`, and updated all three sensor `value_fn` lambdas to read `c.circuit_status` directly.
+- **Bugfix — circuit status sensors**: `circuitStatus` is a field on the circuit list response (`CircuitV3DTO`), not in the live-values key-value array. Added `circuit_status: str | None` to `HovalCircuitData`, populated from `circuit.get("circuitStatus")` in coordinator. Sensor `value_fn` lambdas now read `c.circuit_status`.
 
 ### v0.15.0
-- **WW program control**: Hot water (Warmwasser) circuits now expose a `Program` select entity (same week1/week2/ecoMode/standby/constant options as heating circuits).
-- **Circuit status diagnostics**: Added a `circuit_status` diagnostic sensor for heat generator (BL), heating circuit (HK), and hot water (WW) devices.
-- **Translation fix**: `translations/en.json` now includes all HK/BL/WW sensor names that were already present in `strings.json`.
+- **WW program control**: Hot water circuits now expose a `Program` select entity.
+- **Circuit status diagnostics**: Diagnostic `circuit_status` sensor for BL, HK, WW.
+- **Translation fix**: `translations/en.json` synced with `strings.json`.
