@@ -141,6 +141,15 @@
       },
       "ww_temp_bottom": {
         "name": "Hot water temperature bottom"
+      },
+      "circuit_status_bl": {
+        "name": "Heat generator status"
+      },
+      "circuit_status_hk": {
+        "name": "Heating circuit status"
+      },
+      "circuit_status_ww": {
+        "name": "Hot water status"
       }
     },
     "climate": {

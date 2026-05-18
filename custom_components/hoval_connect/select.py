@@ -13,7 +13,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import HovalConnectConfigEntry, circuit_device_info
 from .api import HovalApiError
-from .const import CIRCUIT_TYPE_HK, CIRCUIT_TYPE_HV, OPERATION_MODE_REGULAR
+from .const import CIRCUIT_TYPE_HK, CIRCUIT_TYPE_HV, CIRCUIT_TYPE_WW, OPERATION_MODE_REGULAR
 from .coordinator import SIGNAL_NEW_CIRCUITS, HovalCircuitData, HovalDataCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ async def async_setup_entry(
         for plant_id, plant_data in coordinator.data.plants.items():
             for path, circuit in plant_data.circuits.items():
                 uid = f"{plant_id}_{path}_program"
-                if circuit.circuit_type not in (CIRCUIT_TYPE_HV, CIRCUIT_TYPE_HK) or uid in known:
+                if circuit.circuit_type not in (CIRCUIT_TYPE_HV, CIRCUIT_TYPE_HK, CIRCUIT_TYPE_WW) or uid in known:
                     continue
                 known.add(uid)
                 entities.append(HovalProgramSelect(coordinator, plant_id, path, circuit))
