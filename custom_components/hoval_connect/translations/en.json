@@ -152,6 +152,11 @@
         "name": "Hot water status"
       }
     },
+    "water_heater": {
+      "hot_water": {
+        "name": "Hot water"
+      }
+    },
     "climate": {
       "heating": {
         "name": "Heating"
