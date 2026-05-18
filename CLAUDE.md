@@ -131,6 +131,15 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
+### v0.15.3
+- **Electric auxiliary heater sensors** (`sensor.py`): Adds 5 sensors for BL circuits covering the auxiliary electric heating element (distinct from the heat pump compressor):
+  - `operating_hours_el_heater` — cumulative runtime (`operatingHoursElHeater`, hours, `TOTAL_INCREASING`)
+  - `operation_cycles_el_heater` — start/stop cycle count (`operationCyclesElHeater`, `TOTAL_INCREASING`)
+  - `heat_amount_el_heater` — thermal energy produced (`heatAmountElHeater`, MWh, `TOTAL_INCREASING`)
+  - `energy_el_heater` — electrical energy consumed (`energyElHeater`, MWh, `TOTAL_INCREASING`)
+  - `el_heater_active` — current active status (`elHeaterActive`, diagnostic string/bool)
+  - All scoped to `CIRCUIT_TYPE_BL`. Live-value keys follow Hoval's established camelCase pattern but are unconfirmed — verify against the `Circuit <path> live_values: {...}` debug log line and adjust `value_fn` lambdas if needed.
+
 ### v0.15.2
 - **WaterHeater entity for WW circuits** (`water_heater.py`, new file): Adds a proper `WaterHeaterEntity` for each WW circuit. Exposes current temperature (`tempSf1Actual`), target temperature (`tempTarget`), and three operation modes: `heat_pump` (normal week-program), `high_demand` (temporary override active), `off` (standby). `set_temperature()` calls `set_temporary_change` with `duration=midnight` so the override auto-expires at 00:00 with no cleanup needed. `set_operation_mode()` maps heat_pump/high_demand → `reset_circuit` and off → standby program.
 - **Solar boost automation** (`automations.yaml`): Two automations — one fires at `input_datetime.max_solar_start_time` and calls `water_heater.set_temperature` with the value from `input_number.ww_boost_temperature`; the second fires at 11:00 and calls `water_heater.set_operation_mode: heat_pump` to cancel the override.
