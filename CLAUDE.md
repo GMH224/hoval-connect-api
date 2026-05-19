@@ -30,10 +30,11 @@ The integration lives in `custom_components/hoval_connect/`. User setup is email
 - `fan.py` — HV ventilation: speed slider 0–100%, on/off (standby ↔ temporary-change), debounced 1.5s
 - `select.py` — Program selection (week1/week2/ecoMode/standby/constant) with user-defined names; applies to HV, HK, **and WW** circuits
 - `sensor.py` — Circuit-type-filtered sensors (HV/HK/BL/WW) + 6 plant-level sensors (events, weather); includes `circuit_status` diagnostic sensor for BL, HK, and WW (sourced from `HovalCircuitData.circuit_status`, populated from `CircuitV3DTO.circuitStatus` in the circuit list response)
-- `water_heater.py` — WW hot water entity (`WaterHeaterEntity`); exposes current/target temperature and operation modes heat_pump / high_demand / off; `set_temperature` posts a `midnight`-duration temporary-change override; `set_operation_mode` switches between week-program and standby; `reset_temporary_change` service cancels the active override via DELETE (identical to the Hoval app reset button)
+- `water_heater.py` — WW hot water entity (`WaterHeaterEntity`); exposes current/target temperature and operation modes heat_pump / high_demand / off; `set_temperature` posts a `midnight`-duration temporary-change override; `set_operation_mode` switches between week-program and standby; registers the `reset_ww_boost` entity service via `async_get_current_platform()` → `async_register_entity_service`, which calls `async_reset_temporary_change` (DELETEs the temporary-change endpoint without touching the week program)
 - `binary_sensor.py` — Plant online status + error/warning status
 - `diagnostics.py` — Diagnostic export with PII redaction
-- `const.py` — API URLs, OAuth client ID, token TTLs, polling interval, circuit types, duration enums
+- `const.py` — API URLs, OAuth client ID, token TTLs, polling interval, circuit types, duration enums, `SERVICE_RESET_WW_BOOST`
+- `services.yaml` — Declares the `reset_ww_boost` service to HA (entity target: `water_heater` + integration `hoval_connect`); makes it discoverable in Developer Tools and the automation editor
 - `__init__.py` — Entry setup, platform forwarding, `plant_device_info`/`circuit_device_info` helpers
 
 ### Entity architecture
@@ -132,7 +133,21 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 ## Changelog
 
 ### v0.15.4
-- **Reset temporary change service** (`water_heater.py`): Adds a new `water_heater.reset_temporary_change` entity service for WW circuits. Calls `DELETE /v3/.../temporary-change` — the same API call as pressing the reset button in the Hoval app. Unlike `set_operation_mode: heat_pump` (which forces `programs/week1`), this cancels the override without changing the active program, so week2 users are unaffected. Registered via `platform.async_register_entity_service`; callable on any `water_heater` entity backed by `HovalWaterHeater`. Service description added to `strings.json` and `translations/en.json`. The `automations.yaml` solar boost end automation updated to use the new service.
+- **`reset_ww_boost` entity service** (`water_heater.py`, `services.yaml`, `const.py`, `strings.json`, `translations/en.json`): Adds a dedicated HA service to cancel an active temporary WW temperature override and immediately resume the week program — identical to pressing "reset" in the Hoval app.
+  - API call: `DELETE /v3/plants/{plantId}/circuits/{circuitPath}/temporary-change` (already present as `api.reset_temporary_change()`; no API changes needed).
+  - Registered as an entity service via `async_get_current_platform().async_register_entity_service(SERVICE_RESET_WW_BOOST, {}, "async_reset_temporary_change")` in `async_setup_entry`; targets `WaterHeaterEntity` instances only.
+  - Service name constant `SERVICE_RESET_WW_BOOST = "reset_ww_boost"` added to `const.py`.
+  - `services.yaml` (new file) declares the service target so it appears in Developer Tools and the automation editor UI.
+  - `strings.json` and `translations/en.json` extended with a `"services"` block containing the human-readable name and description.
+  - Safe to call when no temporary change is active — the API treats it as a no-op.
+  - Does **not** switch the circuit to standby or modify any week program; only removes the temporary override layer.
+  - Example automation usage:
+    ```yaml
+    action:
+      - service: hoval_connect.reset_ww_boost
+        target:
+          entity_id: water_heater.hoval_hot_water
+    ```
 
 ### v0.15.3
 - **Electric auxiliary heater sensors** (`sensor.py`): Adds 5 sensors for BL circuits covering the auxiliary electric heating element (distinct from the heat pump compressor):
