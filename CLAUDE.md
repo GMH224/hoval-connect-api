@@ -30,7 +30,7 @@ The integration lives in `custom_components/hoval_connect/`. User setup is email
 - `fan.py` — HV ventilation: speed slider 0–100%, on/off (standby ↔ temporary-change), debounced 1.5s
 - `select.py` — Program selection (week1/week2/ecoMode/standby/constant) with user-defined names; applies to HV, HK, **and WW** circuits
 - `sensor.py` — Circuit-type-filtered sensors (HV/HK/BL/WW) + 6 plant-level sensors (events, weather); includes `circuit_status` diagnostic sensor for BL, HK, and WW (sourced from `HovalCircuitData.circuit_status`, populated from `CircuitV3DTO.circuitStatus` in the circuit list response)
-- `water_heater.py` — WW hot water entity (`WaterHeaterEntity`); exposes current/target temperature and operation modes heat_pump / high_demand / off; `set_temperature` posts a `midnight`-duration temporary-change override; `set_operation_mode` switches between week-program and standby
+- `water_heater.py` — WW hot water entity (`WaterHeaterEntity`); exposes current/target temperature and operation modes heat_pump / high_demand / off; `set_temperature` posts a `midnight`-duration temporary-change override; `set_operation_mode` switches between week-program and standby; `reset_temporary_change` service cancels the active override via DELETE (identical to the Hoval app reset button)
 - `binary_sensor.py` — Plant online status + error/warning status
 - `diagnostics.py` — Diagnostic export with PII redaction
 - `const.py` — API URLs, OAuth client ID, token TTLs, polling interval, circuit types, duration enums
@@ -130,6 +130,9 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 - HK climate entity: `set_temperature` sends value as integer — may need adjustment for different HK circuit models (some use tenths of degree)
 
 ## Changelog
+
+### v0.15.4
+- **Reset temporary change service** (`water_heater.py`): Adds a new `water_heater.reset_temporary_change` entity service for WW circuits. Calls `DELETE /v3/.../temporary-change` — the same API call as pressing the reset button in the Hoval app. Unlike `set_operation_mode: heat_pump` (which forces `programs/week1`), this cancels the override without changing the active program, so week2 users are unaffected. Registered via `platform.async_register_entity_service`; callable on any `water_heater` entity backed by `HovalWaterHeater`. Service description added to `strings.json` and `translations/en.json`. The `automations.yaml` solar boost end automation updated to use the new service.
 
 ### v0.15.3
 - **Electric auxiliary heater sensors** (`sensor.py`): Adds 5 sensors for BL circuits covering the auxiliary electric heating element (distinct from the heat pump compressor):
