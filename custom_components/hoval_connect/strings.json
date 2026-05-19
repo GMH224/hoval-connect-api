@@ -45,20 +45,6 @@
       }
     }
   },
-  "services": {
-    "reset_temporary_change": {
-      "name": "Reset temporary temperature",
-      "description": "Cancels the active temporary temperature override and returns control to the Hoval week program. Equivalent to pressing the reset button in the Hoval app. Unlike switching to heat_pump mode, this does not change the active program.",
-      "target": {
-        "entity": [
-          {
-            "domain": "water_heater",
-            "integration": "hoval_connect"
-          }
-        ]
-      }
-    }
-  },
   "entity": {
     "binary_sensor": {
       "plant_online": {
@@ -200,6 +186,12 @@
       "program": {
         "name": "Program"
       }
+    }
+  },
+  "services": {
+    "reset_ww_boost": {
+      "name": "Reset hot water boost",
+      "description": "Cancels any active temporary hot water temperature adjustment and immediately resumes the active week program. This is the same action as pressing 'reset' in the Hoval app. Safe to call when no override is active."
     }
   }
 }
