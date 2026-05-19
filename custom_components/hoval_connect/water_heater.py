@@ -15,7 +15,7 @@ from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddEntitiesCallback, async_get_current_platform
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import HovalConnectConfigEntry, circuit_device_info
@@ -65,6 +65,16 @@ async def async_setup_entry(
         _add_new()
 
     entry.async_on_unload(async_dispatcher_connect(hass, SIGNAL_NEW_CIRCUITS, _on_new_circuits))
+
+    # Register custom entity service: cancels the active temporary-change override
+    # via DELETE /v3/.../temporary-change — identical to the reset button in the Hoval app.
+    # Called as: service: water_heater.reset_temporary_change
+    platform = async_get_current_platform()
+    platform.async_register_entity_service(
+        "reset_temporary_change",
+        {},
+        "async_reset_temporary_change",
+    )
 
 
 class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntity):
@@ -216,3 +226,29 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
                 )
         except HovalApiError as err:
             raise HomeAssistantError(f"Failed to set operation mode: {err}") from err
+
+    async def async_reset_temporary_change(self) -> None:
+        """Cancel the active temporary temperature override.
+
+        Sends DELETE /v3/.../temporary-change — the same action as pressing the
+        reset button in the Hoval app. The circuit immediately resumes whichever
+        week program it was on before the override was applied, without forcing a
+        specific program (unlike set_operation_mode which defaults to week1).
+        """
+        _LOGGER.debug(
+            "WW reset_temporary_change: circuit=%s",
+            self._circuit_path,
+        )
+        try:
+            await self.coordinator.async_control_and_refresh(
+                self.coordinator.api.reset_temporary_change(
+                    self._plant_id,
+                    self._circuit_path,
+                ),
+                circuit_path=self._circuit_path,
+                mode_override="REGULAR",
+            )
+        except HovalApiError as err:
+            raise HomeAssistantError(
+                f"Failed to reset hot water temporary change: {err}"
+            ) from err
