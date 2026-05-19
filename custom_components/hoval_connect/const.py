@@ -70,5 +70,5 @@ TURN_ON_WEEK2 = "week2"
 CONF_TURN_ON_MODE = "turn_on_mode"
 DEFAULT_TURN_ON_MODE = TURN_ON_RESUME
 
-# Service names
+# Custom Services
 SERVICE_RESET_WW_BOOST = "reset_ww_boost"
