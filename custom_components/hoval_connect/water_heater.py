@@ -15,12 +15,12 @@ from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity_platform import AddEntitiesCallback, async_get_current_platform
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import HovalConnectConfigEntry, circuit_device_info
 from .api import HovalApiError
-from .const import CIRCUIT_TYPE_WW, OPERATION_MODE_STANDBY, SERVICE_RESET_WW_BOOST
+from .const import CIRCUIT_TYPE_WW, OPERATION_MODE_STANDBY
 from .coordinator import SIGNAL_NEW_CIRCUITS, HovalCircuitData, HovalDataCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -65,15 +65,6 @@ async def async_setup_entry(
         _add_new()
 
     entry.async_on_unload(async_dispatcher_connect(hass, SIGNAL_NEW_CIRCUITS, _on_new_circuits))
-
-    # Register the reset_ww_boost entity service so automations can call it
-    # by targeting one or more HovalWaterHeater entities.
-    platform = async_get_current_platform()
-    platform.async_register_entity_service(
-        SERVICE_RESET_WW_BOOST,
-        {},  # no extra fields — the entity already knows its plant/circuit
-        "async_reset_temporary_change",
-    )
 
 
 class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntity):
@@ -225,32 +216,3 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
                 )
         except HovalApiError as err:
             raise HomeAssistantError(f"Failed to set operation mode: {err}") from err
-
-    async def async_reset_temporary_change(self) -> None:
-        """Cancel any active temporary WW temperature boost and resume the week program.
-
-        This mirrors the 'reset' action in the Hoval app: it issues a DELETE to
-        the temporary-change endpoint, which immediately removes the manual override
-        and hands control back to the active week/day program — without touching the
-        program itself or switching to standby.
-
-        Safe to call even when no temporary change is active; the API treats it as
-        a no-op in that case.
-        """
-        _LOGGER.debug(
-            "reset_ww_boost: cancelling temporary change for circuit=%s",
-            self._circuit_path,
-        )
-        try:
-            await self.coordinator.async_control_and_refresh(
-                self.coordinator.api.reset_temporary_change(
-                    self._plant_id,
-                    self._circuit_path,
-                ),
-                circuit_path=self._circuit_path,
-                mode_override="REGULAR",
-            )
-        except HovalApiError as err:
-            raise HomeAssistantError(
-                f"Failed to reset hot water temporary boost: {err}"
-            ) from err
