@@ -1,8 +1,0 @@
-reset_ww_boost:
-  # Cancels any active temporary hot water temperature override and resumes
-  # the week program — the same action as "reset" in the Hoval app.
-  # Target one or more water_heater entities belonging to this integration.
-  target:
-    entity:
-      domain: water_heater
-      integration: hoval_connect
