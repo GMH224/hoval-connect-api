@@ -30,10 +30,10 @@ The integration lives in `custom_components/hoval_connect/`. User setup is email
 - `fan.py` — HV ventilation: speed slider 0–100%, on/off (standby ↔ temporary-change), debounced 1.5s
 - `select.py` — Program selection (week1/week2/ecoMode/standby/constant) with user-defined names; applies to HV, HK, **and WW** circuits
 - `sensor.py` — Circuit-type-filtered sensors (HV/HK/BL/WW) + 6 plant-level sensors (events, weather); includes `circuit_status` diagnostic sensor for BL, HK, and WW (sourced from `HovalCircuitData.circuit_status`, populated from `CircuitV3DTO.circuitStatus` in the circuit list response)
-- `water_heater.py` — WW hot water entity (`WaterHeaterEntity`); exposes current/target temperature and operation modes heat_pump / high_demand / off; `set_temperature` posts a `midnight`-duration temporary-change override; `set_operation_mode` switches between week-program and standby
+- `water_heater.py` — WW hot water entity (`WaterHeaterEntity`); exposes current/target temperature and operation modes heat_pump / high_demand / off; `set_temperature` posts a `midnight`-duration temporary-change override; `set_operation_mode` switches between week-program and standby; registers the `reset_ww_boost` entity service via `async_get_current_platform()` → `async_register_entity_service`, which calls `async_reset_temporary_change` (DELETEs the temporary-change endpoint without touching the week program)
 - `binary_sensor.py` — Plant online status + error/warning status
 - `diagnostics.py` — Diagnostic export with PII redaction
-- `const.py` — API URLs, OAuth client ID, token TTLs, polling interval, circuit types, duration enums
+- `const.py` — API URLs, OAuth client ID, token TTLs, polling interval, circuit types, duration enums, `SERVICE_RESET_WW_BOOST`
 - `__init__.py` — Entry setup, platform forwarding, `plant_device_info`/`circuit_device_info` helpers
 
 ### Entity architecture
@@ -130,6 +130,29 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 - HK climate entity: `set_temperature` sends value as integer — may need adjustment for different HK circuit models (some use tenths of degree)
 
 ## Changelog
+
+### v0.15.5
+- **API timeout hardening** (`api.py`): Reduced `_MAX_RETRIES` from 3 → 2 and `_RETRY_BASE_DELAY` from 1.0 → 0.5 s to prevent startup hangs when the Hoval cloud is slow. Replaced single `total=30 s` `ClientTimeout` with split `connect=8 s / sock_read=20 s` timeouts on all requests including auth calls — dead connections are now detected in 8 s instead of 30 s. Removed unused `REQUEST_TIMEOUT` import.
+- **Coordinator global timeout guard** (`coordinator.py`): Refactored `_async_update_data` into a thin `asyncio.timeout(90)` wrapper calling a new inner `_fetch_all_data` method. All `HovalAuthError` / `HovalApiError` exceptions are caught in one place and converted to `ConfigEntryAuthFailed` / `UpdateFailed`. A raw `TimeoutError` (API hung > 90 s) now surfaces as a clear `UpdateFailed` log instead of blocking HA's event loop.
+- **`async_control_and_refresh` lock fix** (`coordinator.py`): The `control_lock` was previously held for the API call + sleep(2) + full coordinator refresh (up to ~149 s worst case), blocking all concurrent control actions (automations, button presses) for that entire window. Fixed: lock now releases immediately after the API call succeeds; the sleep(2) and refresh run outside the lock. The refresh itself is scheduled as a **fire-and-forget background task** via `hass.async_create_task`, so the entity action method returns to HA promptly even when the cloud is slow. Refresh failures are silently discarded (coordinator retries on normal poll schedule).
+- **Optimistic state survives failed refreshes** (`coordinator.py`): `_mode_override.clear()` was called at the *start* of each refresh, meaning a timeout or API error mid-cycle would cause entities to snap back to stale state immediately. Fixed: overrides are now cleared only at the *end* of a successful fetch, so the optimistic state (e.g. "boost cancelled") remains visible until confirmed by real data.
+- **`services.yaml` removed**: Entity services registered via `async_register_entity_service` are purely programmatic — a `services.yaml` file is only valid for domain-level services and caused HA's integration validator to raise an initialization error on startup. The `reset_ww_boost` service continues to work correctly in automations.
+
+### v0.15.4
+- **`reset_ww_boost` entity service** (`water_heater.py`, `const.py`, `strings.json`, `translations/en.json`): Adds a dedicated HA service to cancel an active temporary WW temperature override and immediately resume the week program — identical to pressing "reset" in the Hoval app.
+  - API call: `DELETE /v3/plants/{plantId}/circuits/{circuitPath}/temporary-change` (already present as `api.reset_temporary_change()`; no API changes needed).
+  - Registered as an entity service via `async_get_current_platform().async_register_entity_service(SERVICE_RESET_WW_BOOST, {}, "async_reset_temporary_change")` in `async_setup_entry`; targets `WaterHeaterEntity` instances only.
+  - Service name constant `SERVICE_RESET_WW_BOOST = "reset_ww_boost"` added to `const.py`.
+  - `strings.json` and `translations/en.json` extended with a `"services"` block containing the human-readable name and description.
+  - Safe to call when no temporary change is active — the API treats it as a no-op.
+  - Does **not** switch the circuit to standby or modify any week program; only removes the temporary override layer.
+  - Example automation usage:
+    ```yaml
+    action:
+      - service: hoval_connect.reset_ww_boost
+        target:
+          entity_id: water_heater.hoval_hot_water
+    ```
 
 ### v0.15.3
 - **Electric auxiliary heater sensors** (`sensor.py`): Adds 5 sensors for BL circuits covering the auxiliary electric heating element (distinct from the heat pump compressor):
