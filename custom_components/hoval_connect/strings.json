@@ -187,5 +187,11 @@
         "name": "Program"
       }
     }
+  },
+  "services": {
+    "reset_ww_boost": {
+      "name": "Reset hot water boost",
+      "description": "Cancels any active temporary hot water temperature adjustment and immediately resumes the active week program. This is the same action as pressing 'reset' in the Hoval app. Safe to call when no override is active."
+    }
   }
 }

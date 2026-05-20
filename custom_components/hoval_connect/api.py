@@ -15,15 +15,23 @@ from .const import (
     ID_TOKEN_TTL,
     IDP_URL,
     PLANT_TOKEN_TTL,
-    REQUEST_TIMEOUT,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-# Retry configuration for transient errors
-_MAX_RETRIES = 3
-_RETRY_BASE_DELAY = 1.0  # seconds, doubled on each retry
+# Retry configuration for transient errors.
+# Keep retries low: each attempt can take up to (_CONNECT_TIMEOUT + _READ_TIMEOUT)
+# seconds. More than 2 retries make the coordinator hang long enough to trigger
+# HA's ConfigEntryNotReady / watchdog during startup.
+_MAX_RETRIES = 2
+_RETRY_BASE_DELAY = 0.5  # seconds, doubled on each retry
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+# Split timeouts: fail fast on dead connections, allow longer for slow reads.
+# Total worst-case per attempt: _CONNECT_TIMEOUT + _READ_TIMEOUT = 28 s.
+# With 2 retries: ~28 + 0.5 + 28 = ~57 s max for a single endpoint.
+_CONNECT_TIMEOUT = 8   # seconds to establish the TCP connection
+_READ_TIMEOUT = 20     # seconds to receive the full response body
 
 
 class HovalAuthError(Exception):
@@ -67,6 +75,7 @@ class HovalConnectApi:
                     "scope": "openid",
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=aiohttp.ClientTimeout(connect=_CONNECT_TIMEOUT, sock_read=_READ_TIMEOUT),
             ) as resp:
                 if resp.status in (400, 401, 403):
                     _LOGGER.warning("IDP auth failed (HTTP %s)", resp.status)
@@ -97,6 +106,7 @@ class HovalConnectApi:
             async with self._session.get(
                 f"{BASE_URL}/v1/plants/{plant_id}/settings",
                 headers={"Authorization": f"Bearer {id_token}"},
+                timeout=aiohttp.ClientTimeout(connect=_CONNECT_TIMEOUT, sock_read=_READ_TIMEOUT),
             ) as resp:
                 if resp.status == 401:
                     self._id_token = None
@@ -133,7 +143,9 @@ class HovalConnectApi:
         """Make an authenticated API request with token retry and transient error backoff."""
         headers = await self._headers(plant_id)
         url = f"{BASE_URL}{path}"
-        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+        # Use separate connect and read timeouts so a dead server is detected
+        # quickly (connect) while still allowing slow-but-alive responses (read).
+        timeout = aiohttp.ClientTimeout(connect=_CONNECT_TIMEOUT, sock_read=_READ_TIMEOUT)
 
         for attempt in range(_MAX_RETRIES):
             try:
@@ -187,30 +199,33 @@ class HovalConnectApi:
                 if attempt < _MAX_RETRIES - 1:
                     delay = _RETRY_BASE_DELAY * (2**attempt)
                     _LOGGER.warning(
-                        "Request timeout on %s %s, retrying in %.1fs (%d/%d)",
+                        "Request timeout on %s %s (attempt %d/%d), retrying in %.1fs",
                         method,
                         path,
-                        delay,
                         attempt + 1,
                         _MAX_RETRIES,
+                        delay,
                     )
                     await asyncio.sleep(delay)
                     continue
-                raise HovalApiError(f"Request timeout: {err}") from err
+                _LOGGER.warning("Request timeout on %s %s after %d attempts", method, path, _MAX_RETRIES)
+                raise HovalApiError(f"Request timeout after {_MAX_RETRIES} attempts: {err}") from err
             except aiohttp.ClientError as err:
                 if attempt < _MAX_RETRIES - 1:
                     delay = _RETRY_BASE_DELAY * (2**attempt)
                     _LOGGER.warning(
-                        "Connection error on %s %s, retrying in %.1fs (%d/%d)",
+                        "Connection error on %s %s (attempt %d/%d), retrying in %.1fs: %s",
                         method,
                         path,
-                        delay,
                         attempt + 1,
                         _MAX_RETRIES,
+                        delay,
+                        err,
                     )
                     await asyncio.sleep(delay)
                     continue
-                raise HovalApiError(f"Connection error: {err}") from err
+                _LOGGER.warning("Connection error on %s %s after %d attempts: %s", method, path, _MAX_RETRIES, err)
+                raise HovalApiError(f"Connection error after {_MAX_RETRIES} attempts: {err}") from err
 
         raise HovalApiError(f"Request failed after {_MAX_RETRIES} retries")
 
