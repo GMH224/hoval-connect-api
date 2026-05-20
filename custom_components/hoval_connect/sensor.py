@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import logging
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -23,10 +24,13 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from . import HovalConnectConfigEntry, circuit_device_info, plant_device_info
 from .const import CIRCUIT_TYPE_BL, CIRCUIT_TYPE_HK, CIRCUIT_TYPE_HV, CIRCUIT_TYPE_WW
 from .coordinator import SIGNAL_NEW_CIRCUITS, HovalCircuitData, HovalDataCoordinator, HovalPlantData
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -504,6 +508,16 @@ class HovalPlantSensor(CoordinatorEntity[HovalDataCoordinator], SensorEntity):
         val = self.entity_description.value_fn(plant)
         if val is None:
             return None
+        # TIMESTAMP sensors require a timezone-aware datetime object.
+        # The Hoval API returns ISO-8601 strings (e.g. "2026-02-17T10:30:00Z");
+        # passing the raw string causes HA to show the entity as unknown.
+        if self.entity_description.device_class == SensorDeviceClass.TIMESTAMP and isinstance(
+            val, str
+        ):
+            parsed = dt_util.parse_datetime(val)
+            if parsed is None:
+                _LOGGER.debug("Could not parse timestamp value: %r", val)
+            return parsed
         if self.entity_description.native_unit_of_measurement is None and not isinstance(
             val, (int, float)
         ):

@@ -76,7 +76,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HovalConnectConfigEntry)
     api = HovalConnectApi(session, entry.data["email"], entry.data["password"])
 
     coordinator = HovalDataCoordinator(hass, api)
-    coordinator.update_interval = _get_scan_interval(entry)
+    coordinator.set_base_update_interval(_get_scan_interval(entry))
 
     await coordinator.async_config_entry_first_refresh()
 
@@ -107,10 +107,15 @@ async def _async_options_updated(
 ) -> None:
     """Handle options update — adjust polling interval without reload."""
     coordinator = entry.runtime_data.coordinator
-    coordinator.update_interval = _get_scan_interval(entry)
-    _LOGGER.debug("Polling interval updated to %s", coordinator.update_interval)
+    new_interval = _get_scan_interval(entry)
+    coordinator.set_base_update_interval(new_interval)
+    _LOGGER.debug("Polling interval updated to %s (backoff reset)", new_interval)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: HovalConnectConfigEntry) -> bool:
     """Unload a config entry."""
+    # Cancel any in-flight post-control background refresh tasks before tearing
+    # down the coordinator, so they don't call async_request_refresh() on a
+    # coordinator that no longer has a valid config entry.
+    entry.runtime_data.coordinator.cancel_pending_tasks()
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from typing import Any
 
@@ -24,7 +25,15 @@ _LOGGER = logging.getLogger(__name__)
 # seconds. More than 2 retries make the coordinator hang long enough to trigger
 # HA's ConfigEntryNotReady / watchdog during startup.
 _MAX_RETRIES = 2
-_RETRY_BASE_DELAY = 0.5  # seconds, doubled on each retry
+_RETRY_BASE_DELAY = 0.5  # seconds; actual delay = base * 2^attempt * jitter
+
+# Jitter factor applied to every retry delay.  Each retry sleeps for a random
+# duration in [base * 0.5, base * 1.0] rather than a fixed value.  This
+# prevents all circuit requests from hammering a struggling server in lock-step
+# when they fail simultaneously (thundering-herd suppression).
+_RETRY_JITTER_MIN = 0.5
+_RETRY_JITTER_MAX = 1.0
+
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 # Split timeouts: fail fast on dead connections, allow longer for slow reads.
@@ -32,6 +41,17 @@ _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 # With 2 retries: ~28 + 0.5 + 28 = ~57 s max for a single endpoint.
 _CONNECT_TIMEOUT = 8   # seconds to establish the TCP connection
 _READ_TIMEOUT = 20     # seconds to receive the full response body
+
+
+def _jittered_delay(attempt: int) -> float:
+    """Return a jittered exponential-backoff delay for the given attempt index.
+
+    Formula: base * 2^attempt * uniform(JITTER_MIN, JITTER_MAX)
+    Example ranges (attempt 0/1): ~0.25-0.5 s / ~0.5-1.0 s.
+    """
+    return _RETRY_BASE_DELAY * (2 ** attempt) * random.uniform(
+        _RETRY_JITTER_MIN, _RETRY_JITTER_MAX
+    )
 
 
 class HovalAuthError(Exception):
@@ -60,32 +80,55 @@ class HovalConnectApi:
         self._pat_cache: dict[str, tuple[str, float]] = {}
 
     async def _get_id_token(self) -> str:
-        """Get or refresh the ID token via OAuth2 password grant."""
+        """Get or refresh the ID token via OAuth2 password grant.
+
+        Retries transient network/timeout failures with jittered backoff.
+        HovalAuthError (4xx from the identity provider) is NOT retried — bad
+        credentials will not fix themselves.
+        """
         if self._id_token and time.time() < self._id_token_exp:
             return self._id_token
 
-        try:
-            async with self._session.post(
-                IDP_URL,
-                data={
-                    "grant_type": "password",
-                    "client_id": CLIENT_ID,
-                    "username": self._email,
-                    "password": self._password,
-                    "scope": "openid",
-                },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=aiohttp.ClientTimeout(connect=_CONNECT_TIMEOUT, sock_read=_READ_TIMEOUT),
-            ) as resp:
-                if resp.status in (400, 401, 403):
-                    _LOGGER.warning("IDP auth failed (HTTP %s)", resp.status)
-                    raise HovalAuthError(f"Invalid credentials (HTTP {resp.status})")
-                resp.raise_for_status()
-                data = await resp.json()
-        except HovalAuthError:
-            raise
-        except (aiohttp.ClientError, TimeoutError) as err:
-            raise HovalApiError(f"Connection error during authentication: {err}") from err
+        timeout = aiohttp.ClientTimeout(connect=_CONNECT_TIMEOUT, sock_read=_READ_TIMEOUT)
+        data: dict[str, Any] = {}
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                async with self._session.post(
+                    IDP_URL,
+                    data={
+                        "grant_type": "password",
+                        "client_id": CLIENT_ID,
+                        "username": self._email,
+                        "password": self._password,
+                        "scope": "openid",
+                    },
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    timeout=timeout,
+                ) as resp:
+                    if resp.status in (400, 401, 403):
+                        _LOGGER.warning("IDP auth failed (HTTP %s)", resp.status)
+                        raise HovalAuthError(f"Invalid credentials (HTTP {resp.status})")
+                    resp.raise_for_status()
+                    data = await resp.json()
+                break  # success — exit retry loop
+            except HovalAuthError:
+                raise
+            except (aiohttp.ClientError, TimeoutError) as err:
+                if attempt < _MAX_RETRIES - 1:
+                    delay = _jittered_delay(attempt)
+                    _LOGGER.warning(
+                        "Auth request failed (attempt %d/%d), retrying in %.2fs: %s",
+                        attempt + 1,
+                        _MAX_RETRIES,
+                        delay,
+                        err,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise HovalApiError(
+                    f"Auth failed after {_MAX_RETRIES} attempts: {err}"
+                ) from err
 
         if "id_token" not in data:
             _LOGGER.error("IDP response missing id_token. Keys: %s", list(data.keys()))
@@ -96,27 +139,52 @@ class HovalConnectApi:
         return self._id_token
 
     async def _get_plant_access_token(self, plant_id: str) -> str:
-        """Get or refresh the plant access token."""
+        """Get or refresh the plant access token.
+
+        Retries transient network/timeout failures with jittered backoff.
+        A 401 response means the ID token was already rejected by the PAT
+        endpoint — invalidate the ID token and raise HovalAuthError immediately
+        rather than retrying (the retry would fail the same way).
+        """
         cached = self._pat_cache.get(plant_id)
         if cached and time.time() < cached[1]:
             return cached[0]
 
         id_token = await self._get_id_token()
-        try:
-            async with self._session.get(
-                f"{BASE_URL}/v1/plants/{plant_id}/settings",
-                headers={"Authorization": f"Bearer {id_token}"},
-                timeout=aiohttp.ClientTimeout(connect=_CONNECT_TIMEOUT, sock_read=_READ_TIMEOUT),
-            ) as resp:
-                if resp.status == 401:
-                    self._id_token = None
-                    raise HovalAuthError("ID token rejected")
-                resp.raise_for_status()
-                data = await resp.json()
-        except (HovalAuthError, HovalApiError):
-            raise
-        except (aiohttp.ClientError, TimeoutError) as err:
-            raise HovalApiError(f"Connection error fetching plant token: {err}") from err
+        timeout = aiohttp.ClientTimeout(connect=_CONNECT_TIMEOUT, sock_read=_READ_TIMEOUT)
+        data: dict[str, Any] = {}
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                async with self._session.get(
+                    f"{BASE_URL}/v1/plants/{plant_id}/settings",
+                    headers={"Authorization": f"Bearer {id_token}"},
+                    timeout=timeout,
+                ) as resp:
+                    if resp.status == 401:
+                        self._id_token = None
+                        raise HovalAuthError("ID token rejected by PAT endpoint")
+                    resp.raise_for_status()
+                    data = await resp.json()
+                break  # success — exit retry loop
+            except (HovalAuthError, HovalApiError):
+                raise
+            except (aiohttp.ClientError, TimeoutError) as err:
+                if attempt < _MAX_RETRIES - 1:
+                    delay = _jittered_delay(attempt)
+                    _LOGGER.warning(
+                        "PAT request failed for plant %s (attempt %d/%d), retrying in %.2fs: %s",
+                        plant_id,
+                        attempt + 1,
+                        _MAX_RETRIES,
+                        delay,
+                        err,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise HovalApiError(
+                    f"PAT fetch failed after {_MAX_RETRIES} attempts: {err}"
+                ) from err
 
         token = data["token"]
         self._pat_cache[plant_id] = (token, time.time() + PLANT_TOKEN_TTL.total_seconds())
@@ -140,7 +208,11 @@ class HovalConnectApi:
         json_data: Any = None,
         _retry: bool = True,
     ) -> Any:
-        """Make an authenticated API request with token retry and transient error backoff."""
+        """Make an authenticated API request with token retry and transient error backoff.
+
+        Retry delays use _jittered_delay() to avoid synchronised bursts when
+        multiple circuit requests fail at the same time.
+        """
         headers = await self._headers(plant_id)
         url = f"{BASE_URL}{path}"
         # Use separate connect and read timeouts so a dead server is detected
@@ -174,9 +246,9 @@ class HovalConnectApi:
                             )
                         raise HovalAuthError("Authentication failed")
                     if resp.status in _RETRYABLE_STATUS_CODES and attempt < _MAX_RETRIES - 1:
-                        delay = _RETRY_BASE_DELAY * (2**attempt)
+                        delay = _jittered_delay(attempt)
                         _LOGGER.warning(
-                            "Transient error HTTP %s on %s %s, retrying in %.1fs (%d/%d)",
+                            "Transient error HTTP %s on %s %s, retrying in %.2fs (%d/%d)",
                             resp.status,
                             method,
                             path,
@@ -190,16 +262,22 @@ class HovalConnectApi:
                         body = await resp.text()
                         _LOGGER.debug("API error body: %s", body[:500])
                         raise HovalApiError(f"API request failed: HTTP {resp.status}")
-                    if resp.status == 204 or resp.content_length == 0:
+                    # Treat 204 No Content and any response whose body is
+                    # absent or empty as a successful no-data reply.
+                    # `not resp.content_length` catches both explicit 0 and a
+                    # missing Content-Length header (where aiohttp returns None),
+                    # avoiding a ContentTypeError when resp.json() is called on
+                    # an empty body — documented as a known Hoval API quirk.
+                    if resp.status == 204 or not resp.content_length:
                         return None
                     return await resp.json()
             except (HovalAuthError, HovalApiError):
                 raise
             except TimeoutError as err:
                 if attempt < _MAX_RETRIES - 1:
-                    delay = _RETRY_BASE_DELAY * (2**attempt)
+                    delay = _jittered_delay(attempt)
                     _LOGGER.warning(
-                        "Request timeout on %s %s (attempt %d/%d), retrying in %.1fs",
+                        "Request timeout on %s %s (attempt %d/%d), retrying in %.2fs",
                         method,
                         path,
                         attempt + 1,
@@ -208,13 +286,17 @@ class HovalConnectApi:
                     )
                     await asyncio.sleep(delay)
                     continue
-                _LOGGER.warning("Request timeout on %s %s after %d attempts", method, path, _MAX_RETRIES)
-                raise HovalApiError(f"Request timeout after {_MAX_RETRIES} attempts: {err}") from err
+                _LOGGER.warning(
+                    "Request timeout on %s %s after %d attempts", method, path, _MAX_RETRIES
+                )
+                raise HovalApiError(
+                    f"Request timeout after {_MAX_RETRIES} attempts: {err}"
+                ) from err
             except aiohttp.ClientError as err:
                 if attempt < _MAX_RETRIES - 1:
-                    delay = _RETRY_BASE_DELAY * (2**attempt)
+                    delay = _jittered_delay(attempt)
                     _LOGGER.warning(
-                        "Connection error on %s %s (attempt %d/%d), retrying in %.1fs: %s",
+                        "Connection error on %s %s (attempt %d/%d), retrying in %.2fs: %s",
                         method,
                         path,
                         attempt + 1,
@@ -224,8 +306,16 @@ class HovalConnectApi:
                     )
                     await asyncio.sleep(delay)
                     continue
-                _LOGGER.warning("Connection error on %s %s after %d attempts: %s", method, path, _MAX_RETRIES, err)
-                raise HovalApiError(f"Connection error after {_MAX_RETRIES} attempts: {err}") from err
+                _LOGGER.warning(
+                    "Connection error on %s %s after %d attempts: %s",
+                    method,
+                    path,
+                    _MAX_RETRIES,
+                    err,
+                )
+                raise HovalApiError(
+                    f"Connection error after {_MAX_RETRIES} attempts: {err}"
+                ) from err
 
         raise HovalApiError(f"Request failed after {_MAX_RETRIES} retries")
 
@@ -265,11 +355,20 @@ class HovalConnectApi:
         )
 
     async def get_events(self, plant_id: str) -> list[dict[str, Any]]:
-        """Get plant error events."""
+        """Get plant error events.
+
+        Note: intentionally omits plant_id= so only the id_token (Bearer) is
+        sent.  The /v1/plant-events/ paths do NOT require X-Plant-Access-Token.
+        Do not add plant_id= here — it would inject an unwanted PAT header and
+        may cause 401 errors on this endpoint.
+        """
         return await self._request("GET", f"/v1/plant-events/{plant_id}")
 
     async def get_latest_event(self, plant_id: str) -> dict[str, Any]:
-        """Get latest plant event."""
+        """Get latest plant event.
+
+        Note: intentionally omits plant_id= — see get_events() for rationale.
+        """
         return await self._request("GET", f"/v1/plant-events/latest/{plant_id}")
 
     async def get_weather(self, plant_id: str) -> list[dict[str, Any]]:

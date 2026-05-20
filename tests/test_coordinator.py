@@ -10,22 +10,25 @@ import sys
 from datetime import datetime
 from unittest.mock import MagicMock
 
-# Mock homeassistant modules so we can import the coordinator's pure functions
+# Mock homeassistant modules so we can import the coordinator's pure functions.
+# Use setdefault so that if test_api.py already registered these mocks in the
+# same pytest process, we reuse them rather than overwriting with a new object
+# (which would break any module that already imported from the first mock).
 ha_mock = MagicMock()
-sys.modules["homeassistant"] = ha_mock
-sys.modules["homeassistant.config_entries"] = ha_mock
-sys.modules["homeassistant.const"] = ha_mock
-sys.modules["homeassistant.core"] = ha_mock
-sys.modules["homeassistant.exceptions"] = ha_mock
-sys.modules["homeassistant.helpers"] = ha_mock
-sys.modules["homeassistant.helpers.update_coordinator"] = ha_mock
-sys.modules["homeassistant.helpers.aiohttp_client"] = ha_mock
-sys.modules["homeassistant.helpers.device_registry"] = ha_mock
-sys.modules["homeassistant.helpers.dispatcher"] = ha_mock
-sys.modules["homeassistant.util"] = ha_mock
-sys.modules["homeassistant.util.dt"] = ha_mock
-sys.modules["aiohttp"] = ha_mock
-sys.modules["voluptuous"] = ha_mock
+sys.modules.setdefault("homeassistant", ha_mock)
+sys.modules.setdefault("homeassistant.config_entries", ha_mock)
+sys.modules.setdefault("homeassistant.const", ha_mock)
+sys.modules.setdefault("homeassistant.core", ha_mock)
+sys.modules.setdefault("homeassistant.exceptions", ha_mock)
+sys.modules.setdefault("homeassistant.helpers", ha_mock)
+sys.modules.setdefault("homeassistant.helpers.update_coordinator", ha_mock)
+sys.modules.setdefault("homeassistant.helpers.aiohttp_client", ha_mock)
+sys.modules.setdefault("homeassistant.helpers.device_registry", ha_mock)
+sys.modules.setdefault("homeassistant.helpers.dispatcher", ha_mock)
+sys.modules.setdefault("homeassistant.util", ha_mock)
+sys.modules.setdefault("homeassistant.util.dt", ha_mock)
+sys.modules.setdefault("aiohttp", ha_mock)
+sys.modules.setdefault("voluptuous", ha_mock)
 
 # Now we can import the pure functions and dataclasses
 from custom_components.hoval_connect.coordinator import (  # noqa: E402
@@ -119,7 +122,7 @@ class TestResolveActiveProgramValue:
         phases: list[dict] | None = None,
         day_name: str = "Normal",
     ) -> dict:
-        """Build a minimal programs structure."""
+        """Build a minimal programs structure with both week1 and week2."""
         if phases is None:
             phases = [
                 {
@@ -138,6 +141,10 @@ class TestResolveActiveProgramValue:
                 "name": "Woche 1",
                 "dayProgramIds": [1, 1, 1, 1, 1, 2, 2],  # Mon-Fri=1, Sat-Sun=2
             },
+            "week2": {
+                "name": "Woche 2",
+                "dayProgramIds": [3, 3, 3, 3, 3, 3, 3],  # all days = id 3
+            },
             "dayPrograms": {
                 "dayConfigurations": [
                     {"id": 1, "name": day_name, "phases": phases},
@@ -152,6 +159,17 @@ class TestResolveActiveProgramValue:
                             },
                         ],
                     },
+                    {
+                        "id": 3,
+                        "name": "Week2Day",
+                        "phases": [
+                            {
+                                "start": {"hours": 7, "minutes": 0},
+                                "end": {"hours": 21, "minutes": 0},
+                                "value": 75,
+                            },
+                        ],
+                    },
                 ],
             },
         }
@@ -159,7 +177,7 @@ class TestResolveActiveProgramValue:
     def test_monday_morning(self):
         programs = self._make_programs()
         now = datetime(2024, 1, 8, 10, 0)  # Monday
-        week, day, value = _resolve_active_program_value(programs, now)
+        week, day, value = _resolve_active_program_value(programs, now, "week1")
         assert week == "Woche 1"
         assert day == "Normal"
         assert value == 60
@@ -167,7 +185,7 @@ class TestResolveActiveProgramValue:
     def test_monday_night(self):
         programs = self._make_programs()
         now = datetime(2024, 1, 8, 23, 30)  # Monday
-        week, day, value = _resolve_active_program_value(programs, now)
+        week, day, value = _resolve_active_program_value(programs, now, "week1")
         assert week == "Woche 1"
         assert day == "Normal"
         assert value == 30
@@ -175,15 +193,32 @@ class TestResolveActiveProgramValue:
     def test_saturday(self):
         programs = self._make_programs()
         now = datetime(2024, 1, 13, 12, 0)  # Saturday
-        week, day, value = _resolve_active_program_value(programs, now)
+        week, day, value = _resolve_active_program_value(programs, now, "week1")
         assert week == "Woche 1"
         assert day == "Weekend"
         assert value == 50
 
+    def test_week2_selected_when_active_program_is_week2(self):
+        """Circuit running week2 must resolve against the week2 schedule, not week1."""
+        programs = self._make_programs()
+        now = datetime(2024, 1, 8, 10, 0)  # Monday morning
+        week, day, value = _resolve_active_program_value(programs, now, "week2")
+        assert week == "Woche 2"
+        assert day == "Week2Day"
+        assert value == 75
+
+    def test_non_schedule_program_falls_back_to_week1(self):
+        """constant/ecoMode/standby etc. should resolve against week1."""
+        programs = self._make_programs()
+        now = datetime(2024, 1, 8, 10, 0)
+        for prog in ("constant", "ecoMode", "standby", None):
+            week, day, value = _resolve_active_program_value(programs, now, prog)
+            assert week == "Woche 1", f"failed for active_program={prog!r}"
+
     def test_no_matching_phase(self):
         programs = self._make_programs()
         now = datetime(2024, 1, 8, 4, 0)  # Monday 4 AM
-        week, day, value = _resolve_active_program_value(programs, now)
+        week, day, value = _resolve_active_program_value(programs, now, "week1")
         assert week == "Woche 1"
         assert day == "Normal"
         assert value is None
@@ -207,13 +242,13 @@ class TestResolveActiveProgramValue:
     def test_phase_boundary_start(self):
         programs = self._make_programs()
         now = datetime(2024, 1, 8, 6, 0)  # Exactly at phase start
-        week, day, value = _resolve_active_program_value(programs, now)
+        week, day, value = _resolve_active_program_value(programs, now, "week1")
         assert value == 60
 
     def test_phase_boundary_end(self):
         programs = self._make_programs()
         now = datetime(2024, 1, 8, 22, 0)  # Exactly at phase end/next start
-        week, day, value = _resolve_active_program_value(programs, now)
+        week, day, value = _resolve_active_program_value(programs, now, "week1")
         assert value == 30
 
 
