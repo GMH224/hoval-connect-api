@@ -131,6 +131,12 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
+### v0.15.6
+- **`manifest.json` version corrected**: Version string was stuck at `0.15.2` instead of the current release version. Bumped to `0.15.6`.
+- **Dead constant removed** (`const.py`): `REQUEST_TIMEOUT = 30` was left in `const.py` after v0.15.5 removed it from `api.py`'s imports. No file referenced it; now removed entirely.
+- **`water_heater.py` constant consistency fix**: Three occurrences of the bare string literal `"REGULAR"` used as `mode_override` were replaced with `OPERATION_MODE_REGULAR` (imported from `const.py`). All other platforms (climate, fan, select) already used the constant; `water_heater.py` was the only exception. `OPERATION_MODE_REGULAR` is now included in the module's import from `const`.
+- **`examples/hoval_client.py` dead endpoint fixed**: `get_circuits()` was still calling the removed v1 endpoint (`/v1/plants/{plantId}/circuits`), which returns HTTP 404 since 2026-04-21. Updated to `/v3/plants/{plantId}/circuits`, consistent with the main integration.
+
 ### v0.15.5
 - **API timeout hardening** (`api.py`): Reduced `_MAX_RETRIES` from 3 → 2 and `_RETRY_BASE_DELAY` from 1.0 → 0.5 s to prevent startup hangs when the Hoval cloud is slow. Replaced single `total=30 s` `ClientTimeout` with split `connect=8 s / sock_read=20 s` timeouts on all requests including auth calls — dead connections are now detected in 8 s instead of 30 s. Removed unused `REQUEST_TIMEOUT` import.
 - **Coordinator global timeout guard** (`coordinator.py`): Refactored `_async_update_data` into a thin `asyncio.timeout(90)` wrapper calling a new inner `_fetch_all_data` method. All `HovalAuthError` / `HovalApiError` exceptions are caught in one place and converted to `ConfigEntryAuthFailed` / `UpdateFailed`. A raw `TimeoutError` (API hung > 90 s) now surfaces as a clear `UpdateFailed` log instead of blocking HA's event loop.

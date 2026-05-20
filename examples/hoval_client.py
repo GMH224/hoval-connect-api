@@ -74,7 +74,7 @@ class HovalClient:
 
     def get_circuits(self, plant_id: str) -> list:
         resp = requests.get(
-            f"{self.BASE_URL}/v1/plants/{plant_id}/circuits",
+            f"{self.BASE_URL}/v3/plants/{plant_id}/circuits",
             headers=self._headers(plant_id),
         )
         resp.raise_for_status()

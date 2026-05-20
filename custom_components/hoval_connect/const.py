@@ -23,9 +23,6 @@ SCAN_INTERVAL_OPTIONS = {30: "30 seconds", 60: "60 seconds", 120: "2 minutes", 3
 # Program cache TTL — programs change rarely, no need to fetch every poll
 PROGRAM_CACHE_TTL = timedelta(minutes=5)
 
-# HTTP request timeout (seconds)
-REQUEST_TIMEOUT = 30
-
 # Circuit types
 CIRCUIT_TYPE_HV = "HV"
 CIRCUIT_TYPE_HK = "HK"

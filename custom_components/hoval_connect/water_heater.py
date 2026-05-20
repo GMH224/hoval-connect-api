@@ -20,7 +20,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import HovalConnectConfigEntry, circuit_device_info
 from .api import HovalApiError
-from .const import CIRCUIT_TYPE_WW, OPERATION_MODE_STANDBY, SERVICE_RESET_WW_BOOST
+from .const import CIRCUIT_TYPE_WW, OPERATION_MODE_REGULAR, OPERATION_MODE_STANDBY, SERVICE_RESET_WW_BOOST
 from .coordinator import SIGNAL_NEW_CIRCUITS, HovalCircuitData, HovalDataCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -195,7 +195,7 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
                     duration="midnight",
                 ),
                 circuit_path=self._circuit_path,
-                mode_override="REGULAR",
+                mode_override=OPERATION_MODE_REGULAR,
             )
         except HovalApiError as err:
             raise HomeAssistantError(f"Failed to set hot water temperature: {err}") from err
@@ -221,7 +221,7 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
                         self._circuit_path,
                     ),
                     circuit_path=self._circuit_path,
-                    mode_override="REGULAR",
+                    mode_override=OPERATION_MODE_REGULAR,
                 )
         except HovalApiError as err:
             raise HomeAssistantError(f"Failed to set operation mode: {err}") from err
@@ -248,7 +248,7 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
                     self._circuit_path,
                 ),
                 circuit_path=self._circuit_path,
-                mode_override="REGULAR",
+                mode_override=OPERATION_MODE_REGULAR,
             )
         except HovalApiError as err:
             raise HomeAssistantError(
