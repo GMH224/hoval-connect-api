@@ -14,6 +14,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
 
 from .api import HovalConnectApi
+from .api_stats import HovalApiStats
 from .const import CIRCUIT_TYPE_NAMES, CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL, DOMAIN
 from .coordinator import HovalCircuitData, HovalDataCoordinator, HovalPlantData
 
@@ -33,10 +34,21 @@ type HovalConnectConfigEntry = ConfigEntry[HovalRuntimeData]
 
 @dataclass
 class HovalRuntimeData:
-    """Runtime data for the Hoval Connect integration."""
+    """Runtime data stored on the config entry after successful setup.
+
+    Accessible from any platform via ``entry.runtime_data``.
+
+    Attributes:
+        coordinator: The data coordinator that polls the Hoval API.
+        api:         The raw API client (used by service calls and platforms
+                     that issue direct control commands).
+        stats:       Rolling-window API communication statistics exposed by the
+                     diagnostic sensor platform.
+    """
 
     coordinator: HovalDataCoordinator
     api: HovalConnectApi
+    stats: HovalApiStats
 
 
 def plant_device_info(plant_data: HovalPlantData) -> DeviceInfo:
@@ -73,14 +85,15 @@ def _get_scan_interval(entry: HovalConnectConfigEntry) -> timedelta:
 async def async_setup_entry(hass: HomeAssistant, entry: HovalConnectConfigEntry) -> bool:
     """Set up Hoval Connect from a config entry."""
     session = async_get_clientsession(hass)
-    api = HovalConnectApi(session, entry.data["email"], entry.data["password"])
+    stats = HovalApiStats()
+    api = HovalConnectApi(session, entry.data["email"], entry.data["password"], stats=stats)
 
     coordinator = HovalDataCoordinator(hass, api)
     coordinator.set_base_update_interval(_get_scan_interval(entry))
 
     await coordinator.async_config_entry_first_refresh()
 
-    entry.runtime_data = HovalRuntimeData(coordinator=coordinator, api=api)
+    entry.runtime_data = HovalRuntimeData(coordinator=coordinator, api=api, stats=stats)
 
     # Register a parent device for each plant so circuit devices can use via_device
     device_reg = dr.async_get(hass)

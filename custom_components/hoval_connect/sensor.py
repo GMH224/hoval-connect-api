@@ -27,6 +27,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
 from . import HovalConnectConfigEntry, circuit_device_info, plant_device_info
+from .api_stats import HovalApiStats
 from .const import CIRCUIT_TYPE_BL, CIRCUIT_TYPE_HK, CIRCUIT_TYPE_HV, CIRCUIT_TYPE_WW
 from .coordinator import SIGNAL_NEW_CIRCUITS, HovalCircuitData, HovalDataCoordinator, HovalPlantData
 
@@ -368,13 +369,149 @@ PLANT_SENSOR_DESCRIPTIONS: tuple[HovalPlantSensorEntityDescription, ...] = (
 )
 
 
+@dataclass(frozen=True, kw_only=True)
+class HovalCommsSensorEntityDescription(SensorEntityDescription):
+    """Describe a Hoval API communication / health sensor entity.
+
+    ``value_fn`` receives both the ``HovalApiStats`` instance and the
+    ``HovalDataCoordinator`` so descriptions can read from either.  This
+    allows poll-interval and consecutive-failure sensors to read from the
+    coordinator while rolling-window metrics come from stats.
+    """
+
+    value_fn: Callable[[HovalApiStats, HovalDataCoordinator], Any | None]
+
+
+COMMS_SENSOR_DESCRIPTIONS: tuple[HovalCommsSensorEntityDescription, ...] = (
+    # --- Rolling-window rate sensors (last 60 minutes) ---
+    HovalCommsSensorEntityDescription(
+        key="api_calls_hour",
+        translation_key="api_calls_hour",
+        icon="mdi:api",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda s, _c: s.calls_last_hour,
+    ),
+    HovalCommsSensorEntityDescription(
+        key="api_timeouts_hour",
+        translation_key="api_timeouts_hour",
+        icon="mdi:timer-off-outline",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda s, _c: s.timeouts_last_hour,
+    ),
+    HovalCommsSensorEntityDescription(
+        key="api_errors_hour",
+        translation_key="api_errors_hour",
+        icon="mdi:cloud-alert",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda s, _c: s.errors_last_hour,
+    ),
+    HovalCommsSensorEntityDescription(
+        key="api_retries_hour",
+        translation_key="api_retries_hour",
+        icon="mdi:reload",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda s, _c: s.retries_last_hour,
+    ),
+    HovalCommsSensorEntityDescription(
+        key="api_failure_ratio",
+        translation_key="api_failure_ratio",
+        icon="mdi:percent",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda s, _c: s.failure_ratio_last_hour,
+    ),
+    # --- Lifetime counters ---
+    HovalCommsSensorEntityDescription(
+        key="api_total_calls",
+        translation_key="api_total_calls",
+        icon="mdi:counter",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda s, _c: s.total_calls,
+    ),
+    HovalCommsSensorEntityDescription(
+        key="api_total_errors",
+        translation_key="api_total_errors",
+        icon="mdi:alert-circle-outline",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda s, _c: s.total_errors,
+    ),
+    # --- Timestamp sensors ---
+    HovalCommsSensorEntityDescription(
+        key="api_last_success",
+        translation_key="api_last_success",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda s, _c: s.last_success_time,
+    ),
+    HovalCommsSensorEntityDescription(
+        key="api_last_error",
+        translation_key="api_last_error",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda s, _c: s.last_error_time,
+    ),
+    # --- Last error message (string sensor) ---
+    HovalCommsSensorEntityDescription(
+        key="api_last_error_message",
+        translation_key="api_last_error_message",
+        icon="mdi:message-alert",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda s, _c: s.last_error_message,
+    ),
+    # --- Coordinator-level health (reads from coordinator, not stats) ---
+    HovalCommsSensorEntityDescription(
+        key="api_consecutive_failures",
+        translation_key="api_consecutive_failures",
+        icon="mdi:alert-circle",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda _s, c: c._consecutive_failures,
+    ),
+    HovalCommsSensorEntityDescription(
+        key="api_poll_interval",
+        translation_key="api_poll_interval",
+        icon="mdi:timer-outline",
+        native_unit_of_measurement=UnitOfTime.SECONDS,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda _s, c: int(c.update_interval.total_seconds()),
+    ),
+)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: HovalConnectConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Hoval sensor entities."""
+    """Set up Hoval sensor entities.
+
+    Creates three categories of sensor entity:
+
+    1. **Circuit sensors** (``HovalCircuitSensor``) — per-circuit telemetry
+       such as temperatures, air volume, humidity, and program state.
+       Created dynamically as new circuits are discovered.
+
+    2. **Plant sensors** (``HovalPlantSensor``) — plant-level information
+       such as latest event details, active event count, and weather forecast.
+       Created once per plant on first discovery.
+
+    3. **API communication sensors** (``HovalApiStatsSensor``) — integration
+       health metrics (calls/hour, timeouts/hour, errors/hour, failure ratio,
+       last success/error timestamps, etc.) attached to the plant device as
+       diagnostic entities.  Created once per plant; read directly from the
+       ``HovalApiStats`` object rather than from coordinator data so they
+       reflect the true API behaviour rather than the coordinator's view.
+    """
     coordinator = entry.runtime_data.coordinator
+    stats = entry.runtime_data.stats
     known: set[str] = set()
 
     def _add_new() -> None:
@@ -403,6 +540,16 @@ async def async_setup_entry(
                     continue
                 known.add(uid)
                 entities.append(HovalPlantSensor(coordinator, plant_id, plant_data, description))
+
+            # API communication / health sensors (one set per plant, created once)
+            for description in COMMS_SENSOR_DESCRIPTIONS:
+                uid = f"{plant_id}_{description.key}"
+                if uid in known:
+                    continue
+                known.add(uid)
+                entities.append(
+                    HovalApiStatsSensor(coordinator, plant_id, plant_data, description, stats)
+                )
 
         if entities:
             async_add_entities(entities)
@@ -526,3 +673,88 @@ class HovalPlantSensor(CoordinatorEntity[HovalDataCoordinator], SensorEntity):
             return float(val) if isinstance(val, (int, float)) else val
         except (ValueError, TypeError):
             return None
+
+
+class HovalApiStatsSensor(CoordinatorEntity[HovalDataCoordinator], SensorEntity):
+    """Sensor entity for Hoval API communication health metrics.
+
+    Unlike ``HovalCircuitSensor`` and ``HovalPlantSensor``, this entity reads
+    from the ``HovalApiStats`` rolling-window collector rather than from
+    ``coordinator.data``.  It still extends ``CoordinatorEntity`` so that it:
+
+    * Updates automatically on every coordinator poll cycle.
+    * Becomes ``unavailable`` if the coordinator enters a persistent error state.
+    * Respects the integration's unload / reload lifecycle.
+
+    The ``value_fn`` on the description receives both the stats object and the
+    coordinator instance, allowing sensors to read from whichever source is
+    appropriate (rolling-window metrics from stats; poll-interval and
+    consecutive-failure count from the coordinator itself).
+    """
+
+    _attr_has_entity_name = True
+    entity_description: HovalCommsSensorEntityDescription
+
+    def __init__(
+        self,
+        coordinator: HovalDataCoordinator,
+        plant_id: str,
+        plant_data: HovalPlantData,
+        description: HovalCommsSensorEntityDescription,
+        stats: HovalApiStats,
+    ) -> None:
+        """Initialise the API stats sensor.
+
+        Args:
+            coordinator: The shared data coordinator.
+            plant_id:    The plant this sensor is attached to (used for unique_id
+                         and device_info).
+            plant_data:  Used to build ``DeviceInfo`` pointing at the plant device.
+            description: Entity description including ``value_fn``.
+            stats:       The ``HovalApiStats`` instance to read from.
+        """
+        super().__init__(coordinator)
+        self.entity_description = description
+        self._plant_id = plant_id
+        self._stats = stats
+        self._attr_unique_id = f"{plant_id}_{description.key}"
+        self._attr_device_info = plant_device_info(plant_data)
+
+    @property
+    def available(self) -> bool:
+        """Return True as long as the coordinator has been initialised.
+
+        API stats sensors remain available even during transient coordinator
+        failures — that is precisely when the error/timeout metrics are most
+        informative.  The coordinator's own ``available`` flag becomes False
+        only after a prolonged outage, at which point surfacing these sensors
+        as unavailable is acceptable.
+        """
+        return super().available
+
+    @property
+    def native_value(self) -> Any:
+        """Compute and return the sensor value from stats or coordinator.
+
+        Timestamp sensors (``device_class=TIMESTAMP``) return ``datetime``
+        objects directly — no further parsing needed because the stats object
+        already stores them as ``datetime.now(timezone.utc)`` values.
+
+        All other sensors return int, float, or str as appropriate for their
+        ``native_unit_of_measurement`` / ``state_class`` configuration.
+        """
+        try:
+            val = self.entity_description.value_fn(self._stats, self.coordinator)
+        except Exception:  # noqa: BLE001
+            return None
+        if val is None:
+            return None
+        # Timestamp device class expects a datetime — already satisfied by stats
+        if self.entity_description.device_class == SensorDeviceClass.TIMESTAMP:
+            return val
+        # String sensors (last_error_message) — return as str
+        if self.entity_description.native_unit_of_measurement is None and not isinstance(
+            val, (int, float)
+        ):
+            return str(val)
+        return val

@@ -131,6 +131,74 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
+### v0.15.9
+Focus: API communication monitoring sensors + production-quality documentation pass.
+
+#### New: API communication sensors
+**New file `api_stats.py`** — ``HovalApiStats`` rolling-window statistics collector.
+Maintains four monotonic-timestamp deques (calls, timeouts, errors, retries) as a
+1-hour sliding window.  All rate metrics (calls/hour, timeouts/hour, etc.) are
+automatically up-to-date without any external reset.  Lifetime counters (total_*)
+accumulate for the full HA session.  UTC ``datetime`` objects are stored for the
+two timestamp sensors so HA can render them directly without parsing.  An
+``as_dict()`` method is used by the diagnostics platform.
+
+**12 new diagnostic sensor entities** added to the plant device
+(``entity_category=DIAGNOSTIC``, do not appear in the main dashboard by default):
+
+| Entity key | What it shows |
+|---|---|
+| `api_calls_hour` | HTTP requests made in the last 60 minutes |
+| `api_timeouts_hour` | Timed-out requests in the last 60 minutes |
+| `api_errors_hour` | Terminal request failures in the last 60 minutes |
+| `api_retries_hour` | Retry attempts triggered in the last 60 minutes |
+| `api_failure_ratio` | Error rate as % of calls in the last 60 minutes |
+| `api_total_calls` | All HTTP requests since HA started (lifetime) |
+| `api_total_errors` | All terminal errors since HA started (lifetime) |
+| `api_last_success` | UTC timestamp of last successful API response |
+| `api_last_error` | UTC timestamp of last terminal error |
+| `api_last_error_message` | Human-readable description of last error |
+| `api_consecutive_failures` | Current coordinator consecutive-failure count |
+| `api_poll_interval` | Current poll interval in seconds (reflects adaptive backoff) |
+
+`api_poll_interval` and `api_consecutive_failures` read from the coordinator
+directly (not from ``HovalApiStats``), making backoff transparent in the HA UI.
+
+**`api.py`** — instrumented with ``stats.record_*()`` calls at every HTTP event:
+``record_call()`` at the start of every outbound attempt (in ``_request``,
+``_get_id_token``, ``_get_plant_access_token``); ``record_timeout()`` on every
+``TimeoutError`` catch including mid-retry; ``record_retry()`` before each retry
+sleep; ``record_error()`` on terminal failure; ``record_success()`` on a valid 2xx
+response.  The stats object is stored as ``api.stats`` and is accessible via
+``entry.runtime_data.stats``.
+
+**`__init__.py`** — ``HovalApiStats()`` created in ``async_setup_entry`` and passed
+to ``HovalConnectApi`` at construction time.  ``HovalRuntimeData`` extended with a
+``stats: HovalApiStats`` field.  Full docstring added to ``HovalRuntimeData``.
+
+**`sensor.py`** — new ``HovalCommsSensorEntityDescription`` dataclass (``value_fn``
+accepts both stats and coordinator).  ``COMMS_SENSOR_DESCRIPTIONS`` tuple with all
+12 entries.  ``HovalApiStatsSensor`` entity class — extends ``CoordinatorEntity``
+for lifecycle management but reads from ``_stats`` in ``native_value``.
+``async_setup_entry`` updated to create comms sensors per plant.
+
+**`diagnostics.py`** — diagnostics payload extended with ``api_stats`` (from
+``stats.as_dict()``) and ``coordinator_health`` (consecutive failures, current and
+base poll intervals).  Module-level docstring added listing all payload sections.
+
+#### Documentation pass (all files)
+Every module, class, method, and non-obvious constant now has a Google-style
+docstring or inline comment.  Key additions:
+- ``api.py``: class-level docstring covering auth flow, resilience, and stats.
+  Method docstrings for all public methods describing endpoint, auth requirements,
+  and edge cases.  ``_request`` docstring describes the full retry flow and every
+  stats recording point.
+- ``coordinator.py``: ``_fetch_circuit_data`` and ``_async_update_data`` docstrings
+  explain the timeout hierarchy and adaptive backoff.
+- ``api_stats.py``: module docstring explaining the design (asyncio-safe, monotonic
+  pruning, wall-clock timestamps).  Property docstrings for all computed attributes.
+- ``__init__.py``: ``HovalRuntimeData`` dataclass fully documented.
+
 ### v0.15.8
 Focus: timeout resilience and reduction of crash/noise during Hoval cloud instability.
 

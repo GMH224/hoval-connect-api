@@ -165,6 +165,42 @@
       },
       "circuit_status_ww": {
         "name": "Hot water status"
+      },
+      "api_calls_hour": {
+        "name": "API calls (last hour)"
+      },
+      "api_timeouts_hour": {
+        "name": "API timeouts (last hour)"
+      },
+      "api_errors_hour": {
+        "name": "API errors (last hour)"
+      },
+      "api_retries_hour": {
+        "name": "API retries (last hour)"
+      },
+      "api_failure_ratio": {
+        "name": "API failure ratio (last hour)"
+      },
+      "api_total_calls": {
+        "name": "API total calls"
+      },
+      "api_total_errors": {
+        "name": "API total errors"
+      },
+      "api_last_success": {
+        "name": "API last success"
+      },
+      "api_last_error": {
+        "name": "API last error"
+      },
+      "api_last_error_message": {
+        "name": "API last error message"
+      },
+      "api_consecutive_failures": {
+        "name": "API consecutive failures"
+      },
+      "api_poll_interval": {
+        "name": "API poll interval"
       }
     },
     "water_heater": {
