@@ -190,14 +190,11 @@
       "api_last_success": {
         "name": "API last success"
       },
-      "api_last_error": {
-        "name": "API last error"
+      "api_last_error_time": {
+        "name": "API last error time"
       },
       "api_last_error_message": {
         "name": "API last error message"
-      },
-      "api_consecutive_failures": {
-        "name": "API consecutive failures"
       },
       "api_poll_interval": {
         "name": "API poll interval"

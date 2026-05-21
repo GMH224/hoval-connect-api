@@ -1,4 +1,23 @@
-"""Data coordinator for Hoval Connect."""
+"""Data coordinator for Hoval Connect.
+
+Responsibilities
+----------------
+* Polls the Hoval Connect cloud API on a configurable interval.
+* Fetches plant list, circuits, live values, time programs, events and weather
+  in parallel using ``asyncio.gather`` with per-request and global timeouts.
+* Converts raw API payloads to typed dataclasses consumed by platform entities.
+* Serialises control commands (mode changes, overrides) through ``control_lock``
+  and schedules a fast post-control refresh as a background task.
+* Implements adaptive poll-interval back-off when the cloud is persistently
+  unavailable, reducing noise in the HA log and server load.
+
+Timeout hierarchy
+-----------------
+1. ``_CONNECT_TIMEOUT`` / ``_READ_TIMEOUT`` on every aiohttp call (in api.py).
+2. ``_CIRCUIT_TIMEOUT`` caps the entire live-values + programs fetch for one
+   circuit so a single stuck circuit cannot consume the coordinator's budget.
+3. Global 90 s ``asyncio.timeout`` in ``_async_update_data`` as a hard backstop.
+"""
 
 from __future__ import annotations
 
@@ -30,26 +49,22 @@ SIGNAL_NEW_CIRCUITS = f"{DOMAIN}_new_circuits"
 
 _LOGGER = logging.getLogger(__name__)
 
-# Per-circuit data fetch hard cap.  Each _fetch_circuit_data call runs two API
-# requests in parallel (live values + programs).  Worst-case for a single
-# request is (_CONNECT_TIMEOUT + _READ_TIMEOUT) × _MAX_RETRIES ≈ 57 s, but
-# in practice both succeed in <5 s.  35 s is generous for one full attempt with
-# some recovery room, and keeps the circuit well inside the 90 s global cap so
-# a single stuck circuit cannot consume the entire coordinator budget.
+# Per-circuit data-fetch cap.  With _MAX_RETRIES=2 and worst-case 28 s per
+# attempt, a single endpoint could theoretically block for ~57 s.  35 s gives
+# each circuit at least one full attempt plus breathing room while keeping it
+# well within the 90 s global cap.
 _CIRCUIT_TIMEOUT = 35  # seconds
 
-# Adaptive backoff: how many consecutive failures before we start backing off
-# the poll interval.  Value of 2 means first two failures keep normal cadence
-# (they may be transient blips), backoff starts on the third.
+# Adaptive back-off: how many consecutive failures before widening the interval.
+# First two failures keep the normal cadence (may be transient blips); back-off
+# starts on the third failure.
 _BACKOFF_THRESHOLD = 2
-# Maximum backed-off interval regardless of failure count (15 minutes).
-_MAX_BACKOFF_SECONDS = 900
-
+_MAX_BACKOFF_SECONDS = 900  # 15 minutes
 
 # v1 API returns different activeProgram values than v3.
-# Normalize so entities always see v3 enum keys.
+# Normalise so entities always see v3 enum keys.
 _V1_PROGRAM_MAP: dict[str, str] = {
-    "tteControlled": "week1",  # time program active (v1 doesn't say which week)
+    "tteControlled": "week1",
     "timePrograms": "week1",
     "nightReduction": "week1",
     "dayCooling": "week1",
@@ -57,56 +72,53 @@ _V1_PROGRAM_MAP: dict[str, str] = {
 
 
 def _resolve_active_program_value(
-    programs: dict[str, Any], now: datetime, active_program: str | None = None
+    programs: dict[str, Any],
+    now: datetime,
+    active_program: str | None = None,
 ) -> tuple[str | None, str | None, float | None]:
-    """Resolve the currently active week, day program name, and air volume.
+    """Resolve the currently active week, day-program name, and air volume.
 
-    Uses active_program to select the correct week schedule (week1 or week2).
-    Falls back to week1 for programs that are not schedule-driven (constant,
-    ecoMode, standby, etc.).
+    Uses *active_program* to select the correct week schedule.  Any value
+    other than ``"week2"`` (constant, ecoMode, standby, None …) falls back to
+    ``week1`` because those modes are not schedule-driven.
 
-    Returns (week_name, day_program_name, current_phase_value).
+    Returns:
+        (week_name, day_program_name, current_phase_value)
     """
     day_programs = programs.get("dayPrograms", {})
     day_configs = day_programs.get("dayConfigurations", [])
     if not day_configs:
         return None, None, None
 
-    # Build lookup: id -> day config
     config_by_id: dict[int, dict] = {d["id"]: d for d in day_configs}
 
-    # Select the week schedule that matches the active program.  Any value
-    # other than "week2" (constant, ecoMode, standby, None, …) falls back to
-    # week1 because those modes do not correspond to a named schedule.
     week_key = "week2" if active_program == "week2" else "week1"
     week = programs.get(week_key) or programs.get("week1", {})
     week_name = week.get("name")
     day_program_ids = week.get("dayProgramIds", [])
 
-    # weekday: 0=Monday in Python, dayProgramIds[0]=Monday in Hoval
-    weekday = now.weekday()
+    weekday = now.weekday()  # 0 = Monday
     if weekday >= len(day_program_ids):
         return week_name, None, None
 
-    day_prog_id = day_program_ids[weekday]
-    day_config = config_by_id.get(day_prog_id)
+    day_config = config_by_id.get(day_program_ids[weekday])
     if day_config is None:
         return week_name, None, None
 
     day_name = day_config.get("name")
-
-    # Find active phase based on current time
     current_minutes = now.hour * 60 + now.minute
     for phase in day_config.get("phases", []):
         start = phase["start"]
         end = phase["end"]
-        start_min = start["hours"] * 60 + start["minutes"]
-        end_min = end["hours"] * 60 + end["minutes"]
-        if start_min <= current_minutes < end_min:
+        if start["hours"] * 60 + start["minutes"] <= current_minutes < end["hours"] * 60 + end["minutes"]:
             return week_name, day_name, phase.get("value")
 
     return week_name, day_name, None
 
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 
 @dataclass
 class HovalEventData:
@@ -134,8 +146,6 @@ class HovalCircuitData:
     name: str
     operation_mode: str | None = None
     active_program: str | None = None
-    # HV: air-volume percentage; HK: target temperature in °C. Coming from the
-    # circuit list endpoint's `targetValue` (renamed from v1 `targetAirVolume`).
     target_value: float | None = None
     is_air_quality_guided: bool = False
     has_error: bool = False
@@ -144,7 +154,6 @@ class HovalCircuitData:
     active_week_name: str | None = None
     active_day_program_name: str | None = None
     program_air_volume: float | None = None
-    # User-defined program names: API key → display name (e.g. "week1" → "Normal")
     program_names: dict[str, str] = field(default_factory=dict)
 
 
@@ -178,6 +187,10 @@ class HovalData:
     plants: dict[str, HovalPlantData] = field(default_factory=dict)
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _parse_event(raw: dict) -> HovalEventData:
     """Parse a PlantEventDTO dict into HovalEventData."""
     return HovalEventData(
@@ -191,16 +204,11 @@ def _parse_event(raw: dict) -> HovalEventData:
 
 
 def _is_problem_event(event: HovalEventData | None) -> bool:
-    """Return True if event is active and represents a fault (blocking/locking/warning)."""
+    """Return True if the event is active and represents a fault."""
     return bool(
         event
         and event.is_active
-        and event.event_type
-        in (
-            "blocking",
-            "locking",
-            "warning",
-        )
+        and event.event_type in ("blocking", "locking", "warning")
     )
 
 
@@ -208,43 +216,36 @@ DEFAULT_FAN_SPEED = 40
 
 
 def resolve_fan_speed(circuit: HovalCircuitData | None) -> int:
-    """Resolve the best fan speed value for constant mode.
+    """Resolve the best fan speed for constant mode.
 
     Fallback chain: live airVolume → targetValue → program air volume → default.
-    Always returns at least 1 (API rejects value=0).
+    Always returns ≥ 1 (the API rejects 0).
     """
     if circuit is None:
         return DEFAULT_FAN_SPEED
-    # Try live sensor value first
-    val = circuit.live_values.get("airVolume")
-    if val is not None:
-        speed = int(float(val))
-        if speed >= 1:
-            return speed
-    # Try target from circuit config
-    if circuit.target_value is not None:
-        speed = int(circuit.target_value)
-        if speed >= 1:
-            return speed
-    # Try the currently active time program phase value
-    if circuit.program_air_volume is not None:
-        speed = int(circuit.program_air_volume)
-        if speed >= 1:
-            return speed
+    for val_raw in (
+        circuit.live_values.get("airVolume"),
+        circuit.target_value,
+        circuit.program_air_volume,
+    ):
+        if val_raw is not None:
+            speed = int(float(val_raw))
+            if speed >= 1:
+                return speed
     return DEFAULT_FAN_SPEED
 
 
+# ---------------------------------------------------------------------------
+# Coordinator
+# ---------------------------------------------------------------------------
+
 class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
-    """Coordinator to fetch data from Hoval Connect API."""
+    """Coordinator to fetch and cache data from the Hoval Connect API."""
 
     config_entry: ConfigEntry
 
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        api: HovalConnectApi,
-    ) -> None:
-        """Initialize the coordinator."""
+    def __init__(self, hass: HomeAssistant, api: HovalConnectApi) -> None:
+        """Initialise the coordinator."""
         super().__init__(
             hass,
             _LOGGER,
@@ -253,58 +254,42 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         )
         self.api = api
         self.control_lock = asyncio.Lock()
-        # Optimistic mode override per circuit (set by control actions,
-        # cleared on next poll). Key: circuit_path, value: operation mode string.
         self._mode_override: dict[str, str] = {}
-        # Program cache: key=circuit_path, value=(programs_data, timestamp)
         self._program_cache: dict[str, tuple[Any, float]] = {}
         self._program_cache_ttl = PROGRAM_CACHE_TTL.total_seconds()
-        # Track known circuits for dynamic entity discovery
         self._known_circuits: set[str] = set()
-        # Track background refresh tasks so they can be cancelled on entry unload
+        # Background-task tracking — tasks are cancelled on config-entry unload
+        # so they cannot call async_request_refresh() after teardown.
         self._pending_tasks: set[asyncio.Task] = set()
-        # Adaptive backoff: track consecutive failures to widen the poll interval
-        # during sustained outages, and restore it when the API recovers.
+        # Adaptive back-off state
         self._consecutive_failures: int = 0
         self._base_update_interval: timedelta = DEFAULT_SCAN_INTERVAL
 
-    def set_base_update_interval(self, interval: timedelta) -> None:
-        """Set the configured poll interval and reset any active backoff.
+    # ------------------------------------------------------------------
+    # Interval management
+    # ------------------------------------------------------------------
 
-        Called from async_setup_entry and _async_options_updated so that a
-        user-changed scan interval takes effect immediately and clears any
-        backoff that was in progress.
+    def set_base_update_interval(self, interval: timedelta) -> None:
+        """Set the configured poll interval and reset any active back-off.
+
+        Called from ``async_setup_entry`` and ``_async_options_updated`` so
+        that a user-changed scan interval takes effect immediately and clears
+        any back-off that was in progress.
+
+        Also primes ``api.stats._poll_interval_seconds`` so the diagnostic
+        sensor shows the correct value from the moment of setup rather than
+        waiting for the first successful refresh to update it.
         """
         self._base_update_interval = interval
         self._consecutive_failures = 0
         self.update_interval = interval
-
-    def set_mode_override(self, circuit_path: str, mode: str) -> None:
-        """Set optimistic mode override after a control action."""
-        self._mode_override[circuit_path] = mode
-
-    def get_mode_override(self, circuit_path: str) -> str | None:
-        """Get the optimistic mode override for a circuit."""
-        return self._mode_override.get(circuit_path)
-
-    def cancel_pending_tasks(self) -> None:
-        """Cancel all pending background refresh tasks.
-
-        Called by async_unload_entry so that in-flight post-control refreshes
-        do not call async_request_refresh() on a torn-down coordinator after
-        the config entry has been unloaded.
-        """
-        for task in list(self._pending_tasks):
-            task.cancel()
-        self._pending_tasks.clear()
+        self.api.stats._poll_interval_seconds = int(interval.total_seconds())
 
     def _apply_backoff(self) -> None:
         """Widen the poll interval exponentially after repeated failures.
 
-        Kicks in after _BACKOFF_THRESHOLD consecutive failures, doubling the
-        interval each time up to _MAX_BACKOFF_SECONDS.  Logged at INFO so the
-        user can see in the HA log that the integration is deliberately slowing
-        down rather than hammering a struggling server.
+        Kicks in after ``_BACKOFF_THRESHOLD`` consecutive failures.  The
+        interval doubles each time up to ``_MAX_BACKOFF_SECONDS``.
         """
         if self._consecutive_failures <= _BACKOFF_THRESHOLD:
             return
@@ -317,13 +302,41 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         if new_interval != self.update_interval:
             _LOGGER.info(
                 "Hoval API unavailable (%d consecutive failures); "
-                "backing off poll interval to %ds (base: %ds, max: %ds)",
+                "backing off poll interval to %ds",
                 self._consecutive_failures,
                 int(backed_off),
-                int(base_s),
-                _MAX_BACKOFF_SECONDS,
             )
             self.update_interval = new_interval
+
+    # ------------------------------------------------------------------
+    # Mode override helpers
+    # ------------------------------------------------------------------
+
+    def set_mode_override(self, circuit_path: str, mode: str) -> None:
+        """Store an optimistic mode override for a circuit after a control action."""
+        self._mode_override[circuit_path] = mode
+
+    def get_mode_override(self, circuit_path: str) -> str | None:
+        """Return the optimistic override for a circuit, or None."""
+        return self._mode_override.get(circuit_path)
+
+    # ------------------------------------------------------------------
+    # Task lifecycle
+    # ------------------------------------------------------------------
+
+    def cancel_pending_tasks(self) -> None:
+        """Cancel all in-flight background refresh tasks.
+
+        Called by ``async_unload_entry`` to prevent post-control refresh tasks
+        from calling ``async_request_refresh()`` on a torn-down coordinator.
+        """
+        for task in list(self._pending_tasks):
+            task.cancel()
+        self._pending_tasks.clear()
+
+    # ------------------------------------------------------------------
+    # Control + refresh
+    # ------------------------------------------------------------------
 
     async def async_control_and_refresh(
         self,
@@ -331,33 +344,23 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         circuit_path: str,
         mode_override: str,
     ) -> None:
-        """Execute a control command with lock, optimistic state, and refresh.
+        """Execute a control command, set optimistic state, then refresh.
 
-        The API call and optimistic override are serialised inside control_lock
-        so concurrent control actions don't race each other.
+        The API call and override are serialised inside ``control_lock``.
+        The post-control refresh runs as a fire-and-forget background task so
+        the entity action method returns to HA immediately (responsive UI even
+        when the cloud is slow).
 
-        The coordinator refresh is scheduled as a fire-and-forget background
-        task that returns to the caller immediately, keeping the UI responsive
-        even when the Hoval cloud is slow.
-
-        The 2-second pre-refresh pause (giving the API time to commit the
-        change before we read back) is inside the background task so the
-        caller is not blocked.
-
-        The task handle is stored in _pending_tasks so it can be cancelled
-        cleanly if the config entry is unloaded before the refresh completes.
+        The 2-second pre-refresh pause lives *inside* the background task so
+        the caller is not blocked.  The task handle is registered in
+        ``_pending_tasks`` so it is cancelled cleanly on entry unload.
         """
         async with self.control_lock:
             await coro
             self.set_mode_override(circuit_path, mode_override)
 
-        # Schedule refresh as background task — do not await it here.
-        # This keeps the caller (entity action method) fast and prevents the
-        # lock from being starved during a slow/timeout refresh.
         async def _do_refresh() -> None:
-            # Brief pause inside the task so the API has time to commit the
-            # change before we read back.  Kept here (not in the caller) so
-            # the entity action method returns to HA immediately.
+            # Give the API time to commit the change before reading back.
             await asyncio.sleep(2)
             try:
                 await self.async_request_refresh()
@@ -371,6 +374,10 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         self._pending_tasks.add(task)
         task.add_done_callback(self._pending_tasks.discard)
 
+    # ------------------------------------------------------------------
+    # Per-circuit data fetch
+    # ------------------------------------------------------------------
+
     async def _fetch_circuit_data(
         self,
         plant_id: str,
@@ -378,18 +385,12 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         ctype: str,
         circuit: dict,
     ) -> HovalCircuitData:
-        """Fetch live values and programs for a single circuit.
+        """Fetch live values and (cached) programs for one circuit.
 
-        Live values are always fetched. Programs are fetched only when the cache
-        has expired (PROGRAM_CACHE_TTL, default 5 min), reducing API load.
-
-        Both fetches run in parallel via asyncio.gather with return_exceptions=True
-        so a failure on one does not block the other.
-
-        The entire fetch is wrapped in asyncio.timeout(_CIRCUIT_TIMEOUT) so that
-        a single stuck circuit cannot hold up the coordinator's global 90 s cap.
-        On timeout the circuit is returned with empty live_values; entities show
-        their previous state until the next successful poll.
+        Wrapped in ``asyncio.timeout(_CIRCUIT_TIMEOUT)`` so a single stuck
+        circuit cannot exhaust the coordinator's 90 s global budget.  On
+        timeout the circuit is returned with empty ``live_values``; the entity
+        continues to show its last known state until the next successful poll.
         """
         raw_program = circuit.get("activeProgram")
         air_quality = circuit.get("airQuality") or {}
@@ -405,7 +406,6 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
             circuit_status=circuit.get("circuitStatus"),
         )
 
-        # Check program cache
         cached_prog = self._program_cache.get(path)
         need_programs = (
             cached_prog is None
@@ -414,7 +414,6 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
 
         try:
             async with asyncio.timeout(_CIRCUIT_TIMEOUT):
-                # Fetch live values (always) + programs (only if cache expired) in parallel
                 if need_programs:
                     results = await asyncio.gather(
                         self.api.get_live_values(plant_id, path, ctype),
@@ -432,12 +431,11 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                     prog_result = cached_prog[0]
         except TimeoutError:
             _LOGGER.warning(
-                "Circuit %s data fetch timed out after %ds; "
-                "entities will show previous state until next poll",
+                "Circuit %s data fetch timed out after %ds; keeping previous state",
                 path,
                 _CIRCUIT_TIMEOUT,
             )
-            return circuit_data  # empty live_values — entity stays at last state
+            return circuit_data
 
         if not isinstance(live_result, BaseException):
             circuit_data.live_values = {v["key"]: v["value"] for v in live_result}
@@ -455,7 +453,6 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
             circuit_data.active_week_name = week_name
             circuit_data.active_day_program_name = day_name
             circuit_data.program_air_volume = phase_value
-            # Extract user-defined program names
             w1 = prog_result.get("week1", {})
             w2 = prog_result.get("week2", {})
             if w1.get("name"):
@@ -467,23 +464,24 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
 
         return circuit_data
 
+    # ------------------------------------------------------------------
+    # Main update entry points
+    # ------------------------------------------------------------------
+
     async def _async_update_data(self) -> HovalData:
-        """Fetch data from the API with adaptive backoff on sustained failures.
+        """Fetch data from the API with adaptive back-off on sustained failures.
 
-        On success: reset failure counter and restore the configured poll interval.
-        On TimeoutError / HovalApiError: increment counter and apply exponential
-          backoff after _BACKOFF_THRESHOLD consecutive failures (up to 15 min).
-        On HovalAuthError: does not back off — auth failures require user action
-          and HA's ConfigEntryAuthFailed machinery handles the notification.
+        Success path: reset failure counter and restore the configured interval.
+        Failure path: increment counter; widen interval after _BACKOFF_THRESHOLD.
+        Auth errors: do not back off — HA's ConfigEntryAuthFailed stops retries.
 
-        The 90 s asyncio.timeout is a hard cap that prevents the coordinator from
-        blocking HA's event loop indefinitely when the cloud is unresponsive.
+        Also updates ``api.stats._poll_interval_seconds`` so the diagnostic
+        poll-interval sensor always reflects the current setting.
         """
         try:
             async with asyncio.timeout(90):
                 data = await self._fetch_all_data()
 
-            # Success path: reset backoff and restore normal poll cadence
             if self._consecutive_failures > 0:
                 _LOGGER.info(
                     "Hoval API recovered after %d consecutive failure(s); "
@@ -493,19 +491,20 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 )
             self._consecutive_failures = 0
             self.update_interval = self._base_update_interval
+            # Keep the poll-interval stat current for the diagnostic sensor.
+            self.api.stats._poll_interval_seconds = int(
+                self.update_interval.total_seconds()
+            )
             return data
 
         except TimeoutError as err:
             self._consecutive_failures += 1
             self._apply_backoff()
             raise UpdateFailed(
-                "Hoval API refresh timed out after 90 s — cloud may be unresponsive. "
-                "HA will retry automatically."
+                "Hoval API refresh timed out after 90 s — cloud may be unresponsive."
             ) from err
         except HovalAuthError as err:
-            # Auth errors are not transient — do not increment failure counter
-            # or back off, as ConfigEntryAuthFailed stops retries until the user
-            # re-enters credentials anyway.
+            # Auth failures are permanent; don't increment the back-off counter.
             self._consecutive_failures = 0
             self.update_interval = self._base_update_interval
             raise ConfigEntryAuthFailed("Authentication failed — check credentials") from err
@@ -516,17 +515,17 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
             raise UpdateFailed(f"Error fetching Hoval data: {err}") from err
 
     async def _fetch_all_data(self) -> HovalData:
-        """Inner fetch — called inside the asyncio.timeout guard.
+        """Fetch all plants, circuits, events and weather from the API.
 
-        HovalAuthError and HovalApiError propagate up to _async_update_data
-        which converts them to ConfigEntryAuthFailed / UpdateFailed respectively.
-
-        _mode_override is cleared only at the END of a successful fetch so
-        that optimistic entity state survives failed/timed-out refreshes.
+        Called inside the 90 s asyncio.timeout guard in ``_async_update_data``.
+        ``_mode_override`` is cleared only after a *successful* fetch so that
+        optimistic entity state survives transient failures.
         """
         data = HovalData()
-
-        plants = await self.api.get_plants()
+        # Guard against None: the API can return an empty 204 body which
+        # _request translates to None.  Iterating over None would raise
+        # "NoneType is not iterable" and bring down the entire refresh.
+        plants = await self.api.get_plants() or []
 
         for plant in plants:
             plant_id = plant.get("plantExternalId")
@@ -534,53 +533,29 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 _LOGGER.debug("Skipping plant with missing plantExternalId")
                 continue
 
-            plant_name = plant.get("description", plant_id)
-
             plant_data = HovalPlantData(
                 plant_id=plant_id,
-                name=plant_name,
+                name=plant.get("description", plant_id),
                 is_online=plant.get("isOnline", True),
             )
 
-            # Skip all API calls when plant is offline
             if not plant_data.is_online:
-                # Invalidate cached PAT so we get a fresh token when back
                 self.api.invalidate_plant_token(plant_id)
                 data.plants[plant_id] = plant_data
                 continue
 
-            # Fetch circuits. A persistent failure here is the most common
-            # symptom of an upstream API change (the v1 endpoint removal in
-            # April 2026 was masked for days because we used to swallow this
-            # error). Log loudly and let DataUpdateCoordinator surface the
-            # failure to the user as `unavailable` entities.
             try:
-                circuits_raw = await self.api.get_circuits(plant_id)
+                # Guard against None for the same reason as get_plants() above.
+                circuits_raw = await self.api.get_circuits(plant_id) or []
             except HovalApiError as err:
                 _LOGGER.error(
-                    "Circuits endpoint failed for plant %s: %s — entities will go "
-                    "unavailable until the cloud API recovers or the integration is "
-                    "updated.",
-                    plant_id,
-                    err,
+                    "Circuits endpoint failed for plant %s: %s — entities will be "
+                    "unavailable until the API recovers.",
+                    plant_id, err,
                 )
                 raise
 
-            # BL/WW circuits have selectable=False but still provide live values
             _non_selectable_types = {CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WW}
-
-            _LOGGER.debug(
-                "Fetched %d circuits (%d supported)",
-                len(circuits_raw),
-                sum(
-                    1
-                    for c in circuits_raw
-                    if c.get("type") in SUPPORTED_CIRCUIT_TYPES
-                    and (c.get("selectable") or c.get("type") in _non_selectable_types)
-                ),
-            )
-
-            # Build list of supported circuits
             supported_circuits: list[tuple[str, str, dict]] = []
             for circuit in circuits_raw:
                 ctype = circuit.get("type", "")
@@ -596,11 +571,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 )
                 supported_circuits.append((path, ctype, circuit))
 
-            # Fetch all circuits in parallel. Each circuit has its own
-            # _CIRCUIT_TIMEOUT cap so a single slow/stuck circuit cannot
-            # exhaust the coordinator's 90 s global budget.
-            # return_exceptions=True means one failed circuit does not
-            # block the others.
+            # --- Fetch all circuits in parallel (each with its own timeout cap) ---
             circuit_results = await asyncio.gather(
                 *[
                     self._fetch_circuit_data(plant_id, path, ctype, circ)
@@ -609,10 +580,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 return_exceptions=True,
             )
 
-            # Fetch plant-level data (events + weather) in parallel.
-            # Kept separate from circuit fetches for clarity; these calls are
-            # fast and do not benefit meaningfully from being fused with the
-            # circuit gather above.
+            # --- Fetch plant-level data in parallel (separate gather for clarity) ---
             latest_event_result, events_result, weather_result = await asyncio.gather(
                 self.api.get_latest_event(plant_id),
                 self.api.get_events(plant_id),
@@ -620,7 +588,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 return_exceptions=True,
             )
 
-            # Process circuit results
+            # Process circuits
             for result in circuit_results:
                 if isinstance(result, BaseException):
                     _LOGGER.debug("Circuit fetch failed: %s", result)
@@ -635,10 +603,9 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 if _is_problem_event(plant_data.latest_event):
                     plant_data.has_error = True
                 _LOGGER.debug(
-                    "Latest event: type=%s active=%s desc=%s",
+                    "Latest event: type=%s active=%s",
                     plant_data.latest_event.event_type,
                     plant_data.latest_event.is_active,
-                    plant_data.latest_event.description,
                 )
             elif isinstance(latest_event_result, BaseException):
                 _LOGGER.debug("Events endpoint not available for %s", plant_id)
@@ -654,7 +621,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
             elif isinstance(events_result, BaseException):
                 _LOGGER.debug("Events list not available for %s", plant_id)
 
-            # Process weather forecast
+            # Process weather
             if not isinstance(weather_result, BaseException) and weather_result:
                 if isinstance(weather_result, list) and weather_result:
                     w = weather_result[0]
@@ -668,27 +635,21 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
 
             data.plants[plant_id] = plant_data
 
-        # Detect new circuits for dynamic entity discovery.
-        # Fire on any newly seen circuit, including the first one. Skipping the
-        # initial set (when `_known_circuits` was still empty) used to leave
-        # circuits stranded if the very first refresh came back without them
-        # — async_setup_entry's _add_new() ran against an empty circuits dict
-        # and the dispatcher then suppressed the catch-up signal. Each platform
-        # already deduplicates via its `known` set, so firing on the first
-        # discovery is a no-op when entities are already present.
+        # Dynamic entity discovery — fire signal on any newly seen circuit.
+        # Firing on the *first* discovery is intentional: it ensures entities
+        # added in _add_new() catch up even if the first poll returned after
+        # platform setup ran against an empty circuits dict.
         current_circuits = {
-            f"{pid}_{path}" for pid, plant in data.plants.items() for path in plant.circuits
+            f"{pid}_{path}"
+            for pid, plant in data.plants.items()
+            for path in plant.circuits
         }
-        new_circuits = current_circuits - self._known_circuits
-        if new_circuits:
+        if new_circuits := current_circuits - self._known_circuits:
             _LOGGER.info("New circuits discovered: %s", new_circuits)
             async_dispatcher_send(self.hass, SIGNAL_NEW_CIRCUITS)
         self._known_circuits = current_circuits
 
-        # Clear optimistic overrides only after a SUCCESSFUL fetch so that if
-        # the refresh fails (API timeout, transient error), entities continue to
-        # show their optimistic state rather than snapping back to stale data
-        # mid-cycle.  Fresh coordinator data takes over on the next good refresh.
+        # Clear overrides only after a successful fetch so optimistic state
+        # survives transient failures.
         self._mode_override.clear()
-
         return data

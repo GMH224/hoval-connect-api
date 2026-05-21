@@ -34,21 +34,10 @@ type HovalConnectConfigEntry = ConfigEntry[HovalRuntimeData]
 
 @dataclass
 class HovalRuntimeData:
-    """Runtime data stored on the config entry after successful setup.
-
-    Accessible from any platform via ``entry.runtime_data``.
-
-    Attributes:
-        coordinator: The data coordinator that polls the Hoval API.
-        api:         The raw API client (used by service calls and platforms
-                     that issue direct control commands).
-        stats:       Rolling-window API communication statistics exposed by the
-                     diagnostic sensor platform.
-    """
+    """Runtime data for the Hoval Connect integration."""
 
     coordinator: HovalDataCoordinator
     api: HovalConnectApi
-    stats: HovalApiStats
 
 
 def plant_device_info(plant_data: HovalPlantData) -> DeviceInfo:
@@ -85,6 +74,8 @@ def _get_scan_interval(entry: HovalConnectConfigEntry) -> timedelta:
 async def async_setup_entry(hass: HomeAssistant, entry: HovalConnectConfigEntry) -> bool:
     """Set up Hoval Connect from a config entry."""
     session = async_get_clientsession(hass)
+    # Create the stats collector first so the API client can record metrics
+    # from the very first authentication call during setup.
     stats = HovalApiStats()
     api = HovalConnectApi(session, entry.data["email"], entry.data["password"], stats=stats)
 
@@ -93,7 +84,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HovalConnectConfigEntry)
 
     await coordinator.async_config_entry_first_refresh()
 
-    entry.runtime_data = HovalRuntimeData(coordinator=coordinator, api=api, stats=stats)
+    entry.runtime_data = HovalRuntimeData(coordinator=coordinator, api=api)
 
     # Register a parent device for each plant so circuit devices can use via_device
     device_reg = dr.async_get(hass)
@@ -121,14 +112,16 @@ async def _async_options_updated(
     """Handle options update — adjust polling interval without reload."""
     coordinator = entry.runtime_data.coordinator
     new_interval = _get_scan_interval(entry)
+    # set_base_update_interval also resets any active back-off so the new
+    # interval takes effect immediately rather than being overridden.
     coordinator.set_base_update_interval(new_interval)
-    _LOGGER.debug("Polling interval updated to %s (backoff reset)", new_interval)
+    _LOGGER.debug("Polling interval updated to %s (back-off reset)", new_interval)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: HovalConnectConfigEntry) -> bool:
     """Unload a config entry."""
-    # Cancel any in-flight post-control background refresh tasks before tearing
-    # down the coordinator, so they don't call async_request_refresh() on a
-    # coordinator that no longer has a valid config entry.
+    # Cancel any in-flight post-control background refresh tasks before
+    # tearing down the coordinator so they cannot call async_request_refresh()
+    # on a coordinator that no longer has a valid config entry.
     entry.runtime_data.coordinator.cancel_pending_tasks()
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

@@ -131,97 +131,154 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
-### v0.15.9
-Focus: API communication monitoring sensors + production-quality documentation pass.
+### v0.15.10
+Base: v0.15.6 (last confirmed working release).  Incorporates all improvements
+from the v0.15.7 and v0.15.8 development sessions applied cleanly to the working
+base, plus the new API communication monitoring sensors.
 
-#### New: API communication sensors
-**New file `api_stats.py`** — ``HovalApiStats`` rolling-window statistics collector.
-Maintains four monotonic-timestamp deques (calls, timeouts, errors, retries) as a
-1-hour sliding window.  All rate metrics (calls/hour, timeouts/hour, etc.) are
-automatically up-to-date without any external reset.  Lifetime counters (total_*)
-accumulate for the full HA session.  UTC ``datetime`` objects are stored for the
-two timestamp sensors so HA can render them directly without parsing.  An
-``as_dict()`` method is used by the diagnostics platform.
+#### New: API communication monitoring (11 diagnostic sensors)
 
-**12 new diagnostic sensor entities** added to the plant device
-(``entity_category=DIAGNOSTIC``, do not appear in the main dashboard by default):
+**`api_stats.py`** (new file) — pure-Python rolling-window statistics collector
+with no HA imports.  `HovalApiStats` uses four `collections.deque` structures
+(calls, timeouts, errors, retries) with monotonic timestamps for an efficient
+1-hour sliding window, pruned lazily on every property read.  UTC `datetime`
+objects stored for TIMESTAMP sensors.  `_poll_interval_seconds` updated by the
+coordinator so the poll-interval sensor always reflects the current setting.
 
-| Entity key | What it shows |
-|---|---|
-| `api_calls_hour` | HTTP requests made in the last 60 minutes |
-| `api_timeouts_hour` | Timed-out requests in the last 60 minutes |
-| `api_errors_hour` | Terminal request failures in the last 60 minutes |
-| `api_retries_hour` | Retry attempts triggered in the last 60 minutes |
-| `api_failure_ratio` | Error rate as % of calls in the last 60 minutes |
-| `api_total_calls` | All HTTP requests since HA started (lifetime) |
-| `api_total_errors` | All terminal errors since HA started (lifetime) |
-| `api_last_success` | UTC timestamp of last successful API response |
-| `api_last_error` | UTC timestamp of last terminal error |
-| `api_last_error_message` | Human-readable description of last error |
-| `api_consecutive_failures` | Current coordinator consecutive-failure count |
-| `api_poll_interval` | Current poll interval in seconds (reflects adaptive backoff) |
+**11 new `DIAGNOSTIC` sensor entities on the plant device:**
 
-`api_poll_interval` and `api_consecutive_failures` read from the coordinator
-directly (not from ``HovalApiStats``), making backoff transparent in the HA UI.
+| Entity | Description | Unit |
+|---|---|---|
+| `api_calls_hour` | HTTP calls in last 60 min | count |
+| `api_timeouts_hour` | Timed-out calls in last 60 min | count |
+| `api_errors_hour` | Terminal failures in last 60 min | count |
+| `api_retries_hour` | Retry attempts in last 60 min | count |
+| `api_failure_ratio` | Error rate in last 60 min | % |
+| `api_total_calls` | All calls since HA start | count |
+| `api_total_errors` | All errors since HA start | count |
+| `api_last_success` | UTC time of last successful call | timestamp |
+| `api_last_error_time` | UTC time of last error | timestamp |
+| `api_last_error_message` | Description of last error | string |
+| `api_poll_interval` | Current poll interval | seconds |
 
-**`api.py`** — instrumented with ``stats.record_*()`` calls at every HTTP event:
-``record_call()`` at the start of every outbound attempt (in ``_request``,
-``_get_id_token``, ``_get_plant_access_token``); ``record_timeout()`` on every
-``TimeoutError`` catch including mid-retry; ``record_retry()`` before each retry
-sleep; ``record_error()`` on terminal failure; ``record_success()`` on a valid 2xx
-response.  The stats object is stored as ``api.stats`` and is accessible via
-``entry.runtime_data.stats``.
+`HovalCommsSensorEntityDescription` uses `stat_fn` (not `value_fn`) to avoid
+any future conflict with `SensorEntityDescription`.  `HovalRuntimeData` is
+**unchanged** — sensors reach stats via `self.coordinator.api.stats` which is
+always non-None.
 
-**`__init__.py`** — ``HovalApiStats()`` created in ``async_setup_entry`` and passed
-to ``HovalConnectApi`` at construction time.  ``HovalRuntimeData`` extended with a
-``stats: HovalApiStats`` field.  Full docstring added to ``HovalRuntimeData``.
+#### Resilience improvements
 
-**`sensor.py`** — new ``HovalCommsSensorEntityDescription`` dataclass (``value_fn``
-accepts both stats and coordinator).  ``COMMS_SENSOR_DESCRIPTIONS`` tuple with all
-12 entries.  ``HovalApiStatsSensor`` entity class — extends ``CoordinatorEntity``
-for lifecycle management but reads from ``_stats`` in ``native_value``.
-``async_setup_entry`` updated to create comms sensors per plant.
+**`api.py`** — retry jitter: all retry delays now use `_jittered_delay(attempt)`
+— `base × 2^attempt × uniform(0.5, 1.0)` — preventing synchronised retry bursts
+when multiple circuit requests fail simultaneously.  Auth helpers
+(`_get_id_token`, `_get_plant_access_token`) now have full retry loops matching
+`_request`; previously a single network blip on the IDP/PAT endpoint caused an
+immediate refresh failure.  Stats instrumented at every HTTP event.
 
-**`diagnostics.py`** — diagnostics payload extended with ``api_stats`` (from
-``stats.as_dict()``) and ``coordinator_health`` (consecutive failures, current and
-base poll intervals).  Module-level docstring added listing all payload sections.
+**`coordinator.py`** — full rewrite incorporating:
+- `_resolve_active_program_value` accepts `active_program` param; selects
+  `week2` schedule when `active_program == "week2"` instead of always using
+  `week1` (circuits on week2 now get correct schedule data).
+- `_fetch_circuit` extracted from nested closure to `_fetch_circuit_data()`
+  method on `HovalDataCoordinator` — testable in isolation, no loop-variable
+  capture tricks.
+- Separate `asyncio.gather` calls for circuit fetches and plant-level fetches
+  (events, weather) — eliminates fragile integer-index tracking.
+- Per-circuit `asyncio.timeout(_CIRCUIT_TIMEOUT=35)` — a single slow circuit
+  can no longer consume the coordinator's 90 s global budget.
+- Adaptive poll back-off: after `_BACKOFF_THRESHOLD=2` consecutive failures
+  the interval doubles each time up to 15 min; resets on recovery.
+- Background refresh task tracking: `_pending_tasks` set + `cancel_pending_tasks()`
+  method called by `async_unload_entry` — tasks cannot call
+  `async_request_refresh()` on a torn-down coordinator.
+- `sleep(2)` moved inside `_do_refresh()` background task so entity action
+  methods return to HA immediately.
 
-#### Documentation pass (all files)
-Every module, class, method, and non-obvious constant now has a Google-style
-docstring or inline comment.  Key additions:
-- ``api.py``: class-level docstring covering auth flow, resilience, and stats.
-  Method docstrings for all public methods describing endpoint, auth requirements,
-  and edge cases.  ``_request`` docstring describes the full retry flow and every
-  stats recording point.
-- ``coordinator.py``: ``_fetch_circuit_data`` and ``_async_update_data`` docstrings
-  explain the timeout hierarchy and adaptive backoff.
-- ``api_stats.py``: module docstring explaining the design (asyncio-safe, monotonic
-  pruning, wall-clock timestamps).  Property docstrings for all computed attributes.
-- ``__init__.py``: ``HovalRuntimeData`` dataclass fully documented.
+**`__init__.py`** — `set_base_update_interval()` used instead of direct
+`update_interval =` so options changes also reset back-off.
+`async_unload_entry` calls `coordinator.cancel_pending_tasks()`.
 
-### v0.15.8
-Focus: timeout resilience and reduction of crash/noise during Hoval cloud instability.
+**`sensor.py`** — `latest_event_time` TIMESTAMP sensor now parses the
+ISO-8601 string from the API into a timezone-aware `datetime` via
+`dt_util.parse_datetime()` (previously showed `unknown`).  Added `import logging`,
+`_LOGGER`, and `from homeassistant.util import dt as dt_util`.
 
-- **Retry jitter** (`api.py`): All retry delays in `_request`, `_get_id_token`, and `_get_plant_access_token` now use `_jittered_delay(attempt)` — `base × 2^attempt × uniform(0.5, 1.0)` — rather than a fixed value. This prevents synchronised retry bursts (thundering-herd) when multiple circuit requests fail at the same moment. Extracted into a module-level helper `_jittered_delay()` for consistency and testability. Added `import random`.
+**`fan.py`** — `_debounced_set` now catches `HomeAssistantError`, logs at ERROR,
+clears `_pending_percentage`, and calls `async_write_ha_state()` so the UI
+reverts to the last confirmed state instead of freezing on a stale value.
 
-- **Auth call retry loops** (`api.py`): `_get_id_token` and `_get_plant_access_token` previously made a single HTTP call with no retry. A momentary blip on the SAP IAS identity provider or the PAT endpoint caused an immediate `HovalApiError`, failing the entire coordinator refresh before the 90 s timeout could help. Both methods now have a `for attempt in range(_MAX_RETRIES)` loop identical to `_request`, with jittered backoff on `aiohttp.ClientError` and `TimeoutError`. `HovalAuthError` (4xx — bad credentials) is still raised immediately without retry since credentials don't fix themselves. Comments added to both `get_events` and `get_latest_event` explaining why `plant_id=` is intentionally omitted (those paths do not require `X-Plant-Access-Token`; adding it would cause 401s — fix #6 from recommendations).
+**`select.py`** — `_api_key_from_display` raises `HomeAssistantError` with an
+actionable reload message when the reverse lookup fails, instead of passing the
+raw display string to the API.
 
-- **Per-circuit `asyncio.timeout`** (`coordinator.py`): `_fetch_circuit_data` wraps its entire gather block in `async with asyncio.timeout(_CIRCUIT_TIMEOUT)` (35 s). Previously, one stuck circuit could occupy up to ~57 s of the coordinator's 90 s global budget; now it times out at 35 s, logs a WARNING, and returns `circuit_data` with empty `live_values` so the entity shows its previous state. The remaining circuits and plant-level fetches get the full remaining budget. Added `_CIRCUIT_TIMEOUT = 35` module constant with explanation.
+**`test_coordinator.py`** — `sys.modules` assignments replaced with
+`setdefault` (test-order safety).  All `_resolve_active_program_value` call
+sites updated for the new `active_program` parameter.  `_make_programs` extended
+with `week2` schedule and a third day configuration.  New tests:
+`test_week2_uses_week2_schedule`, `test_non_schedule_programs_fall_back_to_week1`,
+`test_active_program_defaults_to_none`.
 
-- **Sleep moved inside background refresh task** (`coordinator.py`): The 2-second pre-refresh pause in `async_control_and_refresh` was previously awaited by the caller (the entity action method, e.g. `async_set_hvac_mode`), blocking it for 2 s before returning to HA. Moved inside `_do_refresh()` so the entity action returns to HA immediately after scheduling the task. The Hoval API still gets the same 2 s commit window before the read-back; only the caller is no longer blocked.
+### v0.15.6
 
-- **Adaptive poll backoff** (`coordinator.py`, `__init__.py`): On sustained API failures the coordinator now backs off its poll interval exponentially rather than hammering a struggling server at the configured rate. New state: `_consecutive_failures` counter and `_base_update_interval` (the user-configured rate). Logic: first `_BACKOFF_THRESHOLD=2` failures keep normal cadence (transient blips), from the third failure onward the interval doubles each time up to `_MAX_BACKOFF_SECONDS=900` (15 min). On any successful refresh the counter resets to 0 and the interval reverts to `_base_update_interval`. `HovalAuthError` does not increment the counter (HA's ConfigEntryAuthFailed machinery stops retries anyway). New `set_base_update_interval(interval)` method replaces direct `coordinator.update_interval =` assignment; it updates `_base_update_interval`, resets the failure counter, and sets `update_interval`. Called from both `async_setup_entry` and `_async_options_updated` in `__init__.py` so a user-changed scan interval also clears any in-progress backoff.
+**New file: `api_stats.py`**
+Pure-Python rolling-window statistics collector with no HA imports.
+`HovalApiStats` uses four `collections.deque` structures (calls, timeouts,
+errors, retries), each holding `time.monotonic()` timestamps.  The 1-hour
+sliding window is pruned lazily on every property read — no background timer,
+no locks required (all mutation happens on the asyncio event-loop thread).
+Wall-clock timestamps (`last_success_time`, `last_error_time`) are
+`datetime.now(timezone.utc)` objects so the TIMESTAMP sensors work without
+additional parsing.  `_poll_interval_seconds` is written by the coordinator
+after every successful refresh so the poll-interval sensor always reflects
+the current setting.
 
-### v0.15.7
-- **`latest_event_time` sensor fixed** (`sensor.py`): The `TIMESTAMP` device class requires a timezone-aware `datetime` object — not a raw string. Previously the sensor always showed `unknown` because the ISO-8601 string from the API (e.g. `"2026-02-17T10:30:00Z"`) was returned as-is. Now parsed via `dt_util.parse_datetime()`. Added `logging` import and `_LOGGER` to `sensor.py` (previously had no logger) so the debug line on parse failure can emit.
-- **`_resolve_active_program_value` week selection fixed** (`coordinator.py`): The function previously always read from `week1` regardless of the circuit's `active_program`. Circuits running `week2` were getting the wrong schedule for `active_week_name`, `active_day_program_name`, and `program_air_volume`. Added `active_program: str | None = None` parameter; uses `week2` key when `active_program == "week2"`, falls back to `week1` for all other values (constant, ecoMode, standby, None) since those modes are not schedule-driven. `_fetch_circuit_data` passes `circuit_data.active_program` to the resolver.
-- **Fan debounce task error handling** (`fan.py`): `_debounced_set` is scheduled as a fire-and-forget background task; previously any `HomeAssistantError` from `_send_percentage` was silently swallowed, leaving the UI stuck on a stale pending percentage. Now caught, logged at ERROR level, and `_pending_percentage` is cleared + `async_write_ha_state()` called so the UI reverts to the last confirmed state.
-- **Background refresh task lifecycle** (`coordinator.py`, `__init__.py`): `async_control_and_refresh` now stores each background `_do_refresh` task handle in `_pending_tasks: set[asyncio.Task]` and registers a `discard` done-callback for automatic cleanup. New `cancel_pending_tasks()` method cancels all in-flight tasks. Called from `async_unload_entry` in `__init__.py` so that post-control refreshes cannot call `async_request_refresh()` on a torn-down coordinator after entry unload.
-- **Fragile index arithmetic refactored** (`coordinator.py`): The single large `asyncio.gather(*all_tasks)` that mixed circuit coroutines with plant-level tasks (events, weather) and used manually tracked integer indices to extract results has been split into two explicit `gather` calls: one for circuits (`circuit_results`) and one for plant-level data (`latest_event_result, events_result, weather_result = await asyncio.gather(...)`). Eliminates the silent-breakage risk from reordering tasks.
-- **`_fetch_circuit` extracted as coordinator method** (`coordinator.py`): The inner async function `_fetch_circuit` was redefined on every plant loop iteration and was untestable in isolation. Replaced by `_fetch_circuit_data(self, plant_id, path, ctype, circuit)` — a proper instance method on `HovalDataCoordinator`. Loop-variable capture no longer relies on default-arg tricks.
-- **`_api_key_from_display` whitelist guard** (`select.py`): Previously fell through to return the raw display string when the reverse lookup failed (e.g. after a program rename on the API side), silently sending an invalid value to the cloud which would return an opaque 4xx. Now raises `HomeAssistantError` with an actionable message directing the user to reload the integration.
-- **`resp.content_length == 0` → `not resp.content_length`** (`api.py`): When the Hoval server returns a 200 with an empty body but no `Content-Length` header, `aiohttp` sets `content_length=None`, bypassing the old `== 0` check and then crashing in `resp.json()` with `ContentTypeError`. `not resp.content_length` catches both `None` and `0`, fully closing the gap documented in CLAUDE.md's Known Pitfalls section.
-- **`test_coordinator.py` module mock ordering fixed** (`tests/test_coordinator.py`): Replaced direct `sys.modules[...] = ha_mock` with `sys.modules.setdefault(...)` so that when both test files run in the same pytest process, the second file reuses the mocks registered by the first instead of overwriting them (which could invalidate already-imported modules and cause order-dependent test failures). Updated `_resolve_active_program_value` test suite: all existing calls now pass `active_program` explicitly; added two new tests (`test_week2_selected_when_active_program_is_week2`, `test_non_schedule_program_falls_back_to_week1`) covering the new week-selection logic; `_make_programs` extended with a `week2` schedule and a third day configuration.
+**`api.py` — full instrumentation**
+Every HTTP event in `_request`, `_get_id_token`, and
+`_get_plant_access_token` now calls the appropriate `stats.record_*()`
+method:
+- `record_call()` at the start of every outbound attempt
+- `record_timeout()` on every `TimeoutError` catch (including mid-retry)
+- `record_retry()` before every back-off sleep
+- `record_error(message)` on every terminal failure
+- `record_success()` on every valid 2xx response
+
+The `stats` parameter is optional (defaults to a private `HovalApiStats()`
+instance) so existing code and the example client need no changes.
+
+Added `import asyncio` to auth helpers (they now have retry loops), added
+full module and method docstrings, noted the intentional absence of
+`plant_id=` on event endpoints (they do not accept X-Plant-Access-Token).
+
+**`__init__.py`** — one-line change: `HovalApiStats()` created before the
+API client and passed in as `stats=stats`.  `HovalRuntimeData` is unchanged.
+
+**`coordinator.py`** — `_async_update_data` now writes
+`api.stats._poll_interval_seconds` after every successful fetch.
+
+**`sensor.py`** — 11 new `DIAGNOSTIC` sensor entities on the plant device:
+
+| Entity key | Description | Unit |
+|---|---|---|
+| `api_calls_hour` | HTTP calls in last 60 min | count |
+| `api_timeouts_hour` | Timed-out calls in last 60 min | count |
+| `api_errors_hour` | Terminal failures in last 60 min | count |
+| `api_retries_hour` | Retry attempts in last 60 min | count |
+| `api_failure_ratio` | Error rate in last 60 min | % |
+| `api_total_calls` | All calls since HA start | count |
+| `api_total_errors` | All errors since HA start | count |
+| `api_last_success` | UTC time of last successful call | timestamp |
+| `api_last_error_time` | UTC time of last error | timestamp |
+| `api_last_error_message` | Description of last error | string |
+| `api_poll_interval` | Current poll interval | seconds |
+
+New `HovalCommsSensorEntityDescription` dataclass uses `stat_fn` (not
+`value_fn`) to avoid any potential conflict with HA's `SensorEntityDescription`
+in future versions.  `HovalApiStatsSensor` extends `CoordinatorEntity` for
+lifecycle management but reads from `coordinator.api.stats` in `native_value`.
+`HovalRuntimeData` is not changed — sensors reach the stats object via
+`self.coordinator.api.stats`, which is always non-None.
+
+**`strings.json` / `translations/en.json`** — 11 new sensor name entries.
 
 ### v0.15.6
 - **`manifest.json` version corrected**: Version string was stuck at `0.15.2` instead of the current release version. Bumped to `0.15.6`.

@@ -168,16 +168,18 @@ class HovalFan(CoordinatorEntity[HovalDataCoordinator], FanEntity):
             raise HomeAssistantError(f"Failed to set fan speed: {err}") from err
 
     async def _debounced_set(self, percentage: int) -> None:
-        """Wait for debounce period, then send the latest percentage."""
+        """Wait for debounce period, then send the latest percentage.
+
+        Errors are caught and logged here rather than propagating into the
+        fire-and-forget task, where they would otherwise be silently swallowed.
+        On failure the pending percentage is cleared so the UI reverts to the
+        last confirmed state instead of showing a stale pending value.
+        """
         await asyncio.sleep(DEBOUNCE_SECONDS)
         _LOGGER.debug("Debounce complete, sending %d%%", percentage)
         try:
             await self._send_percentage(percentage)
         except HomeAssistantError as err:
-            # The task is fire-and-forget, so exceptions would otherwise be
-            # silently swallowed.  Log the error and reset the pending value so
-            # the UI snaps back to the last confirmed state instead of showing
-            # a stale pending percentage indefinitely.
             _LOGGER.error(
                 "Fan speed update failed for %s: %s", self._circuit_path, err
             )
