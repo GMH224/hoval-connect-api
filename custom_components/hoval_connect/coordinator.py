@@ -7,7 +7,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, NamedTuple
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -29,6 +29,19 @@ from .const import (
 SIGNAL_NEW_CIRCUITS = f"{DOMAIN}_new_circuits"
 
 _LOGGER = logging.getLogger(__name__)
+
+# Circuit-breaker configuration.
+# After _CB_THRESHOLD consecutive poll failures the breaker opens and poll
+# attempts are skipped (no network traffic) until _CB_PROBE_INTERVAL seconds
+# have elapsed, at which point one probe is allowed through.  If the probe
+# succeeds the breaker closes; if it fails the interval resets.
+_CB_THRESHOLD = 5
+_CB_PROBE_INTERVAL = 300.0  # seconds between probe attempts
+
+# Rolling window size for connection health rate sensors.
+# All _poll_records older than this are excluded from rate calculations.
+# Records older than 2× this value are pruned from the list.
+_HEALTH_WINDOW_SECS = 3600.0
 
 # v1 API returns different activeProgram values than v3.
 # Normalize so entities always see v3 enum keys.
@@ -85,32 +98,141 @@ def _resolve_active_program_value(
     return week_name, day_name, None
 
 
+class _PollRecord(NamedTuple):
+    """Single poll result stored in the rolling health window.
+
+    ts:         time.monotonic() at the moment the poll completed.
+                Note: monotonic time restarts with HA, so _poll_records is
+                always scoped to the current HA session — cross-session history
+                is not preserved, which is intentional.
+    error_type: None for success; "timeout"/"auth"/"api"/"unknown" for failure.
+    latency_ms: wall-clock duration of the poll in milliseconds. Populated only
+                for successful polls; None for failures.
+    """
+
+    ts: float
+    error_type: str | None
+    latency_ms: float | None
+
+
 @dataclass
 class HovalConnectionHealth:
     """Tracks API connection health metrics across coordinator polls.
 
     Persists across individual poll cycles so cumulative counters survive
-    transient failures. Updated inside _async_update_data before any
-    exception is re-raised, so sensors always reflect the latest state
-    even when HA marks the coordinator as unavailable.
+    transient failures.  Updated inside _async_update_data before any
+    exception is re-raised, so sensors always reflect the latest state even
+    when HA marks the coordinator as unavailable.
+
+    Rolling-window properties (failure_rate_pct_1h, auth_failure_rate_pct_1h,
+    p95_latency_ms_1h) are computed on read from _poll_records rather than
+    being stored, so they never need explicit synchronisation.
     """
 
-    # Timestamps
+    # --- Timestamps ---
     last_success: datetime | None = None      # UTC datetime of last successful poll
     last_error_time: datetime | None = None   # UTC datetime of last poll error
 
-    # Error details
+    # --- Error details ---
     last_error_msg: str | None = None         # Short error string from last failure
     last_error_type: str | None = None        # "timeout" | "auth" | "api" | "unknown"
 
-    # Counters
+    # --- Cumulative counters ---
     consecutive_failures: int = 0            # Consecutive failed polls (reset on success)
     total_failures: int = 0                  # Total failed polls since HA startup
     total_polls: int = 0                     # Total poll attempts since HA startup
     auth_failures: int = 0                   # Total HovalAuthError occurrences since startup
 
-    # Performance
+    # --- Performance ---
     poll_latency_ms: float | None = None     # Duration of last successful full poll (ms)
+
+    # --- Partial / sub-task failures ---
+    # These capture silent failures inside gather(return_exceptions=True) that
+    # don't abort the whole poll but leave some entities with stale data.
+    partial_failures_last_poll: int = 0      # Failed sub-tasks in the most recent poll
+    total_partial_failures: int = 0          # Cumulative sub-task failures since startup
+    partial_failure_endpoints: str | None = None  # Comma-separated list of what failed
+
+    # --- Rolling window ---
+    # List of _PollRecord tuples (ts, error_type, latency_ms).
+    # Coordinator appends one entry per actual poll (circuit-breaker-skipped
+    # polls are NOT recorded here) and prunes entries older than 2× _HEALTH_WINDOW_SECS
+    # to keep memory bounded (≤ ~120 entries at the default 60 s poll interval).
+    _poll_records: list[_PollRecord] = field(default_factory=list)
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers                                                     #
+    # ------------------------------------------------------------------ #
+
+    def record_poll(
+        self,
+        ts: float,
+        error_type: str | None,
+        latency_ms: float | None = None,
+    ) -> None:
+        """Append a poll result and prune the history buffer.
+
+        Args:
+            ts:         time.monotonic() at poll completion.
+            error_type: None for success; error category string for failures.
+            latency_ms: Duration of successful poll in ms (omit for failures).
+        """
+        self._poll_records.append(_PollRecord(ts, error_type, latency_ms))
+        # Prune anything older than 2× the window to prevent unbounded growth.
+        cutoff = ts - _HEALTH_WINDOW_SECS * 2
+        if len(self._poll_records) > 250:  # hard cap as safety valve
+            self._poll_records = [r for r in self._poll_records if r.ts >= cutoff]
+
+    def _window(self) -> list[_PollRecord]:
+        """Return records within the rolling 1-hour window."""
+        cutoff = time.monotonic() - _HEALTH_WINDOW_SECS
+        return [r for r in self._poll_records if r.ts >= cutoff]
+
+    # ------------------------------------------------------------------ #
+    # Computed rolling-window properties                                   #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def failure_rate_pct_1h(self) -> float:
+        """Failure % over the rolling 60-minute window.
+
+        Returns 0.0 when no polls have been recorded yet, so sensors show 0
+        rather than 'unknown' during the warmup period after HA restart.
+        """
+        window = self._window()
+        if not window:
+            return 0.0
+        failures = sum(1 for r in window if r.error_type is not None)
+        return round(failures / len(window) * 100, 1)
+
+    @property
+    def auth_failure_rate_pct_1h(self) -> float:
+        """Auth-error % over the rolling 60-minute window.
+
+        Counts only polls whose error_type == "auth" so transient API/timeout
+        errors don't inflate the auth-specific rate.  Returns 0.0 on startup.
+        """
+        window = self._window()
+        if not window:
+            return 0.0
+        auth_fails = sum(1 for r in window if r.error_type == "auth")
+        return round(auth_fails / len(window) * 100, 1)
+
+    @property
+    def p95_latency_ms_1h(self) -> float | None:
+        """95th-percentile successful poll latency over the last 60 minutes.
+
+        Requires at least 5 successful-poll samples to return a meaningful
+        value; returns None otherwise (shown as 'unknown' in HA).  At the
+        default 60 s interval there are ~60 polls/hour, so P95 stabilises
+        within the first few minutes after a clean startup.
+        """
+        window = self._window()
+        latencies = sorted(r.latency_ms for r in window if r.latency_ms is not None)
+        if len(latencies) < 5:
+            return None
+        idx = min(int(len(latencies) * 0.95), len(latencies) - 1)
+        return latencies[idx]
 
 
 @dataclass
@@ -151,6 +273,9 @@ class HovalCircuitData:
     program_air_volume: float | None = None
     # User-defined program names: API key → display name (e.g. "week1" → "Normal")
     program_names: dict[str, str] = field(default_factory=dict)
+    # Sub-fetch failures: which internal endpoints failed silently for this circuit.
+    # Populated by _fetch_circuit_data; used to track partial failures in health.
+    failed_sub_fetches: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -268,11 +393,19 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         self._known_circuits: set[str] = set()
         # API connection health — persists across poll cycles
         self._connection_health = HovalConnectionHealth()
+        # Circuit-breaker state
+        self._cb_open: bool = False
+        self._cb_probe_after: float = 0.0  # monotonic time when probe is allowed
 
     @property
     def connection_health(self) -> HovalConnectionHealth:
         """Return the current API connection health snapshot."""
         return self._connection_health
+
+    @property
+    def circuit_breaker_open(self) -> bool:
+        """Return whether the circuit breaker is currently open."""
+        return self._cb_open
 
     def set_mode_override(self, circuit_path: str, mode: str) -> None:
         """Set optimistic mode override after a control action."""
@@ -288,34 +421,13 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         circuit_path: str,
         mode_override: str,
     ) -> None:
-        """Execute a control command with lock, optimistic state, and refresh.
-
-        The API call and optimistic override are serialised inside control_lock
-        so concurrent control actions don't race each other.
-
-        The coordinator refresh is deliberately scheduled as a fire-and-forget
-        background task OUTSIDE the lock for two reasons:
-        - The lock is released quickly (only held during the API round-trip),
-          so a second control action can proceed without waiting for the full
-          data refresh.
-        - The calling entity method returns to HA promptly, keeping the UI
-          responsive even when the Hoval cloud is slow.
-
-        If the background refresh fails (transient timeout), it is silently
-        discarded — the coordinator will retry on its normal poll schedule and
-        entities remain at their optimistic state until then.
-        """
+        """Execute a control command with lock, optimistic state, and refresh."""
         async with self.control_lock:
             await coro
             self.set_mode_override(circuit_path, mode_override)
 
-        # Brief pause outside the lock so the API has time to commit the change
-        # before we fetch fresh state.
         await asyncio.sleep(2)
 
-        # Schedule refresh as background task — do not await it here.
-        # This keeps the caller (entity action method) fast and prevents the
-        # lock from being starved during a slow/timeout refresh.
         async def _do_refresh() -> None:
             try:
                 await self.async_request_refresh()
@@ -330,31 +442,62 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
     async def _async_update_data(self) -> HovalData:
         """Fetch data from the API, updating connection health on every attempt.
 
-        Health counters are updated before exceptions are re-raised so that
-        connection-health sensors always reflect the latest failure state even
-        when HA marks the coordinator as unavailable.
+        Circuit breaker:
+          After _CB_THRESHOLD consecutive failures the breaker opens.  While
+          open, _async_update_data raises UpdateFailed immediately without
+          making any network requests.  After _CB_PROBE_INTERVAL seconds one
+          probe is allowed through; success closes the breaker, failure resets
+          the probe timer.  Circuit-breaker-skipped calls are NOT counted in
+          total_polls or recorded in the rolling window — they represent
+          "intentionally skipped", not "attempt failed".
+
+        Health counters:
+          All counters are updated before exceptions are re-raised so that
+          connection-health sensors always reflect the latest failure state
+          even when HA marks the coordinator as unavailable.
         """
+        # ------------------------------------------------------------------ #
+        # Circuit-breaker gate — check BEFORE incrementing any counters       #
+        # ------------------------------------------------------------------ #
+        if self._cb_open:
+            now_mono = time.monotonic()
+            if now_mono < self._cb_probe_after:
+                wait = self._cb_probe_after - now_mono
+                _LOGGER.debug(
+                    "Circuit breaker open — skipping poll (probe in %.0fs)", wait
+                )
+                raise UpdateFailed(
+                    f"Circuit breaker open after {_CB_THRESHOLD} consecutive failures. "
+                    f"Probe in {int(wait)}s."
+                )
+            # Probe window reached — allow one attempt through
+            _LOGGER.info(
+                "Circuit breaker: probe attempt (was open for %.0fs)",
+                now_mono - (self._cb_probe_after - _CB_PROBE_INTERVAL),
+            )
+            self._cb_open = False
+
         _start = time.monotonic()
         self._connection_health.total_polls += 1
 
-        # Hard cap on total refresh time.  Even if every individual API call
-        # retries twice and the auth calls also retry, this prevents the
-        # coordinator from blocking HA's event loop (and startup) indefinitely
-        # when the Hoval cloud is unresponsive.  90 s is generous for the
-        # parallel fetch of circuits + live values + programs + events + weather.
         try:
             async with asyncio.timeout(90):
                 result = await self._fetch_all_data()
 
-            # Success — record latency and reset consecutive failure counter.
-            elapsed_ms = round((time.monotonic() - _start) * 1000, 0)
-            self._connection_health.last_success = dt_util.utcnow()
-            self._connection_health.consecutive_failures = 0
-            self._connection_health.poll_latency_ms = elapsed_ms
+            # ---- Success ------------------------------------------------- #
+            _end = time.monotonic()
+            elapsed_ms = round((_end - _start) * 1000, 0)
+            now_utc = dt_util.utcnow()
+            h = self._connection_health
+            h.last_success = now_utc
+            h.consecutive_failures = 0
+            h.poll_latency_ms = elapsed_ms
+            h.record_poll(_end, None, elapsed_ms)
             _LOGGER.debug(
-                "Poll succeeded in %.0f ms (consecutive_failures reset, total_polls=%d)",
+                "Poll succeeded in %.0f ms (total_polls=%d, failure_rate_1h=%.1f%%)",
                 elapsed_ms,
-                self._connection_health.total_polls,
+                h.total_polls,
+                h.failure_rate_pct_1h,
             )
             return result
 
@@ -364,14 +507,17 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
             self._connection_health.last_error_time = dt_util.utcnow()
             self._connection_health.last_error_type = "timeout"
             self._connection_health.last_error_msg = "Poll timeout after 90 s"
+            self._connection_health.partial_failures_last_poll = 0
+            self._connection_health.record_poll(time.monotonic(), "timeout")
+            self._maybe_open_circuit_breaker()
             _LOGGER.warning(
-                "Poll timed out (consecutive=%d, total_failures=%d)",
+                "Poll timed out (consecutive=%d, total_failures=%d, failure_rate_1h=%.1f%%)",
                 self._connection_health.consecutive_failures,
                 self._connection_health.total_failures,
+                self._connection_health.failure_rate_pct_1h,
             )
             raise UpdateFailed(
-                "Hoval API refresh timed out after 90 s — cloud may be unresponsive. "
-                "HA will retry automatically."
+                "Hoval API refresh timed out after 90 s — cloud may be unresponsive."
             ) from err
 
         except HovalAuthError as err:
@@ -381,10 +527,14 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
             self._connection_health.last_error_time = dt_util.utcnow()
             self._connection_health.last_error_type = "auth"
             self._connection_health.last_error_msg = f"Auth error: {err}"[:200]
+            self._connection_health.partial_failures_last_poll = 0
+            self._connection_health.record_poll(time.monotonic(), "auth")
+            self._maybe_open_circuit_breaker()
             _LOGGER.warning(
-                "Auth failure (consecutive=%d, auth_failures=%d): %s",
+                "Auth failure (consecutive=%d, auth_failures=%d, auth_rate_1h=%.1f%%): %s",
                 self._connection_health.consecutive_failures,
                 self._connection_health.auth_failures,
+                self._connection_health.auth_failure_rate_pct_1h,
                 err,
             )
             raise ConfigEntryAuthFailed("Authentication failed — check credentials") from err
@@ -395,6 +545,9 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
             self._connection_health.last_error_time = dt_util.utcnow()
             self._connection_health.last_error_type = "api"
             self._connection_health.last_error_msg = str(err)[:200]
+            self._connection_health.partial_failures_last_poll = 0
+            self._connection_health.record_poll(time.monotonic(), "api")
+            self._maybe_open_circuit_breaker()
             _LOGGER.warning(
                 "API error during poll (consecutive=%d, total_failures=%d): %s",
                 self._connection_health.consecutive_failures,
@@ -404,27 +557,143 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
             raise UpdateFailed(f"Error fetching Hoval data: {err}") from err
 
         except Exception as err:  # noqa: BLE001
-            # Catch-all for unexpected exceptions — still update health so sensors
-            # reflect what happened before re-raising.
             self._connection_health.consecutive_failures += 1
             self._connection_health.total_failures += 1
             self._connection_health.last_error_time = dt_util.utcnow()
             self._connection_health.last_error_type = "unknown"
             self._connection_health.last_error_msg = f"{type(err).__name__}: {err}"[:200]
+            self._connection_health.partial_failures_last_poll = 0
+            self._connection_health.record_poll(time.monotonic(), "unknown")
+            self._maybe_open_circuit_breaker()
             raise
 
-    async def _fetch_all_data(self) -> HovalData:
-        """Inner fetch — called inside the asyncio.timeout guard.
+    def _maybe_open_circuit_breaker(self) -> None:
+        """Open the circuit breaker if the failure threshold has been reached."""
+        if self._connection_health.consecutive_failures >= _CB_THRESHOLD:
+            self._cb_open = True
+            self._cb_probe_after = time.monotonic() + _CB_PROBE_INTERVAL
+            _LOGGER.warning(
+                "Circuit breaker opened after %d consecutive failures — "
+                "next probe in %.0fs",
+                self._connection_health.consecutive_failures,
+                _CB_PROBE_INTERVAL,
+            )
 
-        HovalAuthError and HovalApiError propagate up to _async_update_data
-        which converts them to ConfigEntryAuthFailed / UpdateFailed respectively.
+    async def _fetch_circuit_data(
+        self,
+        plant_id: str,
+        path: str,
+        ctype: str,
+        circuit: dict,
+    ) -> HovalCircuitData:
+        """Fetch live values and programs for a single circuit.
 
-        _mode_override is cleared only at the END of a successful fetch so
-        that optimistic entity state survives failed/timed-out refreshes.
+        This is a proper coordinator method rather than a closure to avoid the
+        closure-over-loop-variable hazard and to make it independently testable.
+
+        Failed sub-fetches (live_values, programs) are recorded in
+        HovalCircuitData.failed_sub_fetches so the caller can aggregate
+        partial-failure counts without relying on log inspection.
+
+        Program cache fallback:
+          If programs fetch fails but a stale cache entry exists, the stale
+          data is used and the cache timestamp is NOT updated — so the next
+          poll will retry the fetch.  If no cache entry exists the circuit
+          simply has no program data for this poll.
         """
+        raw_program = circuit.get("activeProgram")
+        air_quality = circuit.get("airQuality") or {}
+        circuit_data = HovalCircuitData(
+            circuit_type=ctype,
+            path=path,
+            name=circuit.get("name") or ctype,
+            operation_mode=circuit.get("operationMode"),
+            active_program=_V1_PROGRAM_MAP.get(raw_program, raw_program),
+            target_value=circuit.get("targetValue"),
+            is_air_quality_guided=bool(air_quality.get("isAirQualityGuided")),
+            has_error=circuit.get("hasError", False),
+            circuit_status=circuit.get("circuitStatus"),
+        )
+
+        cached_prog = self._program_cache.get(path)
+        need_programs = (
+            cached_prog is None
+            or time.time() - cached_prog[1] > self._program_cache_ttl
+        )
+
+        live_task = self.api.get_live_values(plant_id, path, ctype)
+        if need_programs:
+            results = await asyncio.gather(
+                live_task,
+                self.api.get_programs(plant_id, path),
+                return_exceptions=True,
+            )
+        else:
+            live_result = await asyncio.gather(live_task, return_exceptions=True)
+            results = [live_result[0], cached_prog[0]]
+
+        # Live values
+        if not isinstance(results[0], BaseException):
+            circuit_data.live_values = {v["key"]: v["value"] for v in results[0]}
+            _LOGGER.debug("Circuit %s live_values: %s", path, circuit_data.live_values)
+        else:
+            circuit_data.failed_sub_fetches.append("live_values")
+            _LOGGER.debug("Live values not available for %s: %s", path, results[0])
+
+        # Programs — with stale-cache fallback on fetch failure
+        programs_data: Any = None
+        raw_prog_result = results[1]
+        if not isinstance(raw_prog_result, BaseException):
+            programs_data = raw_prog_result
+            if need_programs:
+                self._program_cache[path] = (programs_data, time.time())
+        elif cached_prog is not None:
+            # Fetch failed but we have a previously cached value — use it and
+            # do NOT update the cache timestamp so the next poll retries.
+            # Still record as a sub-fetch failure so partial_failures_last_poll
+            # reflects that the programs endpoint is broken, even though stale
+            # data is being served (which keeps the circuit entities populated).
+            programs_data = cached_prog[0]
+            circuit_data.failed_sub_fetches.append("programs_stale_cache")
+            _LOGGER.debug(
+                "Programs fetch failed for %s — using stale cache: %s",
+                path,
+                raw_prog_result,
+            )
+        else:
+            circuit_data.failed_sub_fetches.append("programs")
+            _LOGGER.debug(
+                "Programs not available for %s (no cache): %s", path, raw_prog_result
+            )
+
+        if programs_data is not None:
+            now = dt_util.now()
+            week_name, day_name, phase_value = _resolve_active_program_value(
+                programs_data, now
+            )
+            circuit_data.active_week_name = week_name
+            circuit_data.active_day_program_name = day_name
+            circuit_data.program_air_volume = phase_value
+            w1 = programs_data.get("week1", {})
+            w2 = programs_data.get("week2", {})
+            if w1.get("name"):
+                circuit_data.program_names["week1"] = w1["name"]
+            if w2.get("name"):
+                circuit_data.program_names["week2"] = w2["name"]
+
+        return circuit_data
+
+    async def _fetch_all_data(self) -> HovalData:
+        """Inner fetch — called inside the asyncio.timeout guard in _async_update_data."""
         data = HovalData()
 
         plants = await self.api.get_plants()
+
+        # Accumulators for partial-failure tracking across all plants.
+        # Initialised here so multi-plant setups report the full poll's
+        # failure counts, not just the last plant processed.
+        all_partial_fail_count: int = 0
+        all_partial_fail_names: list[str] = []
 
         for plant in plants:
             plant_id = plant.get("plantExternalId")
@@ -440,18 +709,11 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 is_online=plant.get("isOnline", True),
             )
 
-            # Skip all API calls when plant is offline
             if not plant_data.is_online:
-                # Invalidate cached PAT so we get a fresh token when back
                 self.api.invalidate_plant_token(plant_id)
                 data.plants[plant_id] = plant_data
                 continue
 
-            # Fetch circuits. A persistent failure here is the most common
-            # symptom of an upstream API change (the v1 endpoint removal in
-            # April 2026 was masked for days because we used to swallow this
-            # error). Log loudly and let DataUpdateCoordinator surface the
-            # failure to the user as `unavailable` entities.
             try:
                 circuits_raw = await self.api.get_circuits(plant_id)
             except HovalApiError as err:
@@ -464,7 +726,6 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 )
                 raise
 
-            # BL/WW circuits have selectable=False but still provide live values
             _non_selectable_types = {CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WW}
 
             _LOGGER.debug(
@@ -478,7 +739,6 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 ),
             )
 
-            # Build list of supported circuits
             supported_circuits: list[tuple[str, str, dict]] = []
             for circuit in circuits_raw:
                 ctype = circuit.get("type", "")
@@ -494,84 +754,14 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 )
                 supported_circuits.append((path, ctype, circuit))
 
-            # Fetch live values + programs for all circuits in parallel
-            async def _fetch_circuit(
-                path: str,
-                ctype: str,
-                circuit: dict,
-                _plant_id: str = plant_id,
-            ) -> HovalCircuitData:
-                raw_program = circuit.get("activeProgram")
-                air_quality = circuit.get("airQuality") or {}
-                circuit_data = HovalCircuitData(
-                    circuit_type=ctype,
-                    path=path,
-                    name=circuit.get("name") or ctype,
-                    operation_mode=circuit.get("operationMode"),
-                    active_program=_V1_PROGRAM_MAP.get(raw_program, raw_program),
-                    target_value=circuit.get("targetValue"),
-                    is_air_quality_guided=bool(air_quality.get("isAirQualityGuided")),
-                    has_error=circuit.get("hasError", False),
-                    circuit_status=circuit.get("circuitStatus"),
-                )
-
-                # Check program cache
-                cached_prog = self._program_cache.get(path)
-                need_programs = (
-                    cached_prog is None
-                    or time.time() - cached_prog[1] > self._program_cache_ttl
-                )
-
-                # Fetch live values (always) + programs (only if cache expired)
-                live_task = self.api.get_live_values(_plant_id, path, ctype)
-                if need_programs:
-                    prog_task = self.api.get_programs(_plant_id, path)
-                    results = await asyncio.gather(
-                        live_task,
-                        prog_task,
-                        return_exceptions=True,
-                    )
-                else:
-                    live_result = await asyncio.gather(
-                        live_task,
-                        return_exceptions=True,
-                    )
-                    results = [live_result[0], cached_prog[0]]
-
-                if not isinstance(results[0], BaseException):
-                    circuit_data.live_values = {v["key"]: v["value"] for v in results[0]}
-                    _LOGGER.debug("Circuit %s live_values: %s", path, circuit_data.live_values)
-                else:
-                    _LOGGER.debug("Live values not available for %s: %s", path, results[0])
-
-                programs = results[1]
-                if not isinstance(programs, BaseException):
-                    if need_programs:
-                        self._program_cache[path] = (programs, time.time())
-                    now = dt_util.now()
-                    week_name, day_name, phase_value = _resolve_active_program_value(
-                        programs, now
-                    )
-                    circuit_data.active_week_name = week_name
-                    circuit_data.active_day_program_name = day_name
-                    circuit_data.program_air_volume = phase_value
-                    # Extract user-defined program names
-                    w1 = programs.get("week1", {})
-                    w2 = programs.get("week2", {})
-                    if w1.get("name"):
-                        circuit_data.program_names["week1"] = w1["name"]
-                    if w2.get("name"):
-                        circuit_data.program_names["week2"] = w2["name"]
-                else:
-                    _LOGGER.debug("Programs not available for %s: %s", path, programs)
-
-                return circuit_data
-
-            # Run circuits, events, and weather all in parallel
-            all_tasks = [
-                _fetch_circuit(path, ctype, circ) for path, ctype, circ in supported_circuits
+            # Dispatch all tasks in parallel: circuits + plant-level endpoints.
+            # Using the promoted _fetch_circuit_data method eliminates the
+            # closure-over-loop-variable risk that existed with the old inner
+            # function (previously guarded only by a default-arg trick).
+            all_tasks: list[Any] = [
+                self._fetch_circuit_data(plant_id, path, ctype, circ)
+                for path, ctype, circ in supported_circuits
             ]
-            # Append plant-level tasks (events + weather)
             latest_idx = len(all_tasks)
             all_tasks.append(self.api.get_latest_event(plant_id))
             events_idx = len(all_tasks)
@@ -579,21 +769,28 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
             weather_idx = len(all_tasks)
             all_tasks.append(self.api.get_weather(plant_id))
 
-            all_results = await asyncio.gather(
-                *all_tasks,
-                return_exceptions=True,
-            )
+            all_results = await asyncio.gather(*all_tasks, return_exceptions=True)
 
-            # Process circuit results
+            # ---- Track partial (sub-task) failures for this plant -------- #
+            partial_fail_count = 0
+            partial_fail_names: list[str] = []
+
+            # Circuit results
             for result in all_results[:latest_idx]:
                 if isinstance(result, BaseException):
+                    partial_fail_count += 1
+                    partial_fail_names.append("circuit_fetch")
                     _LOGGER.debug("Circuit fetch failed: %s", result)
                     continue
+                # Accumulate sub-fetch failures from within the circuit
+                for sub in result.failed_sub_fetches:
+                    partial_fail_count += 1
+                    partial_fail_names.append(f"{result.path}.{sub}")
                 if result.has_error:
                     plant_data.has_error = True
                 plant_data.circuits[result.path] = result
 
-            # Process latest event
+            # Plant-level endpoints
             latest_result = all_results[latest_idx]
             if not isinstance(latest_result, BaseException) and latest_result:
                 plant_data.latest_event = _parse_event(latest_result)
@@ -606,9 +803,10 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                     plant_data.latest_event.description,
                 )
             elif isinstance(latest_result, BaseException):
+                partial_fail_count += 1
+                partial_fail_names.append("latest_event")
                 _LOGGER.debug("Events endpoint not available for %s", plant_id)
 
-            # Process events list
             events_result = all_results[events_idx]
             if not isinstance(events_result, BaseException) and events_result:
                 for ev in events_result[:10]:
@@ -618,9 +816,10 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                         plant_data.has_error = True
                         break
             elif isinstance(events_result, BaseException):
+                partial_fail_count += 1
+                partial_fail_names.append("events")
                 _LOGGER.debug("Events list not available for %s", plant_id)
 
-            # Process weather forecast
             weather_result = all_results[weather_idx]
             if not isinstance(weather_result, BaseException) and weather_result:
                 if isinstance(weather_result, list) and weather_result:
@@ -631,18 +830,34 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                         outside_temperature_min=w.get("outsideTemperatureMin"),
                     )
             elif isinstance(weather_result, BaseException):
+                partial_fail_count += 1
+                partial_fail_names.append("weather")
                 _LOGGER.debug("Weather not available for %s", plant_id)
+
+            # Accumulate partial-failure health across all plants.
+            # total_partial_failures is updated immediately; partial_failures_last_poll
+            # and partial_failure_endpoints are set after all plants are processed
+            # so they always reflect the full picture rather than just the last plant.
+            self._connection_health.total_partial_failures += partial_fail_count
+            if partial_fail_count:
+                _LOGGER.debug(
+                    "Partial failures for plant %s (%d): %s",
+                    plant_id,
+                    partial_fail_count,
+                    ", ".join(partial_fail_names),
+                )
+            all_partial_fail_count += partial_fail_count
+            all_partial_fail_names.extend(partial_fail_names)
 
             data.plants[plant_id] = plant_data
 
-        # Detect new circuits for dynamic entity discovery.
-        # Fire on any newly seen circuit, including the first one. Skipping the
-        # initial set (when `_known_circuits` was still empty) used to leave
-        # circuits stranded if the very first refresh came back without them
-        # — async_setup_entry's _add_new() ran against an empty circuits dict
-        # and the dispatcher then suppressed the catch-up signal. Each platform
-        # already deduplicates via its `known` set, so firing on the first
-        # discovery is a no-op when entities are already present.
+        # Commit accumulated partial-failure counts after processing all plants
+        self._connection_health.partial_failures_last_poll = all_partial_fail_count
+        self._connection_health.partial_failure_endpoints = (
+            ", ".join(all_partial_fail_names) if all_partial_fail_names else None
+        )
+
+        # Detect new circuits for dynamic entity discovery
         current_circuits = {
             f"{pid}_{path}" for pid, plant in data.plants.items() for path in plant.circuits
         }
@@ -652,10 +867,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
             async_dispatcher_send(self.hass, SIGNAL_NEW_CIRCUITS)
         self._known_circuits = current_circuits
 
-        # Clear optimistic overrides only after a SUCCESSFUL fetch so that if
-        # the refresh fails (API timeout, transient error), entities continue to
-        # show their optimistic state rather than snapping back to stale data
-        # mid-cycle.  Fresh coordinator data takes over on the next good refresh.
+        # Clear optimistic overrides only after a SUCCESSFUL fetch
         self._mode_override.clear()
 
         return data

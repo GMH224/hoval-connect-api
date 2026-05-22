@@ -192,6 +192,21 @@
       },
       "api_poll_latency": {
         "name": "API poll latency"
+      },
+      "api_p95_latency_1h": {
+        "name": "API P95 latency (1 h)"
+      },
+      "api_auth_failure_rate_1h": {
+        "name": "API auth failure rate (1 h)"
+      },
+      "api_partial_failures_last_poll": {
+        "name": "API partial failures (last poll)"
+      },
+      "api_seconds_since_success": {
+        "name": "API seconds since last success"
+      },
+      "api_failure_rate_1h": {
+        "name": "API failure rate (1 h)"
       }
     },
     "water_heater": {

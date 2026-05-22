@@ -24,6 +24,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from . import HovalConnectConfigEntry, circuit_device_info, plant_device_info
 from .const import CIRCUIT_TYPE_BL, CIRCUIT_TYPE_HK, CIRCUIT_TYPE_HV, CIRCUIT_TYPE_WW
@@ -396,8 +397,14 @@ PLANT_SENSOR_DESCRIPTIONS: tuple[HovalPlantSensorEntityDescription, ...] = (
 #   - HovalConnectionSensor overrides `available` to always return True —
 #     the whole point of these sensors is to report failures, so marking them
 #     unavailable on a poll error would defeat the purpose.
-#   - Counters use TOTAL_INCREASING so HA's energy/stats UI can chart them
-#     over time and alert on rate-of-change (e.g. >5 failures/hour).
+#   - Counters (total_polls, total_failures, auth_failures) use MEASUREMENT
+#     not TOTAL_INCREASING: dimensionless counters without a physical unit are
+#     stored inconsistently by HA's recorder across versions when using
+#     TOTAL_INCREASING, sometimes showing 'unknown' until the first non-zero
+#     value.  MEASUREMENT stores every value reliably.
+#   - Rolling-window rate sensors (failure_rate_pct_1h, auth_failure_rate_pct_1h)
+#     return 0.0 before any polls are recorded, so they always show a numeric
+#     value rather than 'unknown' immediately after HA restart.
 # ---------------------------------------------------------------------------
 
 CONNECTION_SENSOR_DESCRIPTIONS: tuple[HovalConnectionSensorDescription, ...] = (
@@ -433,7 +440,7 @@ CONNECTION_SENSOR_DESCRIPTIONS: tuple[HovalConnectionSensorDescription, ...] = (
         icon="mdi:help-network-outline",
         value_fn=lambda h: h.last_error_type,
     ),
-    # --- Failure counters ---
+    # --- Failure counters (MEASUREMENT, not TOTAL_INCREASING — see note above) ---
     HovalConnectionSensorDescription(
         key="api_consecutive_failures",
         translation_key="api_consecutive_failures",
@@ -445,7 +452,7 @@ CONNECTION_SENSOR_DESCRIPTIONS: tuple[HovalConnectionSensorDescription, ...] = (
     HovalConnectionSensorDescription(
         key="api_total_failures",
         translation_key="api_total_failures",
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         icon="mdi:cloud-off-outline",
         value_fn=lambda h: h.total_failures,
@@ -453,7 +460,7 @@ CONNECTION_SENSOR_DESCRIPTIONS: tuple[HovalConnectionSensorDescription, ...] = (
     HovalConnectionSensorDescription(
         key="api_auth_failures",
         translation_key="api_auth_failures",
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         icon="mdi:lock-alert-outline",
         value_fn=lambda h: h.auth_failures,
@@ -462,7 +469,7 @@ CONNECTION_SENSOR_DESCRIPTIONS: tuple[HovalConnectionSensorDescription, ...] = (
     HovalConnectionSensorDescription(
         key="api_total_polls",
         translation_key="api_total_polls",
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         icon="mdi:refresh-circle",
         value_fn=lambda h: h.total_polls,
@@ -475,8 +482,66 @@ CONNECTION_SENSOR_DESCRIPTIONS: tuple[HovalConnectionSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         icon="mdi:timer-outline",
-        # Only meaningful after the first successful poll; None until then.
         value_fn=lambda h: h.poll_latency_ms,
+    ),
+    HovalConnectionSensorDescription(
+        key="api_p95_latency_1h",
+        translation_key="api_p95_latency_1h",
+        native_unit_of_measurement=UnitOfTime.MILLISECONDS,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:timer-alert-outline",
+        # None until ≥5 successful polls are in the 1-hour window.
+        value_fn=lambda h: h.p95_latency_ms_1h,
+    ),
+    # --- Rolling-window rates (always 0.0 before first poll, never 'unknown') ---
+    HovalConnectionSensorDescription(
+        key="api_failure_rate_1h",
+        translation_key="api_failure_rate_1h",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:cloud-percent",
+        value_fn=lambda h: h.failure_rate_pct_1h,
+    ),
+    HovalConnectionSensorDescription(
+        key="api_auth_failure_rate_1h",
+        translation_key="api_auth_failure_rate_1h",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:lock-percent",
+        value_fn=lambda h: h.auth_failure_rate_pct_1h,
+    ),
+    # --- Partial (sub-task) failures ---
+    HovalConnectionSensorDescription(
+        key="api_partial_failures_last_poll",
+        translation_key="api_partial_failures_last_poll",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:cloud-sync-outline",
+        # Count of sub-fetches (live_values, programs, events, weather) that
+        # failed silently inside gather(return_exceptions=True) last poll.
+        # Non-zero while the whole-poll succeeds means some entities have
+        # stale data — useful for diagnosing partial outages.
+        value_fn=lambda h: h.partial_failures_last_poll,
+    ),
+    # --- Availability: seconds since the last successful poll ---
+    # Computed live in native_value so it reflects the current clock, not a
+    # stored field.  Updates every coordinator poll (~60 s default).
+    # Useful for automations: alert when this exceeds e.g. 600 s.
+    HovalConnectionSensorDescription(
+        key="api_seconds_since_success",
+        translation_key="api_seconds_since_success",
+        native_unit_of_measurement="s",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:clock-alert-outline",
+        value_fn=lambda h: (
+            round((dt_util.utcnow() - h.last_success).total_seconds())
+            if h.last_success
+            else None
+        ),
     ),
 )
 
@@ -576,20 +641,28 @@ class HovalCircuitSensor(CoordinatorEntity[HovalDataCoordinator], SensorEntity):
 
     @property
     def native_value(self) -> float | str | None:
-        """Return the sensor value."""
+        """Return the sensor value.
+
+        Sensors with a unit or a state_class (MEASUREMENT, TOTAL_INCREASING)
+        must return a numeric value so HA's recorder and statistics engine can
+        process them correctly.  Pure string sensors (operation mode, program
+        name, circuit status) have neither unit nor state_class and return str.
+        """
         circuit = self._circuit
         if circuit is None:
             return None
         val = self.entity_description.value_fn(circuit)
         if val is None:
             return None
-        # String sensors (program names, operation mode) return as-is
-        if self.entity_description.native_unit_of_measurement is None:
-            return str(val)
-        try:
-            return float(val)
-        except (ValueError, TypeError):
-            return None
+        if (
+            self.entity_description.native_unit_of_measurement is not None
+            or self.entity_description.state_class is not None
+        ):
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return None
+        return str(val)
 
 
 class HovalPlantSensor(CoordinatorEntity[HovalDataCoordinator], SensorEntity):
@@ -624,13 +697,23 @@ class HovalPlantSensor(CoordinatorEntity[HovalDataCoordinator], SensorEntity):
 
     @property
     def native_value(self) -> float | str | None:
-        """Return the sensor value."""
+        """Return the sensor value.
+
+        TIMESTAMP device_class requires a tz-aware datetime, not a raw string.
+        The latest_event_time sensor receives an ISO-8601 string from the API;
+        parse it here so HA can store and display it correctly.
+        """
         plant = self._plant
         if plant is None:
             return None
         val = self.entity_description.value_fn(plant)
         if val is None:
             return None
+        # TIMESTAMP sensors must return a tz-aware datetime, not a string.
+        if self.entity_description.device_class == SensorDeviceClass.TIMESTAMP:
+            if isinstance(val, str):
+                return dt_util.parse_datetime(val)
+            return val  # already a datetime
         if self.entity_description.native_unit_of_measurement is None and not isinstance(
             val, (int, float)
         ):

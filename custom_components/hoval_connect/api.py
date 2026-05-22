@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from typing import Any
 
@@ -24,7 +25,8 @@ _LOGGER = logging.getLogger(__name__)
 # seconds. More than 2 retries make the coordinator hang long enough to trigger
 # HA's ConfigEntryNotReady / watchdog during startup.
 _MAX_RETRIES = 2
-_RETRY_BASE_DELAY = 0.5  # seconds, doubled on each retry
+_RETRY_BASE_DELAY = 0.5  # seconds, doubled on each retry (before jitter)
+_RETRY_JITTER_FACTOR = 0.4  # ±20 % of computed delay (uniform in [0.8×, 1.2×])
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 # Split timeouts: fail fast on dead connections, allow longer for slow reads.
@@ -32,6 +34,26 @@ _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 # With 2 retries: ~28 + 0.5 + 28 = ~57 s max for a single endpoint.
 _CONNECT_TIMEOUT = 8   # seconds to establish the TCP connection
 _READ_TIMEOUT = 20     # seconds to receive the full response body
+
+# After a credential rejection (HTTP 400/401/403 from the IDP) wait this long
+# before allowing another token request.  This prevents polling every 60 s
+# hammering the IDP when credentials are simply wrong.
+_AUTH_COOLDOWN_SECS = 60.0
+
+
+def _jittered_delay(attempt: int) -> float:
+    """Return an exponential backoff delay with ±20 % uniform jitter.
+
+    Jitter prevents thundering-herd retries when many HA instances restart
+    simultaneously during a Hoval cloud incident and the server starts
+    recovering.
+
+    delay = base * 2^attempt * uniform(0.8, 1.2)
+    where uniform(0.8, 1.2) = 0.8 + random() * 0.4
+    """
+    base = _RETRY_BASE_DELAY * (2**attempt)
+    jitter = 1.0 - _RETRY_JITTER_FACTOR / 2 + random.random() * _RETRY_JITTER_FACTOR
+    return base * jitter
 
 
 class HovalAuthError(Exception):
@@ -58,11 +80,23 @@ class HovalConnectApi:
         self._id_token: str | None = None
         self._id_token_exp: float = 0
         self._pat_cache: dict[str, tuple[str, float]] = {}
+        # Monotonic timestamp until which IDP auth requests should be suppressed
+        # after a credential-rejection failure.  Prevents hammering the IDP on
+        # every coordinator poll when credentials are simply wrong.
+        self._auth_cooldown_until: float = 0.0
 
     async def _get_id_token(self) -> str:
         """Get or refresh the ID token via OAuth2 password grant."""
         if self._id_token and time.time() < self._id_token_exp:
             return self._id_token
+
+        # Respect cooldown after auth failures
+        cooldown_remaining = self._auth_cooldown_until - time.monotonic()
+        if cooldown_remaining > 0:
+            raise HovalApiError(
+                f"Auth cooldown active for {cooldown_remaining:.0f}s more — "
+                "skipping IDP request to avoid hammering the identity provider"
+            )
 
         try:
             async with self._session.post(
@@ -79,6 +113,8 @@ class HovalConnectApi:
             ) as resp:
                 if resp.status in (400, 401, 403):
                     _LOGGER.warning("IDP auth failed (HTTP %s)", resp.status)
+                    # Engage cooldown so subsequent polls don't immediately retry
+                    self._auth_cooldown_until = time.monotonic() + _AUTH_COOLDOWN_SECS
                     raise HovalAuthError(f"Invalid credentials (HTTP {resp.status})")
                 resp.raise_for_status()
                 data = await resp.json()
@@ -93,6 +129,8 @@ class HovalConnectApi:
 
         self._id_token = data["id_token"]
         self._id_token_exp = time.time() + ID_TOKEN_TTL.total_seconds()
+        # Clear cooldown on successful auth
+        self._auth_cooldown_until = 0.0
         return self._id_token
 
     async def _get_plant_access_token(self, plant_id: str) -> str:
@@ -140,11 +178,9 @@ class HovalConnectApi:
         json_data: Any = None,
         _retry: bool = True,
     ) -> Any:
-        """Make an authenticated API request with token retry and transient error backoff."""
+        """Make an authenticated API request with token retry and jittered backoff."""
         headers = await self._headers(plant_id)
         url = f"{BASE_URL}{path}"
-        # Use separate connect and read timeouts so a dead server is detected
-        # quickly (connect) while still allowing slow-but-alive responses (read).
         timeout = aiohttp.ClientTimeout(connect=_CONNECT_TIMEOUT, sock_read=_READ_TIMEOUT)
 
         for attempt in range(_MAX_RETRIES):
@@ -174,7 +210,7 @@ class HovalConnectApi:
                             )
                         raise HovalAuthError("Authentication failed")
                     if resp.status in _RETRYABLE_STATUS_CODES and attempt < _MAX_RETRIES - 1:
-                        delay = _RETRY_BASE_DELAY * (2**attempt)
+                        delay = _jittered_delay(attempt)
                         _LOGGER.warning(
                             "Transient error HTTP %s on %s %s, retrying in %.1fs (%d/%d)",
                             resp.status,
@@ -190,14 +226,21 @@ class HovalConnectApi:
                         body = await resp.text()
                         _LOGGER.debug("API error body: %s", body[:500])
                         raise HovalApiError(f"API request failed: HTTP {resp.status}")
-                    if resp.status == 204 or resp.content_length == 0:
+                    # Fix #5: check status 204 first (no body), then check
+                    # content_length explicitly.  content_length can be None when
+                    # the server omits the Content-Length header — in that case we
+                    # fall through and attempt to parse JSON normally.
+                    if resp.status == 204:
+                        return None
+                    cl = resp.content_length
+                    if cl is not None and cl == 0:
                         return None
                     return await resp.json()
             except (HovalAuthError, HovalApiError):
                 raise
             except TimeoutError as err:
                 if attempt < _MAX_RETRIES - 1:
-                    delay = _RETRY_BASE_DELAY * (2**attempt)
+                    delay = _jittered_delay(attempt)
                     _LOGGER.warning(
                         "Request timeout on %s %s (attempt %d/%d), retrying in %.1fs",
                         method,
@@ -208,11 +251,15 @@ class HovalConnectApi:
                     )
                     await asyncio.sleep(delay)
                     continue
-                _LOGGER.warning("Request timeout on %s %s after %d attempts", method, path, _MAX_RETRIES)
-                raise HovalApiError(f"Request timeout after {_MAX_RETRIES} attempts: {err}") from err
+                _LOGGER.warning(
+                    "Request timeout on %s %s after %d attempts", method, path, _MAX_RETRIES
+                )
+                raise HovalApiError(
+                    f"Request timeout after {_MAX_RETRIES} attempts: {err}"
+                ) from err
             except aiohttp.ClientError as err:
                 if attempt < _MAX_RETRIES - 1:
-                    delay = _RETRY_BASE_DELAY * (2**attempt)
+                    delay = _jittered_delay(attempt)
                     _LOGGER.warning(
                         "Connection error on %s %s (attempt %d/%d), retrying in %.1fs: %s",
                         method,
@@ -224,8 +271,16 @@ class HovalConnectApi:
                     )
                     await asyncio.sleep(delay)
                     continue
-                _LOGGER.warning("Connection error on %s %s after %d attempts: %s", method, path, _MAX_RETRIES, err)
-                raise HovalApiError(f"Connection error after {_MAX_RETRIES} attempts: {err}") from err
+                _LOGGER.warning(
+                    "Connection error on %s %s after %d attempts: %s",
+                    method,
+                    path,
+                    _MAX_RETRIES,
+                    err,
+                )
+                raise HovalApiError(
+                    f"Connection error after {_MAX_RETRIES} attempts: {err}"
+                ) from err
 
         raise HovalApiError(f"Request failed after {_MAX_RETRIES} retries")
 
@@ -238,11 +293,7 @@ class HovalConnectApi:
         return await self._request("GET", f"/v1/plants/{plant_id}/settings", plant_id=plant_id)
 
     async def get_circuits(self, plant_id: str) -> list[dict[str, Any]]:
-        """Get all circuits for a plant.
-
-        Hoval removed the v1 endpoint around 2026-04-21; v3 is the only path that
-        still works. Response shape changed: see coordinator field mapping.
-        """
+        """Get all circuits for a plant."""
         return await self._request("GET", f"/v3/plants/{plant_id}/circuits", plant_id=plant_id)
 
     async def get_programs(self, plant_id: str, circuit_path: str) -> Any:
@@ -274,15 +325,12 @@ class HovalConnectApi:
 
     async def get_weather(self, plant_id: str) -> list[dict[str, Any]]:
         """Get weather forecast for plant location."""
-        return await self._request("GET", f"/v2/api/weather/forecast/{plant_id}", plant_id=plant_id)
+        return await self._request(
+            "GET", f"/v2/api/weather/forecast/{plant_id}", plant_id=plant_id
+        )
 
     async def set_circuit_mode(self, plant_id: str, circuit_path: str, mode: str) -> Any:
-        """Set circuit operation mode (standby or manual).
-
-        v1 had separate endpoints per mode (.../standby, .../manual, .../reset).
-        v3 unifies them under .../programs/{program}. The 'reset' mode no longer
-        exists; use reset_circuit() to resume the schedule.
-        """
+        """Set circuit operation mode."""
         if mode == "reset":
             raise HovalApiError(
                 "set_circuit_mode('reset') is no longer supported by the cloud API; "
@@ -293,25 +341,13 @@ class HovalConnectApi:
     async def set_temporary_change(
         self, plant_id: str, circuit_path: str, value: float, duration: str = "FOUR"
     ) -> Any:
-        """Set a temporary value override (works alongside an active time program).
-
-        v3: POST .../{circuitPath}/temporary-change with JSON body
-            {"value": <float>, "duration": "fourHours" | "midnight"}
-        For HV the value is the air volume percentage (15..100); for HK it is the
-        temperature in degrees Celsius (e.g. 21.5).
-
-        The historical FOUR / MIDNIGHT enum values from stored options are accepted
-        for backwards compatibility and translated to the v3 camelCase form.
-        """
+        """Set a temporary value override."""
         duration_v3 = {"FOUR": "fourHours", "MIDNIGHT": "midnight"}.get(
             duration, duration[:1].lower() + duration[1:]
         )
         body = {"value": value, "duration": duration_v3}
         _LOGGER.debug(
-            "set_temporary_change: plant=%s circuit=%s body=%s",
-            plant_id,
-            circuit_path,
-            body,
+            "set_temporary_change: plant=%s circuit=%s body=%s", plant_id, circuit_path, body
         )
         result = await self._request(
             "POST",
@@ -323,15 +359,9 @@ class HovalConnectApi:
         return result
 
     async def reset_temporary_change(self, plant_id: str, circuit_path: str) -> Any:
-        """Cancel an active temporary override and resume the underlying program.
-
-        v3: DELETE /v3/plants/{plantId}/circuits/{circuitPath}/temporary-change
-        Replaces the removed v1 .../temporary-change/reset POST.
-        """
+        """Cancel an active temporary override."""
         _LOGGER.debug(
-            "reset_temporary_change: plant=%s circuit=%s",
-            plant_id,
-            circuit_path,
+            "reset_temporary_change: plant=%s circuit=%s", plant_id, circuit_path
         )
         result = await self._request(
             "DELETE",
@@ -342,25 +372,13 @@ class HovalConnectApi:
         return result
 
     async def reset_circuit(self, plant_id: str, circuit_path: str, program: str = "week1") -> Any:
-        """Resume a configured time program (defaults to week1).
-
-        The v1 POST .../{circuitPath}/reset endpoint that auto-picked the active
-        time program no longer exists. v3 requires the caller to choose a specific
-        program. Pass program="week2" to switch to the second weekly schedule.
-        """
+        """Resume a configured time program."""
         return await self.set_program(plant_id, circuit_path, program)
 
     async def set_program(self, plant_id: str, circuit_path: str, program: str) -> Any:
-        """Activate a specific program on a circuit.
-
-        POST /v3/plants/{plantExternalId}/circuits/{circuitPath}/programs/{program}
-        Program enum: constant, ecoMode, standby, week1, week2, manual, externalConstant.
-        """
+        """Activate a specific program on a circuit."""
         _LOGGER.debug(
-            "set_program: plant=%s circuit=%s program=%s",
-            plant_id,
-            circuit_path,
-            program,
+            "set_program: plant=%s circuit=%s program=%s", plant_id, circuit_path, program
         )
         result = await self._request(
             "POST",
@@ -379,3 +397,4 @@ class HovalConnectApi:
         self._id_token = None
         self._id_token_exp = 0
         self._pat_cache.clear()
+        self._auth_cooldown_until = 0.0  # clear cooldown when caller explicitly invalidates
