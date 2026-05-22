@@ -131,6 +131,45 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
+### v0.15.7
+- **API connection health telemetry** (`coordinator.py`, `sensor.py`, `strings.json`, `translations/en.json`): Adds a comprehensive set of diagnostic sensors to surface Hoval cloud API connection quality directly in Home Assistant. Motivated by persistent server-side instability causing silent failures that are hard to diagnose without log diving.
+
+  **New `HovalConnectionHealth` dataclass** (`coordinator.py`): Persists across coordinator poll cycles on the coordinator instance (not inside `HovalData` which is regenerated each poll). Fields tracked:
+  - `last_success: datetime | None` — UTC timestamp of last successful full poll
+  - `last_error_time: datetime | None` — UTC timestamp of last poll failure
+  - `last_error_msg: str | None` — Error message string (truncated to 200 chars)
+  - `last_error_type: str | None` — Category string: `"timeout"` | `"auth"` | `"api"` | `"unknown"`
+  - `consecutive_failures: int` — Count of consecutive failed polls; reset to 0 on any success
+  - `total_failures: int` — Cumulative failed polls since HA startup
+  - `total_polls: int` — Cumulative poll attempts since HA startup
+  - `auth_failures: int` — Cumulative `HovalAuthError` occurrences since HA startup
+  - `poll_latency_ms: float | None` — Wall-clock duration of last successful full poll in milliseconds (measured with `time.monotonic()`)
+
+  **Instrumented `_async_update_data`** (`coordinator.py`): Health counters updated in every branch (success and all exception paths) before exceptions are re-raised. On success: resets `consecutive_failures`, records `last_success` and `poll_latency_ms`. On each failure type: increments `consecutive_failures`, `total_failures`, sets `last_error_time`, `last_error_msg`, `last_error_type`. `HovalAuthError` additionally increments `auth_failures`.
+
+  **New `HovalConnectionSensorDescription` dataclass** (`sensor.py`): Like `HovalPlantSensorEntityDescription` but `value_fn` takes a `HovalConnectionHealth` instead of `HovalPlantData`.
+
+  **New `CONNECTION_SENSOR_DESCRIPTIONS` tuple** (`sensor.py`): Nine diagnostic sensors, all `EntityCategory.DIAGNOSTIC` (hidden by default, visible under Developer Tools / Entities). Attached to the plant device:
+  | Entity key | Device class | State class | Description |
+  |---|---|---|---|
+  | `api_last_success` | `timestamp` | — | When last poll completed OK |
+  | `api_last_error_time` | `timestamp` | — | When last poll failed |
+  | `api_last_error` | — | — | Error message string |
+  | `api_last_error_type` | — | — | `timeout` / `auth` / `api` / `unknown` |
+  | `api_consecutive_failures` | — | `measurement` | Failures in a row (resets on success) |
+  | `api_total_failures` | — | `total_increasing` | Cumulative failures since startup |
+  | `api_auth_failures` | — | `total_increasing` | Cumulative auth errors since startup |
+  | `api_total_polls` | — | `total_increasing` | Cumulative polls since startup |
+  | `api_poll_latency` | — | `measurement` | Last successful poll duration (ms) |
+
+  **New `HovalConnectionSensor` entity class** (`sensor.py`): Overrides `available` to always return `True` — the whole point is to report failures, so marking unavailable on poll error would defeat the purpose. `native_value` handles `datetime` (returned as-is for TIMESTAMP sensors), `int`/`float`, and `str` (truncated to 255 chars).
+
+  **Suggested automations** using the new sensors:
+  - Alert when `api_consecutive_failures` ≥ 3 (Hoval cloud is likely down)
+  - Alert when `api_last_error_type` = `"auth"` (credentials expired / rotated)
+  - Monitor `api_poll_latency` for gradual degradation (rising p50 predicts timeouts)
+  - Long-term statistics on `api_total_failures` / `api_total_polls` for reliability dashboards
+
 ### v0.15.6
 - **`manifest.json` version corrected**: Version string was stuck at `0.15.2` instead of the current release version. Bumped to `0.15.6`.
 - **Dead constant removed** (`const.py`): `REQUEST_TIMEOUT = 30` was left in `const.py` after v0.15.5 removed it from `api.py`'s imports. No file referenced it; now removed entirely.

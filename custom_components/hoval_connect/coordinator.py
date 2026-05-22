@@ -86,6 +86,34 @@ def _resolve_active_program_value(
 
 
 @dataclass
+class HovalConnectionHealth:
+    """Tracks API connection health metrics across coordinator polls.
+
+    Persists across individual poll cycles so cumulative counters survive
+    transient failures. Updated inside _async_update_data before any
+    exception is re-raised, so sensors always reflect the latest state
+    even when HA marks the coordinator as unavailable.
+    """
+
+    # Timestamps
+    last_success: datetime | None = None      # UTC datetime of last successful poll
+    last_error_time: datetime | None = None   # UTC datetime of last poll error
+
+    # Error details
+    last_error_msg: str | None = None         # Short error string from last failure
+    last_error_type: str | None = None        # "timeout" | "auth" | "api" | "unknown"
+
+    # Counters
+    consecutive_failures: int = 0            # Consecutive failed polls (reset on success)
+    total_failures: int = 0                  # Total failed polls since HA startup
+    total_polls: int = 0                     # Total poll attempts since HA startup
+    auth_failures: int = 0                   # Total HovalAuthError occurrences since startup
+
+    # Performance
+    poll_latency_ms: float | None = None     # Duration of last successful full poll (ms)
+
+
+@dataclass
 class HovalEventData:
     """Parsed data for a plant event."""
 
@@ -238,6 +266,13 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         self._program_cache_ttl = PROGRAM_CACHE_TTL.total_seconds()
         # Track known circuits for dynamic entity discovery
         self._known_circuits: set[str] = set()
+        # API connection health — persists across poll cycles
+        self._connection_health = HovalConnectionHealth()
+
+    @property
+    def connection_health(self) -> HovalConnectionHealth:
+        """Return the current API connection health snapshot."""
+        return self._connection_health
 
     def set_mode_override(self, circuit_path: str, mode: str) -> None:
         """Set optimistic mode override after a control action."""
@@ -293,7 +328,15 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         self.hass.async_create_task(_do_refresh())
 
     async def _async_update_data(self) -> HovalData:
-        """Fetch data from the API."""
+        """Fetch data from the API, updating connection health on every attempt.
+
+        Health counters are updated before exceptions are re-raised so that
+        connection-health sensors always reflect the latest failure state even
+        when HA marks the coordinator as unavailable.
+        """
+        _start = time.monotonic()
+        self._connection_health.total_polls += 1
+
         # Hard cap on total refresh time.  Even if every individual API call
         # retries twice and the auth calls also retry, this prevents the
         # coordinator from blocking HA's event loop (and startup) indefinitely
@@ -301,17 +344,74 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         # parallel fetch of circuits + live values + programs + events + weather.
         try:
             async with asyncio.timeout(90):
-                return await self._fetch_all_data()
+                result = await self._fetch_all_data()
+
+            # Success — record latency and reset consecutive failure counter.
+            elapsed_ms = round((time.monotonic() - _start) * 1000, 0)
+            self._connection_health.last_success = dt_util.utcnow()
+            self._connection_health.consecutive_failures = 0
+            self._connection_health.poll_latency_ms = elapsed_ms
+            _LOGGER.debug(
+                "Poll succeeded in %.0f ms (consecutive_failures reset, total_polls=%d)",
+                elapsed_ms,
+                self._connection_health.total_polls,
+            )
+            return result
+
         except TimeoutError as err:
+            self._connection_health.consecutive_failures += 1
+            self._connection_health.total_failures += 1
+            self._connection_health.last_error_time = dt_util.utcnow()
+            self._connection_health.last_error_type = "timeout"
+            self._connection_health.last_error_msg = "Poll timeout after 90 s"
+            _LOGGER.warning(
+                "Poll timed out (consecutive=%d, total_failures=%d)",
+                self._connection_health.consecutive_failures,
+                self._connection_health.total_failures,
+            )
             raise UpdateFailed(
                 "Hoval API refresh timed out after 90 s — cloud may be unresponsive. "
                 "HA will retry automatically."
             ) from err
+
         except HovalAuthError as err:
+            self._connection_health.consecutive_failures += 1
+            self._connection_health.total_failures += 1
+            self._connection_health.auth_failures += 1
+            self._connection_health.last_error_time = dt_util.utcnow()
+            self._connection_health.last_error_type = "auth"
+            self._connection_health.last_error_msg = f"Auth error: {err}"[:200]
+            _LOGGER.warning(
+                "Auth failure (consecutive=%d, auth_failures=%d): %s",
+                self._connection_health.consecutive_failures,
+                self._connection_health.auth_failures,
+                err,
+            )
             raise ConfigEntryAuthFailed("Authentication failed — check credentials") from err
+
         except HovalApiError as err:
-            _LOGGER.warning("Hoval API error during refresh: %s", err)
+            self._connection_health.consecutive_failures += 1
+            self._connection_health.total_failures += 1
+            self._connection_health.last_error_time = dt_util.utcnow()
+            self._connection_health.last_error_type = "api"
+            self._connection_health.last_error_msg = str(err)[:200]
+            _LOGGER.warning(
+                "API error during poll (consecutive=%d, total_failures=%d): %s",
+                self._connection_health.consecutive_failures,
+                self._connection_health.total_failures,
+                err,
+            )
             raise UpdateFailed(f"Error fetching Hoval data: {err}") from err
+
+        except Exception as err:  # noqa: BLE001
+            # Catch-all for unexpected exceptions — still update health so sensors
+            # reflect what happened before re-raising.
+            self._connection_health.consecutive_failures += 1
+            self._connection_health.total_failures += 1
+            self._connection_health.last_error_time = dt_util.utcnow()
+            self._connection_health.last_error_type = "unknown"
+            self._connection_health.last_error_msg = f"{type(err).__name__}: {err}"[:200]
+            raise
 
     async def _fetch_all_data(self) -> HovalData:
         """Inner fetch — called inside the asyncio.timeout guard.
@@ -559,4 +659,3 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         self._mode_override.clear()
 
         return data
-

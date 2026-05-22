@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -26,7 +27,13 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import HovalConnectConfigEntry, circuit_device_info, plant_device_info
 from .const import CIRCUIT_TYPE_BL, CIRCUIT_TYPE_HK, CIRCUIT_TYPE_HV, CIRCUIT_TYPE_WW
-from .coordinator import SIGNAL_NEW_CIRCUITS, HovalCircuitData, HovalDataCoordinator, HovalPlantData
+from .coordinator import (
+    SIGNAL_NEW_CIRCUITS,
+    HovalCircuitData,
+    HovalConnectionHealth,
+    HovalDataCoordinator,
+    HovalPlantData,
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -42,6 +49,19 @@ class HovalPlantSensorEntityDescription(SensorEntityDescription):
     """Describe a Hoval plant-level sensor entity."""
 
     value_fn: Callable[[HovalPlantData], Any | None]
+
+
+@dataclass(frozen=True, kw_only=True)
+class HovalConnectionSensorDescription(SensorEntityDescription):
+    """Describe a Hoval API connection health sensor.
+
+    These sensors read from coordinator.connection_health (a persistent
+    HovalConnectionHealth dataclass on the coordinator) rather than from
+    coordinator.data.  They remain available even when the last poll failed,
+    because tracking failures is their entire purpose.
+    """
+
+    value_fn: Callable[[HovalConnectionHealth], Any | None]
 
 
 CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
@@ -363,6 +383,103 @@ PLANT_SENSOR_DESCRIPTIONS: tuple[HovalPlantSensorEntityDescription, ...] = (
     ),
 )
 
+# ---------------------------------------------------------------------------
+# API connection health sensors
+# ---------------------------------------------------------------------------
+# These sensors expose the coordinator's persistent HovalConnectionHealth state
+# to HA, enabling dashboards and automations to observe and alert on
+# connection quality with the Hoval cloud (which is known to be flaky).
+#
+# Key design choices:
+#   - Attached to the plant device (natural parent for cloud-API diagnostics).
+#   - All have EntityCategory.DIAGNOSTIC so they are hidden by default.
+#   - HovalConnectionSensor overrides `available` to always return True —
+#     the whole point of these sensors is to report failures, so marking them
+#     unavailable on a poll error would defeat the purpose.
+#   - Counters use TOTAL_INCREASING so HA's energy/stats UI can chart them
+#     over time and alert on rate-of-change (e.g. >5 failures/hour).
+# ---------------------------------------------------------------------------
+
+CONNECTION_SENSOR_DESCRIPTIONS: tuple[HovalConnectionSensorDescription, ...] = (
+    # --- Timestamps ---
+    HovalConnectionSensorDescription(
+        key="api_last_success",
+        translation_key="api_last_success",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:cloud-check-outline",
+        value_fn=lambda h: h.last_success,
+    ),
+    HovalConnectionSensorDescription(
+        key="api_last_error_time",
+        translation_key="api_last_error_time",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:cloud-alert",
+        value_fn=lambda h: h.last_error_time,
+    ),
+    # --- Error details ---
+    HovalConnectionSensorDescription(
+        key="api_last_error",
+        translation_key="api_last_error",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:alert-network-outline",
+        value_fn=lambda h: h.last_error_msg,
+    ),
+    HovalConnectionSensorDescription(
+        key="api_last_error_type",
+        translation_key="api_last_error_type",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:help-network-outline",
+        value_fn=lambda h: h.last_error_type,
+    ),
+    # --- Failure counters ---
+    HovalConnectionSensorDescription(
+        key="api_consecutive_failures",
+        translation_key="api_consecutive_failures",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:connection",
+        value_fn=lambda h: h.consecutive_failures,
+    ),
+    HovalConnectionSensorDescription(
+        key="api_total_failures",
+        translation_key="api_total_failures",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:cloud-off-outline",
+        value_fn=lambda h: h.total_failures,
+    ),
+    HovalConnectionSensorDescription(
+        key="api_auth_failures",
+        translation_key="api_auth_failures",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:lock-alert-outline",
+        value_fn=lambda h: h.auth_failures,
+    ),
+    # --- Poll statistics ---
+    HovalConnectionSensorDescription(
+        key="api_total_polls",
+        translation_key="api_total_polls",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:refresh-circle",
+        value_fn=lambda h: h.total_polls,
+    ),
+    # --- Performance ---
+    HovalConnectionSensorDescription(
+        key="api_poll_latency",
+        translation_key="api_poll_latency",
+        native_unit_of_measurement=UnitOfTime.MILLISECONDS,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:timer-outline",
+        # Only meaningful after the first successful poll; None until then.
+        value_fn=lambda h: h.poll_latency_ms,
+    ),
+)
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -399,6 +516,16 @@ async def async_setup_entry(
                     continue
                 known.add(uid)
                 entities.append(HovalPlantSensor(coordinator, plant_id, plant_data, description))
+
+            # API connection health sensors (one set per plant, attached to plant device)
+            for description in CONNECTION_SENSOR_DESCRIPTIONS:
+                uid = f"{plant_id}_{description.key}"
+                if uid in known:
+                    continue
+                known.add(uid)
+                entities.append(
+                    HovalConnectionSensor(coordinator, plant_id, plant_data, description)
+                )
 
         if entities:
             async_add_entities(entities)
@@ -512,3 +639,58 @@ class HovalPlantSensor(CoordinatorEntity[HovalDataCoordinator], SensorEntity):
             return float(val) if isinstance(val, (int, float)) else val
         except (ValueError, TypeError):
             return None
+
+
+class HovalConnectionSensor(CoordinatorEntity[HovalDataCoordinator], SensorEntity):
+    """Hoval API connection health sensor.
+
+    Reads from coordinator.connection_health (a HovalConnectionHealth dataclass
+    that persists across polls) rather than from coordinator.data.
+
+    Stays available even when the last poll failed — surfacing failure counts,
+    error messages, and latency data is the entire reason these sensors exist.
+    Building automations on `api_consecutive_failures` lets you alert when the
+    Hoval cloud is misbehaving without writing any template sensors.
+    """
+
+    _attr_has_entity_name = True
+    entity_description: HovalConnectionSensorDescription
+
+    def __init__(
+        self,
+        coordinator: HovalDataCoordinator,
+        plant_id: str,
+        plant_data: HovalPlantData,
+        description: HovalConnectionSensorDescription,
+    ) -> None:
+        """Initialize the connection health sensor."""
+        super().__init__(coordinator)
+        self.entity_description = description
+        self._plant_id = plant_id
+        self._attr_unique_id = f"{plant_id}_{description.key}"
+        self._attr_device_info = plant_device_info(plant_data)
+
+    @property
+    def available(self) -> bool:
+        """Always available — tracking failures is the purpose of this sensor.
+
+        CoordinatorEntity would set available=False whenever last_update_success
+        is False, which is exactly when these sensors are most useful.
+        """
+        return True
+
+    @property
+    def native_value(self) -> datetime | float | int | str | None:
+        """Return the health metric value."""
+        health = self.coordinator.connection_health
+        val = self.entity_description.value_fn(health)
+        if val is None:
+            return None
+        # datetime values (TIMESTAMP device class) — return as-is; HA accepts them
+        if isinstance(val, datetime):
+            return val
+        # Numeric values — return as-is
+        if isinstance(val, (int, float)):
+            return val
+        # String values (error message, error type)
+        return str(val)[:255]
