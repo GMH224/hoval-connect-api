@@ -14,6 +14,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import (
     PERCENTAGE,
+    UnitOfTime,
     EntityCategory,
     UnitOfEnergy,
     UnitOfTemperature,
@@ -400,6 +401,12 @@ async def async_setup_entry(
                 known.add(uid)
                 entities.append(HovalPlantSensor(coordinator, plant_id, plant_data, description))
 
+        for key, name, icon in DIAGNOSTIC_SENSOR_DESCRIPTIONS:
+            uid = f"diagnostic_{key}"
+            if uid not in known:
+                known.add(uid)
+                entities.append(HovalDiagnosticSensor(coordinator, key, name, icon))
+
         if entities:
             async_add_entities(entities)
 
@@ -411,6 +418,16 @@ async def async_setup_entry(
 
     entry.async_on_unload(async_dispatcher_connect(hass, SIGNAL_NEW_CIRCUITS, _on_new_circuits))
 
+
+
+
+DIAGNOSTIC_SENSOR_DESCRIPTIONS = (
+    ("api_calls_per_hour", "API Calls/h", "mdi:api"),
+    ("api_failures_per_hour", "API Failures/h", "mdi:alert-circle"),
+    ("api_timeouts_per_hour", "API Timeouts/h", "mdi:timer-alert"),
+    ("api_failure_ratio", "API Failure Ratio", "mdi:percent"),
+    ("api_average_latency", "API Average Latency", "mdi:speedometer"),
+)
 
 class HovalCircuitSensor(CoordinatorEntity[HovalDataCoordinator], SensorEntity):
     """Hoval circuit sensor entity."""
@@ -512,3 +529,21 @@ class HovalPlantSensor(CoordinatorEntity[HovalDataCoordinator], SensorEntity):
             return float(val) if isinstance(val, (int, float)) else val
         except (ValueError, TypeError):
             return None
+
+
+class HovalDiagnosticSensor(CoordinatorEntity[HovalDataCoordinator], SensorEntity):
+    """Diagnostic telemetry sensor."""
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: HovalDataCoordinator, key: str, name: str, icon: str) -> None:
+        super().__init__(coordinator)
+        self._key = key
+        self._attr_name = name
+        self._attr_unique_id = f"hoval_connect_{key}"
+        self._attr_icon = icon
+
+    @property
+    def native_value(self):
+        return self.coordinator.diagnostic_stats.get(self._key)

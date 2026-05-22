@@ -1,9 +1,7 @@
 {
   "domain": "hoval_connect",
   "name": "Hoval Connect",
-  "codeowners": [
-    "@trcyberoptic"
-  ],
+  "codeowners": ["@trcyberoptic"],
   "config_flow": true,
   "dependencies": [],
   "documentation": "https://github.com/trcyberoptic/hoval-connect-api",
@@ -11,5 +9,5 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/trcyberoptic/hoval-connect-api/issues",
   "requirements": [],
-  "version": "0.15.10"
+  "version": "0.15.11"
 }

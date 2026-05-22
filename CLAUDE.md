@@ -184,8 +184,8 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 - **Translation fix**: `translations/en.json` synced with `strings.json`.
 
 
-## v0.15.10
-- Fixed coordinator crash when Hoval API returns None for plants collection
-- Added defensive normalization for iterable API payloads
-- Prevented setup retry loop failures on transient upstream API responses
-- Revalidated telemetry sensor suite and Home Assistant compatibility
+## v0.15.11
+- Fixed NoneType iterable crash in coordinator
+- Added real diagnostic telemetry sensors
+- Added API request/failure/timeout/latency monitoring
+- Added Python 3.11 compatibility fix

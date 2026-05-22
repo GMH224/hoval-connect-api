@@ -238,6 +238,11 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         self._program_cache_ttl = PROGRAM_CACHE_TTL.total_seconds()
         # Track known circuits for dynamic entity discovery
         self._known_circuits: set[str] = set()
+        # Diagnostic telemetry counters
+        self._request_timestamps: list[float] = []
+        self._failure_timestamps: list[float] = []
+        self._timeout_timestamps: list[float] = []
+        self._latencies: list[float] = []
 
     def set_mode_override(self, circuit_path: str, mode: str) -> None:
         """Set optimistic mode override after a control action."""
@@ -299,17 +304,29 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         # coordinator from blocking HA's event loop (and startup) indefinitely
         # when the Hoval cloud is unresponsive.  90 s is generous for the
         # parallel fetch of circuits + live values + programs + events + weather.
+        start_time = time.monotonic()
+        self._request_timestamps.append(time.time())
         try:
             async with asyncio.timeout(90):
-                return await self._fetch_all_data()
+                data = await self._fetch_all_data()
+                self._latencies.append((time.monotonic() - start_time) * 1000)
+                self._trim_metrics()
+                return data
         except TimeoutError as err:
+            self._timeout_timestamps.append(time.time())
+            self._failure_timestamps.append(time.time())
+            self._trim_metrics()
             raise UpdateFailed(
                 "Hoval API refresh timed out after 90 s — cloud may be unresponsive. "
                 "HA will retry automatically."
             ) from err
         except HovalAuthError as err:
+            self._failure_timestamps.append(time.time())
+            self._trim_metrics()
             raise ConfigEntryAuthFailed("Authentication failed — check credentials") from err
         except HovalApiError as err:
+            self._failure_timestamps.append(time.time())
+            self._trim_metrics()
             _LOGGER.warning("Hoval API error during refresh: %s", err)
             raise UpdateFailed(f"Error fetching Hoval data: {err}") from err
 
@@ -325,18 +342,11 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         data = HovalData()
 
         plants = await self.api.get_plants()
-
-        # Defensive normalization: some API failure modes can return None
-        # instead of an iterable collection. Never allow coordinator setup
-        # to crash on transient upstream failures.
         if plants is None:
-            _LOGGER.warning("Hoval API returned no plant data; treating as empty list")
+            _LOGGER.warning("Plants endpoint returned None; treating as empty list")
             plants = []
-        elif not isinstance(plants, list):
-            _LOGGER.warning(
-                "Unexpected plant payload type from Hoval API: %s",
-                type(plants).__name__,
-            )
+        if not isinstance(plants, list):
+            _LOGGER.warning("Plants endpoint returned invalid payload type %s", type(plants))
             plants = []
 
         for plant in plants:
@@ -573,3 +583,27 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
 
         return data
 
+
+    def _trim_metrics(self) -> None:
+        """Trim telemetry metrics to the last hour."""
+        cutoff = time.time() - 3600
+        self._request_timestamps = [t for t in self._request_timestamps if t >= cutoff]
+        self._failure_timestamps = [t for t in self._failure_timestamps if t >= cutoff]
+        self._timeout_timestamps = [t for t in self._timeout_timestamps if t >= cutoff]
+        self._latencies = self._latencies[-100:]
+
+    @property
+    def diagnostic_stats(self) -> dict[str, float]:
+        """Return diagnostic telemetry stats."""
+        requests = len(self._request_timestamps)
+        failures = len(self._failure_timestamps)
+        timeouts = len(self._timeout_timestamps)
+        avg_latency = round(sum(self._latencies) / len(self._latencies), 1) if self._latencies else 0
+        failure_ratio = round((failures / requests) * 100, 2) if requests else 0
+        return {
+            "api_calls_per_hour": requests,
+            "api_failures_per_hour": failures,
+            "api_timeouts_per_hour": timeouts,
+            "api_failure_ratio": failure_ratio,
+            "api_average_latency": avg_latency,
+        }
