@@ -536,6 +536,12 @@ class HovalDiagnosticSensor(CoordinatorEntity[HovalDataCoordinator], SensorEntit
 
     _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = True
+
+    """Diagnostic telemetry sensor."""
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(self, coordinator: HovalDataCoordinator, key: str, name: str, icon: str) -> None:
         super().__init__(coordinator)
