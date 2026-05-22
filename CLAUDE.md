@@ -131,6 +131,15 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
+
+### v0.15.8
+- **Full code audit completed** across API handling, diagnostics, retry logic, and response parsing.
+- **Improved timeout handling**: Added explicit `asyncio.TimeoutError` handling to improve compatibility across Python and aiohttp runtime combinations.
+- **Improved API response robustness**: Added safe fallback handling for non-JSON API responses to prevent coordinator crashes during transient upstream failures.
+- **Plant token validation hardened**: Added validation for missing `token` fields in API responses with proper error propagation.
+- **Documentation refreshed**: Updated README and internal documentation for diagnostics and reliability features.
+- **Version bump**: Updated integration version to `0.15.8`.
+
 ### v0.15.6
 - **`manifest.json` version corrected**: Version string was stuck at `0.15.2` instead of the current release version. Bumped to `0.15.6`.
 - **Dead constant removed** (`const.py`): `REQUEST_TIMEOUT = 30` was left in `const.py` after v0.15.5 removed it from `api.py`'s imports. No file referenced it; now removed entirely.
