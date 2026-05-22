@@ -84,7 +84,7 @@ class HovalConnectApi:
                 data = await resp.json()
         except HovalAuthError:
             raise
-        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as err:
+        except (aiohttp.ClientError, TimeoutError) as err:
             raise HovalApiError(f"Connection error during authentication: {err}") from err
 
         if "id_token" not in data:
@@ -115,12 +115,10 @@ class HovalConnectApi:
                 data = await resp.json()
         except (HovalAuthError, HovalApiError):
             raise
-        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as err:
+        except (aiohttp.ClientError, TimeoutError) as err:
             raise HovalApiError(f"Connection error fetching plant token: {err}") from err
 
-        token = data.get("token")
-        if not token:
-            raise HovalApiError("Plant settings response missing token")
+        token = data["token"]
         self._pat_cache[plant_id] = (token, time.time() + PLANT_TOKEN_TTL.total_seconds())
         return token
 
@@ -194,13 +192,10 @@ class HovalConnectApi:
                         raise HovalApiError(f"API request failed: HTTP {resp.status}")
                     if resp.status == 204 or resp.content_length == 0:
                         return None
-                    try:
-                        return await resp.json()
-                    except aiohttp.ContentTypeError:
-                        return await resp.text()
+                    return await resp.json()
             except (HovalAuthError, HovalApiError):
                 raise
-            except (asyncio.TimeoutError, TimeoutError) as err:
+            except TimeoutError as err:
                 if attempt < _MAX_RETRIES - 1:
                     delay = _RETRY_BASE_DELAY * (2**attempt)
                     _LOGGER.warning(
