@@ -184,9 +184,8 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 - **Translation fix**: `translations/en.json` synced with `strings.json`.
 
 
-## v0.15.9
-- Fixed Python/Home Assistant compatibility issue caused by Python 3.12-only type alias syntax.
-- Performed repository audit and verified all integration files are included in release archive.
-- Verified package compiles successfully under Python 3.11 runtime used by Home Assistant.
-- Retained diagnostic monitoring sensor suite introduced in v0.15.7.
-- Regenerated release archive with complete repository contents.
+## v0.15.10
+- Fixed coordinator crash when Hoval API returns None for plants collection
+- Added defensive normalization for iterable API payloads
+- Prevented setup retry loop failures on transient upstream API responses
+- Revalidated telemetry sensor suite and Home Assistant compatibility

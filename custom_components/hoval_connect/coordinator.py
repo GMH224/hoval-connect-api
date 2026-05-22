@@ -326,6 +326,19 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
 
         plants = await self.api.get_plants()
 
+        # Defensive normalization: some API failure modes can return None
+        # instead of an iterable collection. Never allow coordinator setup
+        # to crash on transient upstream failures.
+        if plants is None:
+            _LOGGER.warning("Hoval API returned no plant data; treating as empty list")
+            plants = []
+        elif not isinstance(plants, list):
+            _LOGGER.warning(
+                "Unexpected plant payload type from Hoval API: %s",
+                type(plants).__name__,
+            )
+            plants = []
+
         for plant in plants:
             plant_id = plant.get("plantExternalId")
             if not plant_id:

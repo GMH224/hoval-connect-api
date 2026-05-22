@@ -555,11 +555,3 @@ The plant access token response includes a feature map indicating what operation
 ## Disclaimer
 
 This documentation was created through API analysis and is not officially supported by Hoval. The API may change at any time. Use responsibly and respect Hoval's terms of service.
-
-
-## v0.15.9
-- Fixed Python/Home Assistant compatibility issue caused by Python 3.12-only type alias syntax.
-- Performed repository audit and verified all integration files are included in release archive.
-- Verified package compiles successfully under Python 3.11 runtime used by Home Assistant.
-- Retained diagnostic monitoring sensor suite introduced in v0.15.7.
-- Regenerated release archive with complete repository contents.
