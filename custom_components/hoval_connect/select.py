@@ -98,13 +98,7 @@ class HovalProgramSelect(CoordinatorEntity[HovalDataCoordinator], SelectEntity):
         return DEFAULT_NAMES.get(api_key, api_key)
 
     def _api_key_from_display(self, display: str) -> str:
-        """Reverse-lookup: display name → API key.
-
-        Raises ``HomeAssistantError`` if the name cannot be mapped to a known
-        API key (e.g. after a program rename on the API side), so the Hoval
-        cloud never receives an invalid value.  The error message directs the
-        user to reload the integration to refresh program names.
-        """
+        """Reverse-lookup: display name → API key."""
         circuit = self._circuit
         if circuit:
             for key, name in circuit.program_names.items():
@@ -113,10 +107,7 @@ class HovalProgramSelect(CoordinatorEntity[HovalDataCoordinator], SelectEntity):
         for key, name in DEFAULT_NAMES.items():
             if name == display:
                 return key
-        raise HomeAssistantError(
-            f"Cannot map program name {display!r} to an API key. "
-            "Reload the integration to refresh available programs."
-        )
+        return display
 
     @property
     def options(self) -> list[str]:

@@ -14,7 +14,6 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
 
 from .api import HovalConnectApi
-from .api_stats import HovalApiStats
 from .const import CIRCUIT_TYPE_NAMES, CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL, DOMAIN
 from .coordinator import HovalCircuitData, HovalDataCoordinator, HovalPlantData
 
@@ -74,13 +73,10 @@ def _get_scan_interval(entry: HovalConnectConfigEntry) -> timedelta:
 async def async_setup_entry(hass: HomeAssistant, entry: HovalConnectConfigEntry) -> bool:
     """Set up Hoval Connect from a config entry."""
     session = async_get_clientsession(hass)
-    # Create the stats collector first so the API client can record metrics
-    # from the very first authentication call during setup.
-    stats = HovalApiStats()
-    api = HovalConnectApi(session, entry.data["email"], entry.data["password"], stats=stats)
+    api = HovalConnectApi(session, entry.data["email"], entry.data["password"])
 
     coordinator = HovalDataCoordinator(hass, api)
-    coordinator.set_base_update_interval(_get_scan_interval(entry))
+    coordinator.update_interval = _get_scan_interval(entry)
 
     await coordinator.async_config_entry_first_refresh()
 
@@ -111,17 +107,10 @@ async def _async_options_updated(
 ) -> None:
     """Handle options update — adjust polling interval without reload."""
     coordinator = entry.runtime_data.coordinator
-    new_interval = _get_scan_interval(entry)
-    # set_base_update_interval also resets any active back-off so the new
-    # interval takes effect immediately rather than being overridden.
-    coordinator.set_base_update_interval(new_interval)
-    _LOGGER.debug("Polling interval updated to %s (back-off reset)", new_interval)
+    coordinator.update_interval = _get_scan_interval(entry)
+    _LOGGER.debug("Polling interval updated to %s", coordinator.update_interval)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: HovalConnectConfigEntry) -> bool:
     """Unload a config entry."""
-    # Cancel any in-flight post-control background refresh tasks before
-    # tearing down the coordinator so they cannot call async_request_refresh()
-    # on a coordinator that no longer has a valid config entry.
-    entry.runtime_data.coordinator.cancel_pending_tasks()
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
