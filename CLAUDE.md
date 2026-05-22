@@ -184,7 +184,7 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 - **Translation fix**: `translations/en.json` synced with `strings.json`.
 
 
-## v0.15.11
+## v0.15.12
 - Fixed NoneType iterable crash in coordinator
 - Added real diagnostic telemetry sensors
 - Added API request/failure/timeout/latency monitoring
