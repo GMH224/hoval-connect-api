@@ -28,7 +28,7 @@ PLATFORMS = [
     Platform.WATER_HEATER,
 ]
 
-HovalConnectConfigEntry = ConfigEntry
+type HovalConnectConfigEntry = ConfigEntry[HovalRuntimeData]
 
 
 @dataclass

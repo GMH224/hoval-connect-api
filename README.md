@@ -555,10 +555,3 @@ The plant access token response includes a feature map indicating what operation
 ## Disclaimer
 
 This documentation was created through API analysis and is not officially supported by Hoval. The API may change at any time. Use responsibly and respect Hoval's terms of service.
-
-
-## v0.15.12
-- Fixed NoneType iterable crash in coordinator
-- Added real diagnostic telemetry sensors
-- Added API request/failure/timeout/latency monitoring
-- Added Python 3.11 compatibility fix
