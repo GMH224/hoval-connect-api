@@ -69,3 +69,9 @@ DEFAULT_TURN_ON_MODE = TURN_ON_RESUME
 
 # Service names
 SERVICE_RESET_WW_BOOST = "reset_ww_boost"
+
+# Persistent health storage
+# Increment HEALTH_STORAGE_VERSION whenever the stored schema changes in a
+# backwards-incompatible way; HA will discard the stale file automatically.
+HEALTH_STORAGE_KEY = f"{DOMAIN}_health"
+HEALTH_STORAGE_VERSION = 1

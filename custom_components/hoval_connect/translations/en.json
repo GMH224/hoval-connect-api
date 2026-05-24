@@ -191,22 +191,31 @@
         "name": "API total polls"
       },
       "api_poll_latency": {
-        "name": "API poll latency"
+        "name": "API poll latency (last)"
       },
-      "api_p95_latency_1h": {
-        "name": "API P95 latency (1 h)"
+      "api_ema_latency": {
+        "name": "API poll latency (EMA)"
+      },
+      "api_avg_latency": {
+        "name": "API poll latency (avg)"
+      },
+      "api_p95_latency": {
+        "name": "API poll latency (p95)"
+      },
+      "api_failure_rate_1h": {
+        "name": "API failure rate (1 h)"
       },
       "api_auth_failure_rate_1h": {
         "name": "API auth failure rate (1 h)"
       },
-      "api_partial_failures_last_poll": {
-        "name": "API partial failures (last poll)"
+      "api_availability_1h": {
+        "name": "API availability (1 h)"
       },
-      "api_seconds_since_success": {
-        "name": "API seconds since last success"
+      "circuit_failure_rate_1h": {
+        "name": "Circuit failure rate (1 h)"
       },
-      "api_failure_rate_1h": {
-        "name": "API failure rate (1 h)"
+      "circuit_availability_1h": {
+        "name": "Circuit availability (1 h)"
       }
     },
     "water_heater": {

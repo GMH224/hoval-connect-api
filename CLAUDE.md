@@ -131,45 +131,130 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
-### v0.15.8
-Comprehensive defect fix release. Addresses all 15 items raised in the post-0.15.7 review.
+### v0.16.0
+Implements all four improvements suggested at the end of the v0.15.9 release notes.
 
-#### API reliability (api.py)
-- **Fix #1 — Retry jitter**: `_jittered_delay()` now multiplies base delay by `uniform(0.8, 1.2)` (formula corrected from the broken `1 ± 0.4*(r-0.5)*2` that produced `[0.6, 1.4]`). Prevents thundering-herd retries when multiple HA instances recover simultaneously after a Hoval cloud incident.
-- **Fix #5 — `content_length` check**: Replaced fragile `resp.content_length == 0` with an explicit two-step check: `if resp.status == 204: return None` then `cl = resp.content_length; if cl is not None and cl == 0: return None`. `content_length` is `None` when the server omits the Content-Length header — the old check would silently return `None` and drop valid JSON bodies.
-- **Fix #11 — Auth backoff after IDP rejection**: `_auth_cooldown_until: float` added to `HovalConnectApi`. After HTTP 400/401/403 from the IDP, `_auth_cooldown_until = time.monotonic() + 60.0`. Subsequent `_get_id_token()` calls within the cooldown raise `HovalApiError("Auth cooldown active…")` rather than hitting the IDP again. Cleared on successful auth and on `invalidate_tokens()`. Prevents hammering the identity provider when credentials are simply wrong.
+#### Persistence across HA restarts (`const.py`, `coordinator.py`, `__init__.py`)
+Cumulative health counters now survive HA restarts via HA's built-in `Store` helper (`homeassistant/helpers/storage`). A store keyed `hoval_connect_health` (version 1) is created in `async_setup_entry` and loaded *before* the first coordinator refresh, so sensors show historical context immediately — not a misleading "0 failures since startup" after every reboot.
 
-#### Connection health & circuit breaker (coordinator.py)
-- **Fix #2 — Circuit breaker**: After `_CB_THRESHOLD = 5` consecutive failures, `_maybe_open_circuit_breaker()` sets `_cb_open = True` and schedules a probe after `_CB_PROBE_INTERVAL = 300 s`. While open, `_async_update_data` raises `UpdateFailed` immediately without making any network requests. CB-skipped polls are NOT counted in `total_polls` or recorded in `_poll_records`. A successful probe closes the breaker; a failed probe resets the interval. `circuit_breaker_open` property exposed for diagnostics.
-- **Fix #3 — Per-endpoint partial failure tracking**: `HovalCircuitData` gains `failed_sub_fetches: list[str]`. `_fetch_circuit_data` appends `"live_values"` or `"programs"` when those sub-fetches fail inside `gather(return_exceptions=True)`. `_fetch_all_data` aggregates these plus `latest_event`, `events`, `weather` failures into `HovalConnectionHealth.partial_failures_last_poll`, `total_partial_failures`, and `partial_failure_endpoints` (comma-separated list). Previously these failures were completely silent.
-- **Fix #6 — Program cache stale-data fallback**: When programs fetch fails and a cached entry exists, the stale cached value is used and the cache timestamp is NOT updated (so the next poll retries). Previously the stale entry was abandoned mid-TTL, leaving circuits with no program data until the endpoint recovered.
-- **Fix #10 — `_fetch_circuit` promoted to proper method**: `_fetch_circuit` was an inner closure relying on a default-arg trick (`_plant_id: str = plant_id`) to avoid closure-over-loop-variable. Now a proper `async def _fetch_circuit_data(self, plant_id, path, ctype, circuit)` coordinator method. Independently testable and no scoping risk.
+**Persisted fields**: `total_polls`, `total_failures`, `auth_failures`, `error_counts`, `ema_latency_ms`, and per-circuit `total_polls` / `total_failures`.
 
-#### Rolling-window telemetry (coordinator.py)
-- **Fix #12 — `_poll_history` stores failure type, not bool**: `_PollRecord(ts, error_type, latency_ms)` NamedTuple replaces the old `(float, bool)` tuple. `error_type` is `None` for success or `"timeout"/"auth"/"api"/"unknown"` for failures. `latency_ms` populated only for successes. This unlocks per-type rate computation.
-- **Fix #13 — `api_auth_failure_rate_1h` sensor**: New `auth_failure_rate_pct_1h` rolling-window property on `HovalConnectionHealth`, counting only `error_type == "auth"` records. Exposed as `api_auth_failure_rate_1h` sensor.
-- **Fix #15 — Rate sensors return `0.0` not `None` before first poll**: `failure_rate_pct_1h` and `auth_failure_rate_pct_1h` now return `0.0` on an empty window, so sensors show `0%` rather than `unknown` immediately after HA restart.
+**Intentionally ephemeral** (reset on restart): rolling deques (`_poll_times`, `_failure_times`, etc.), `consecutive_failures`, `last_success`, `last_error_*`. Rolling rates reflect the current HA session; mixing sessions would give misleading 1-hour rates.
 
-#### Sensor fixes (sensor.py)
-- **Fix #14 — Counter state_class corrected**: `api_total_polls`, `api_total_failures`, `api_auth_failures` changed from `TOTAL_INCREASING` to `MEASUREMENT`. Dimensionless counters without a physical unit are stored inconsistently by HA's recorder with `TOTAL_INCREASING` (some HA versions show `unknown` until the first non-zero value). `MEASUREMENT` stores every value reliably.
-- **Fix #7 — P95 latency sensor**: New `api_p95_latency_1h` sensor backed by `p95_latency_ms_1h` property. Computed from successful-poll latencies in the 1-hour window; requires ≥5 samples (returns `None` otherwise). Useful for detecting gradual latency degradation before hard timeouts begin.
-- **Fix #8 — `api_seconds_since_success` sensor**: New sensor computing `(dt_util.utcnow() - last_success).total_seconds()` live in `native_value`. Updates every coordinator poll. Unit `s`, state_class `MEASUREMENT`. Enables simple automations like "alert if no successful poll in 10 minutes" without template sensors.
-- **New — `api_partial_failures_last_poll`**: Exposes `HovalConnectionHealth.partial_failures_last_poll` — count of sub-tasks that failed silently in the most recent poll. Non-zero while the overall poll succeeds means some entities have stale data.
+Saves are *debounced* via `Store.async_delay_save(fn, 30s)` so busy poll cycles don't hammer I/O. A final immediate `async_save` is called from `async_unload_entry` to guard against data loss on a clean HA shutdown before the debounce fires.
 
-#### Diagnostics (diagnostics.py)
-- **Fix #9 — Connection health in diagnostics export**: `async_get_config_entry_diagnostics` now includes a `connection_health` section with all telemetry fields (timestamps as ISO-8601, all counters, rolling-window rates, P95 latency, partial-failure details, circuit-breaker state, and rolling-window sample count). Raw `_poll_records` are omitted (monotonic timestamps are meaningless outside the process); derived metrics are included instead.
+#### Exponential Moving Average latency (`coordinator.py`, `sensor.py`, `strings.json`, `translations/en.json`)
+Adds `api_ema_latency` sensor (α = 0.1). The EMA weights the most-recent poll at 10 % and the prior EMA at 90 %, giving a smooth trend line that responds to sustained degradation without being dominated by one-off spikes. A single 10 s spike on a 100 ms baseline produces EMA ≈ 1 090 ms — a clear signal but not an alarm. The EMA is persisted across restarts so its trend carries meaningful history; it's never reset to `None` unless the storage file is deleted.
 
-#### Summary of new/changed sensors
-| Key | Change |
+The EMA is calculated without storing any additional history — a single scalar field updated on each successful poll.
+
+#### Finer-grained error bucketing (`coordinator.py`)
+`last_error_type` and the new `error_counts` dict now use five distinct string constants instead of four blended categories:
+
+| Constant | When raised |
 |---|---|
-| `api_total_polls` | state_class: `TOTAL_INCREASING` → `MEASUREMENT` |
-| `api_total_failures` | state_class: `TOTAL_INCREASING` → `MEASUREMENT` |
-| `api_auth_failures` | state_class: `TOTAL_INCREASING` → `MEASUREMENT` |
-| `api_failure_rate_1h` | now returns `0.0` (not `None`) before first poll |
-| `api_auth_failure_rate_1h` | **NEW** — auth errors as % of polls in last hour |
-| `api_p95_latency_1h` | **NEW** — P95 successful poll latency over last hour (ms) |
-| `api_seconds_since_success` | **NEW** — seconds elapsed since last good poll |
-| `api_partial_failures_last_poll` | **NEW** — silent sub-task failures in last poll |
+| `"timeout"` | The 90 s overall coordinator asyncio timeout fires |
+| `"auth"` | `HovalAuthError` — credentials problem |
+| `"circuit_list"` | `get_circuits()` specifically fails (most impactful single endpoint) |
+| `"api"` | Any other `HovalApiError` |
+| `"unknown"` | Unexpected exception (schema change, bug) |
+
+`"circuit_list"` is a new sentinel raised by the private `_CircuitListError` exception class, which wraps `HovalApiError` from `get_circuits()` before it propagates to `_async_update_data`. This lets `error_counts["circuit_list"]` distinguish a circuits-endpoint failure from a generic API failure on a less-critical endpoint (e.g. weather). `error_counts` is persisted and included in the `counters_since_startup` diagnostics group.
+
+#### Per-circuit reliability tracking (`coordinator.py`, `sensor.py`, `strings.json`, `translations/en.json`)
+Adds `HovalCircuitHealth` — a dedicated dataclass per circuit path (keyed in `HovalConnectionHealth._circuit_health`) that tracks:
+
+- `total_polls` / `total_failures` — cumulative; persisted
+- `consecutive_failures` — session-only; resets on success
+- `last_success` / `last_failure` (UTC datetimes) — session-only
+- `last_error` (str, truncated to 200 chars) — session-only
+- `failure_rate_1h` / `availability_1h` — computed from rolling deques, same pattern as the coordinator-level rates
+
+`record_success(ts)` / `record_failure(ts, error)` are called inside `_fetch_circuit` after the live-values fetch result is known. Programs-fetch failures are *not* counted because they fall back to a stale cache and are far less impactful on entity availability.
+
+Two new **circuit-level diagnostic sensors** are added to `CIRCUIT_SENSOR_DESCRIPTIONS`:
+
+| Entity key | Unit | Description |
+|---|---|---|
+| `circuit_failure_rate_1h` | `%` | Live-values fetch failure rate for this specific circuit in the last hour |
+| `circuit_availability_1h` | `%` | Inverse of failure rate |
+
+These surfaces a partial outage (e.g. Hoval rolling out a change that breaks one circuit type's endpoint) that the plant-level sensors would mask.
+
+The full per-circuit health snapshot (`total_polls`, `total_failures`, `consecutive_failures`, `failure_rate_1h_pct`, `availability_1h_pct`, `last_success`, `last_failure`, `last_error`) is included in the `connection_health.circuits` section of the HA diagnostics export, sorted alphabetically by circuit path.
+
+#### Suggested automations using new sensors
+- Alert when `circuit_failure_rate_1h` > 50 % on any circuit → partial API outage
+- Alert when `api_ema_latency` > 8 000 ms → sustained cloud slowdown, timeouts likely soon
+- Trend `api_ema_latency` in a Grafana/InfluxDB dashboard for long-term reliability history
+- Alert when `error_counts["circuit_list"]` increases → most severe single-endpoint failure
+
+### v0.15.9
+- **Telemetry: rolling 1-hour rate sensors** (`coordinator.py`, `sensor.py`, `strings.json`, `translations/en.json`): Adds three new diagnostic sensors that answer the most actionable question — *"how reliable is the Hoval cloud right now?"* — without requiring custom template helpers:
+  | Entity key | Unit | Description |
+  |---|---|---|
+  | `api_failure_rate_1h` | `%` | Percentage of polls that failed in the last hour |
+  | `api_auth_failure_rate_1h` | `%` | Percentage of polls with an auth error in the last hour |
+  | `api_availability_1h` | `%` | Inverse of failure rate — API uptime over the last hour |
+
+  All three return `None` (unavailable) until at least one poll is recorded inside the rolling window, so they don't show a misleading `0 %` immediately after startup.
+
+- **Telemetry: rolling latency statistics** (`coordinator.py`, `sensor.py`): Replaces the single "last poll latency" scalar with three sensors covering the last 60 successful polls:
+  | Entity key | Description |
+  |---|---|
+  | `api_poll_latency` (renamed) | Last successful poll — `(last)` suffix added for clarity |
+  | `api_avg_latency` | Rolling arithmetic mean — useful for spotting gradual slowdowns |
+  | `api_p95_latency` | 95th-percentile — catches tail latency that the mean hides; a rising p95 reliably predicts imminent timeouts |
+
+- **Telemetry: rolling-history internals** (`coordinator.py`): `HovalConnectionHealth` now maintains four in-memory deques (not dataclass fields, so they never appear in `asdict()` or corrupt serialisation):
+  - `_poll_times` — UTC timestamp of every poll attempt (maxlen=180, ~90 min at 30 s polling)
+  - `_failure_times` — UTC timestamp of every failed poll
+  - `_auth_failure_times` — UTC timestamp of every auth failure
+  - `_latency_samples` — wall-clock duration (ms) of every successful poll (maxlen=60)
+  All computed properties (`failure_rate_1h`, `auth_failure_rate_1h`, `availability_1h`, `avg_latency_ms`, `p95_latency_ms`) use `datetime.now(timezone.utc)` for the rolling cutoff so they are always accurate regardless of when HA started or how long it ran. Each failure branch in `_async_update_data` now appends a single shared timestamp variable (`_ts = dt_util.utcnow()`) rather than calling `dt_util.utcnow()` multiple times — ensures all counter fields for the same failure are timestamped identically.
+
+- **Diagnostics: `connection_health` section** (`diagnostics.py`): The HA diagnostics export (`Developer Tools → Diagnostics`) now includes a structured `connection_health` block alongside `config_entry` and `coordinator_data`. The block is produced by the new `HovalConnectionHealth.as_diagnostic_dict()` method and contains four groups:
+  ```
+  connection_health
+  ├── last_success              ISO-8601 UTC string
+  ├── last_error
+  │   ├── time                  ISO-8601 UTC string
+  │   ├── type                  "timeout" | "auth" | "api" | "unknown"
+  │   └── message               truncated error string
+  ├── counters_since_startup
+  │   ├── total_polls
+  │   ├── total_failures
+  │   ├── auth_failures
+  │   ├── consecutive_failures
+  │   └── overall_failure_rate_pct
+  ├── rolling_1h_window
+  │   ├── polls                 raw count in the window
+  │   ├── failures
+  │   ├── auth_failures
+  │   ├── failure_rate_pct
+  │   ├── auth_failure_rate_pct
+  │   └── availability_pct
+  └── latency_ms
+      ├── last
+      ├── avg
+      ├── p95
+      └── sample_count
+  ```
+
+- **Suggested automations** using the new sensors:
+  - Alert when `api_availability_1h` < 80 % (sustained outage, not just a blip)
+  - Alert when `api_auth_failure_rate_1h` > 0 % (credentials may have rotated)
+  - Alert when `api_p95_latency` > 15 000 ms (cloud degradation likely to cause timeouts soon)
+  - Long-term statistics on `api_failure_rate_1h` for a reliability trend dashboard
+
+### v0.15.8
+- **Bug fix — `async_control_and_refresh` blocked entity actions for 2 s** (`coordinator.py`): `await asyncio.sleep(2)` was placed *before* `hass.async_create_task(_do_refresh())`, so every control action (fan speed change, set temperature, HVAC mode switch) blocked the calling entity method for 2 s before returning to HA. Despite the docstring saying the caller returns promptly, it did not. Fixed by moving the `asyncio.sleep(2)` inside `_do_refresh()`, which runs as a background task. Entity action methods now return to HA immediately; the 2 s settle delay happens off the critical path.
+- **Bug fix — `_resolve_active_program_value` always used `week1`, breaking week2 users** (`coordinator.py`): The function hard-coded `programs.get("week1", {})` regardless of which weekly schedule was active. Users running on `week2` got the wrong `active_week_name`, wrong `active_day_program_name`, and wrong `program_air_volume` — the last of which feeds into `resolve_fan_speed()`'s fallback chain, silently sending incorrect airflow targets to the API. Fixed by adding an `active_program: str | None = None` parameter; the function now selects `"week2"` when `active_program == "week2"`, otherwise defaults to `"week1"`. The call-site in `_fetch_circuit` passes `circuit_data.active_program`.
+- **Bug fix — `latest_event_time` TIMESTAMP sensor returned a raw ISO string** (`sensor.py`): `HovalPlantSensor.native_value` returned `str(val)` for any string value with no `native_unit_of_measurement`. The `latest_event_time` sensor carries `device_class=SensorDeviceClass.TIMESTAMP` — HA requires a `datetime` object for TIMESTAMP sensors; a plain string causes state errors. Fixed by importing `dt_util` and calling `dt_util.parse_datetime(val)` when `device_class == SensorDeviceClass.TIMESTAMP` and the value is a string. The return-type annotation is updated to `datetime | float | str | None`.
+- **Bug fix — `get_events` / `get_latest_event` did not send Plant Access Token** (`api.py`): Both methods called `self._request(...)` without the `plant_id=` keyword argument, so `_headers()` only attached the `Authorization: Bearer` id-token and omitted `X-Plant-Access-Token`. All v1 endpoints require the PAT; the missing header caused silent failures (swallowed by `gather(return_exceptions=True)`) that made event sensors always show `None`. Fixed by passing `plant_id=plant_id` in both calls.
+- **Bug fix — unguarded `circuit["path"]` KeyError** (`coordinator.py`): A circuit dict returned without a `"path"` key raised `KeyError`, failing the entire plant refresh rather than skipping the malformed entry. Fixed by using `circuit.get("path")` with an explicit `None` check and a `_LOGGER.warning` before `continue`.
+- **Bug fix — auth headers built once before retry loop** (`api.py`): `headers = await self._headers(plant_id)` was computed once before the `for attempt in range(_MAX_RETRIES)` loop. On a long retry cycle where the id-token expires between attempts, the stale bearer token was reused and would be rejected with 401. Fixed by moving the `headers` call inside the loop so tokens are always fresh at the start of each attempt.
+- **Bug fix — `select.py` display-name reverse-lookup collision** (`select.py`): `_api_key_from_display` fell through to `DEFAULT_NAMES` for all keys, including those already overridden by the user. If a user named their `week2` program `"Week 1"` (the default for `week1`), the lookup returned `"week1"` and activated the wrong program. Fixed by skipping `DEFAULT_NAMES` for any key already present in `circuit.program_names`.
 
 ### v0.15.7
 - **API connection health telemetry** (`coordinator.py`, `sensor.py`, `strings.json`, `translations/en.json`): Adds a comprehensive set of diagnostic sensors to surface Hoval cloud API connection quality directly in Home Assistant. Motivated by persistent server-side instability causing silent failures that are hard to diagnose without log diving.

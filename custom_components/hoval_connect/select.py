@@ -98,14 +98,22 @@ class HovalProgramSelect(CoordinatorEntity[HovalDataCoordinator], SelectEntity):
         return DEFAULT_NAMES.get(api_key, api_key)
 
     def _api_key_from_display(self, display: str) -> str:
-        """Reverse-lookup: display name → API key."""
+        """Reverse-lookup: display name → API key.
+
+        User-defined names take precedence.  When falling back to DEFAULT_NAMES,
+        only consider keys that have no user-defined name — this prevents a
+        collision where the user names their week2 program "Week 1" and the
+        lookup incorrectly returns "week1".
+        """
         circuit = self._circuit
         if circuit:
             for key, name in circuit.program_names.items():
                 if name == display:
                     return key
+        # Only use DEFAULT_NAMES for keys that the user hasn't renamed
+        user_named_keys = set(circuit.program_names.keys()) if circuit else set()
         for key, name in DEFAULT_NAMES.items():
-            if name == display:
+            if key not in user_named_keys and name == display:
                 return key
         return display
 

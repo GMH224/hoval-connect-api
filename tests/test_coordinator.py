@@ -31,6 +31,8 @@ sys.modules["voluptuous"] = ha_mock
 from custom_components.hoval_connect.coordinator import (  # noqa: E402
     _V1_PROGRAM_MAP,
     HovalCircuitData,
+    HovalCircuitHealth,
+    HovalConnectionHealth,
     HovalEventData,
     _is_problem_event,
     _parse_event,
@@ -180,6 +182,39 @@ class TestResolveActiveProgramValue:
         assert day == "Weekend"
         assert value == 50
 
+    def test_week2_active_program_uses_week2_schedule(self):
+        """Bug fix: week2 users were always resolved against week1 schedule."""
+        programs = self._make_programs()
+        # week2 has a different name and dayProgramIds than week1
+        programs["week2"] = {
+            "name": "Woche 2",
+            "dayProgramIds": [2, 2, 2, 2, 2, 2, 2],  # All days → Weekend day config
+        }
+        now = datetime(2024, 1, 8, 12, 0)  # Monday
+        week, day, value = _resolve_active_program_value(
+            programs, now, active_program="week2"
+        )
+        assert week == "Woche 2"
+        assert day == "Weekend"
+        assert value == 50  # Weekend phase value
+
+    def test_week1_active_program_explicit(self):
+        """Passing active_program='week1' explicitly behaves identically to default."""
+        programs = self._make_programs()
+        now = datetime(2024, 1, 8, 10, 0)  # Monday
+        week, day, value = _resolve_active_program_value(
+            programs, now, active_program="week1"
+        )
+        assert week == "Woche 1"
+        assert value == 60
+
+    def test_none_active_program_defaults_to_week1(self):
+        """active_program=None (default) still resolves week1."""
+        programs = self._make_programs()
+        now = datetime(2024, 1, 8, 10, 0)
+        week, day, value = _resolve_active_program_value(programs, now, active_program=None)
+        assert week == "Woche 1"
+
     def test_no_matching_phase(self):
         programs = self._make_programs()
         now = datetime(2024, 1, 8, 4, 0)  # Monday 4 AM
@@ -312,3 +347,250 @@ class TestIsProblemEvent:
 
     def test_none_event_type_is_not_problem(self):
         assert _is_problem_event(HovalEventData(event_type=None)) is False
+
+
+class TestHovalCircuitHealth:
+    """Tests for HovalCircuitHealth — per-circuit reliability tracking."""
+
+    def test_initial_state(self):
+        ch = HovalCircuitHealth()
+        assert ch.total_polls == 0
+        assert ch.total_failures == 0
+        assert ch.consecutive_failures == 0
+        assert ch.failure_rate_1h is None  # no data yet
+        assert ch.availability_1h is None
+
+    def test_record_success(self):
+        from datetime import timezone
+        ch = HovalCircuitHealth()
+        ts = datetime.now(timezone.utc)
+        ch.record_success(ts)
+        assert ch.total_polls == 1
+        assert ch.total_failures == 0
+        assert ch.consecutive_failures == 0
+        assert ch.last_success == ts
+        assert ch.failure_rate_1h == 0.0
+        assert ch.availability_1h == 100.0
+
+    def test_record_failure(self):
+        from datetime import timezone
+        ch = HovalCircuitHealth()
+        ts = datetime.now(timezone.utc)
+        ch.record_failure(ts, "HTTP 503")
+        assert ch.total_polls == 1
+        assert ch.total_failures == 1
+        assert ch.consecutive_failures == 1
+        assert ch.last_failure == ts
+        assert ch.last_error == "HTTP 503"
+        assert ch.failure_rate_1h == 100.0
+        assert ch.availability_1h == 0.0
+
+    def test_consecutive_failures_resets_on_success(self):
+        from datetime import timezone
+        ch = HovalCircuitHealth()
+        ts = datetime.now(timezone.utc)
+        ch.record_failure(ts, "err")
+        ch.record_failure(ts, "err")
+        assert ch.consecutive_failures == 2
+        ch.record_success(ts)
+        assert ch.consecutive_failures == 0
+        assert ch.total_failures == 2  # cumulative doesn't reset
+
+    def test_mixed_polls_failure_rate(self):
+        from datetime import timezone
+        ch = HovalCircuitHealth()
+        ts = datetime.now(timezone.utc)
+        for _ in range(8):
+            ch.record_success(ts)
+        for _ in range(2):
+            ch.record_failure(ts, "err")
+        assert ch.failure_rate_1h == 20.0
+        assert ch.availability_1h == 80.0
+
+    def test_error_truncated_to_200_chars(self):
+        from datetime import timezone
+        ch = HovalCircuitHealth()
+        ch.record_failure(datetime.now(timezone.utc), "x" * 300)
+        assert len(ch.last_error) == 200
+
+    def test_to_store_dict_only_cumulative(self):
+        from datetime import timezone
+        ch = HovalCircuitHealth()
+        ch.record_success(datetime.now(timezone.utc))
+        ch.record_failure(datetime.now(timezone.utc), "err")
+        d = ch.to_store_dict()
+        assert set(d.keys()) == {"total_polls", "total_failures"}
+        assert d["total_polls"] == 2
+        assert d["total_failures"] == 1
+
+    def test_restore_from_store(self):
+        ch = HovalCircuitHealth()
+        ch.restore_from_store({"total_polls": 500, "total_failures": 42})
+        assert ch.total_polls == 500
+        assert ch.total_failures == 42
+        assert ch.consecutive_failures == 0  # not restored — session-only
+
+    def test_restore_ignores_bad_keys(self):
+        ch = HovalCircuitHealth()
+        ch.restore_from_store({"total_polls": "not-a-number"})
+        assert ch.total_polls == 0  # int() of "not-a-number" raises → falls back to 0
+
+
+class TestHovalConnectionHealthV2:
+    """Tests for v0.16.0 additions to HovalConnectionHealth."""
+
+    def _make_health(self):
+        from datetime import timezone
+        return HovalConnectionHealth()
+
+    def test_ema_initialises_on_first_sample(self):
+        h = self._make_health()
+        assert h.ema_latency_ms is None
+        h.update_ema(200.0)
+        assert h.ema_latency_ms == 200.0
+
+    def test_ema_converges_toward_new_value(self):
+        h = self._make_health()
+        h.update_ema(1000.0)
+        # Feed 100 ms samples — EMA should drift down from 1000
+        for _ in range(50):
+            h.update_ema(100.0)
+        assert h.ema_latency_ms < 200.0  # well below starting value
+
+    def test_ema_is_smooth(self):
+        """A single spike should not dominate the EMA."""
+        h = self._make_health()
+        for _ in range(20):
+            h.update_ema(100.0)
+        baseline = h.ema_latency_ms
+        h.update_ema(10000.0)  # spike
+        assert h.ema_latency_ms < 1500.0  # 1090 expected (0.1*10000+0.9*100); 1500 is a conservative bound
+
+    def test_record_error_helper(self):
+        from datetime import timezone
+        h = self._make_health()
+        ts = datetime.now(timezone.utc)
+        h._record_error(ts, "timeout", "Poll timeout after 90 s")
+        assert h.consecutive_failures == 1
+        assert h.total_failures == 1
+        assert h.auth_failures == 0
+        assert h.last_error_type == "timeout"
+        assert h.last_error_msg == "Poll timeout after 90 s"
+        assert h.error_counts == {"timeout": 1}
+
+    def test_record_error_auth_flag(self):
+        from datetime import timezone
+        h = self._make_health()
+        ts = datetime.now(timezone.utc)
+        h._record_error(ts, "auth", "Bad token", is_auth=True)
+        assert h.auth_failures == 1
+        assert h.error_counts == {"auth": 1}
+
+    def test_error_counts_accumulate(self):
+        from datetime import timezone
+        h = self._make_health()
+        ts = datetime.now(timezone.utc)
+        h._record_error(ts, "timeout", "t")
+        h._record_error(ts, "timeout", "t")
+        h._record_error(ts, "api", "a")
+        assert h.error_counts == {"timeout": 2, "api": 1}
+
+    def test_circuit_health_lazy_creation(self):
+        h = self._make_health()
+        assert "1.2.3" not in h._circuit_health
+        ch = h.get_circuit_health("1.2.3")
+        assert isinstance(ch, HovalCircuitHealth)
+        # Same object on subsequent calls
+        assert h.get_circuit_health("1.2.3") is ch
+
+    def test_to_store_dict_includes_circuits(self):
+        from datetime import timezone
+        h = self._make_health()
+        h.total_polls = 10
+        h.ema_latency_ms = 250.0
+        ch = h.get_circuit_health("1.2.3")
+        ch.record_success(datetime.now(timezone.utc))
+        d = h.to_store_dict()
+        assert d["total_polls"] == 10
+        assert d["ema_latency_ms"] == 250.0
+        assert "1.2.3" in d["circuits"]
+        assert d["circuits"]["1.2.3"]["total_polls"] == 1
+
+    def test_restore_from_store_full(self):
+        h = self._make_health()
+        data = {
+            "total_polls": 1000,
+            "total_failures": 50,
+            "auth_failures": 3,
+            "error_counts": {"timeout": 10, "api": 40},
+            "ema_latency_ms": 350.5,
+            "circuits": {
+                "2.3.4": {"total_polls": 200, "total_failures": 5},
+            },
+        }
+        h.restore_from_store(data)
+        assert h.total_polls == 1000
+        assert h.total_failures == 50
+        assert h.auth_failures == 3
+        assert h.error_counts == {"timeout": 10, "api": 40}
+        assert h.ema_latency_ms == 350.5
+        assert h._circuit_health["2.3.4"].total_polls == 200
+        assert h._circuit_health["2.3.4"].total_failures == 5
+
+    def test_restore_strips_unknown_error_types(self):
+        h = self._make_health()
+        h.restore_from_store({
+            "error_counts": {"timeout": 1, "INJECTION_ATTACK": 99, "api": 2},
+        })
+        assert "INJECTION_ATTACK" not in h.error_counts
+        assert h.error_counts == {"timeout": 1, "api": 2}
+
+    def test_restore_ignores_bad_ema(self):
+        h = self._make_health()
+        h.restore_from_store({"ema_latency_ms": -5})
+        assert h.ema_latency_ms is None  # negative value rejected
+
+    def test_as_diagnostic_dict_structure(self):
+        h = self._make_health()
+        d = h.as_diagnostic_dict()
+        assert "last_success" in d
+        assert "last_error" in d
+        assert "counters_since_startup" in d
+        assert "rolling_1h_window" in d
+        assert "latency_ms" in d
+        assert "circuits" in d
+        assert "ema" in d["latency_ms"]
+        assert "error_counts" in d["counters_since_startup"]
+
+    def test_as_diagnostic_dict_circuit_section(self):
+        from datetime import timezone
+        h = self._make_health()
+        ch = h.get_circuit_health("5.6.7")
+        ch.record_success(datetime.now(timezone.utc))
+        d = h.as_diagnostic_dict()
+        assert "5.6.7" in d["circuits"]
+        assert d["circuits"]["5.6.7"]["total_polls"] == 1
+
+    def test_persist_roundtrip(self):
+        """to_store_dict() → restore_from_store() is a lossless roundtrip."""
+        from datetime import timezone
+        h = self._make_health()
+        h.total_polls = 42
+        h.total_failures = 7
+        h.auth_failures = 2
+        h.error_counts = {"auth": 2, "timeout": 5}
+        h.ema_latency_ms = 123.4
+        ch = h.get_circuit_health("9.9.9")
+        ch.total_polls = 10
+        ch.total_failures = 1
+
+        stored = h.to_store_dict()
+        h2 = HovalConnectionHealth()
+        h2.restore_from_store(stored)
+
+        assert h2.total_polls == 42
+        assert h2.total_failures == 7
+        assert h2.auth_failures == 2
+        assert h2.error_counts == {"auth": 2, "timeout": 5}
+        assert h2.ema_latency_ms == 123.4
+        assert h2._circuit_health["9.9.9"].total_polls == 10
