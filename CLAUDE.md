@@ -31,7 +31,7 @@ The integration lives in `custom_components/hoval_connect/`. User setup is email
 - `select.py` — Program selection (week1/week2/ecoMode/standby/constant) with user-defined names; applies to HV, HK, **and WW** circuits
 - `sensor.py` — Circuit-type-filtered sensors (HV/HK/BL/WW) + 6 plant-level sensors (events, weather); includes `circuit_status` diagnostic sensor for BL, HK, and WW (sourced from `HovalCircuitData.circuit_status`, populated from `CircuitV3DTO.circuitStatus` in the circuit list response)
 - `water_heater.py` — WW hot water entity (`WaterHeaterEntity`); exposes current/target temperature and operation modes heat_pump / high_demand / off; `set_temperature` posts a `midnight`-duration temporary-change override; `set_operation_mode` switches between week-program and standby; registers the `reset_ww_boost` entity service via `async_get_current_platform()` → `async_register_entity_service`, which calls `async_reset_temporary_change` (DELETEs the temporary-change endpoint without touching the week program)
-- `binary_sensor.py` — Plant online/error status + circuit-level binary sensors (WEZ/BL heat generator active state via `HovalCircuitBinarySensor`); uses `HovalCircuitBinarySensorDescription` with `circuit_types` filter, same pattern as sensor.py
+- `binary_sensor.py` — Plant online status + error/warning status
 - `diagnostics.py` — Diagnostic export with PII redaction
 - `const.py` — API URLs, OAuth client ID, token TTLs, polling interval, circuit types, duration enums, `SERVICE_RESET_WW_BOOST`
 - `__init__.py` — Entry setup, platform forwarding, `plant_device_info`/`circuit_device_info` helpers
@@ -41,7 +41,7 @@ The integration lives in `custom_components/hoval_connect/`. User setup is email
 - Entities use `CoordinatorEntity` — no direct API calls, all data comes from the coordinator
 - Device hierarchy: one parent device per plant, one child device per plant+circuit (linked via `via_device`)
 - Circuit devices identified by `{plantId}_{circuitPath}`
-- Supports HV (ventilation), HK (heating), BL (boiler), WW (warm water), and WEZ (Wärmeerzeuger / heat generator) circuit types (`SUPPORTED_CIRCUIT_TYPES` in `const.py`)
+- Supports HV (ventilation), HK (heating), BL (boiler), and WW (warm water) circuit types (`SUPPORTED_CIRCUIT_TYPES` in `const.py`)
 - Sensor descriptions use `circuit_types: frozenset[str] | None` to filter which sensors appear on which circuit types (`None` = all types)
 - Fan speed resolution uses smart fallback chain: live airVolume → `targetValue` (HV percentage from circuit list) → program air volume → default 40% (API rejects value=0)
 - All entity platforms use `translation_key` for entity names (not hardcoded `_attr_name`)
@@ -130,34 +130,6 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 - HK climate entity: `set_temperature` sends value as integer — may need adjustment for different HK circuit models (some use tenths of degree)
 
 ## Changelog
-
-### v0.17.0
-Fixes "entity is no longer being provided by the hoval_connect integration" errors that appeared after upgrading to v0.16.0, caused by Hoval returning heat-generator circuits as type `WEZ` in the v3 API instead of `BL`.
-
-**`CIRCUIT_TYPE_WEZ` added** (`const.py`):
-- New constant `CIRCUIT_TYPE_WEZ = "WEZ"` (Wärmeerzeuger — German for heat generator).
-- Added to `SUPPORTED_CIRCUIT_TYPES` alongside HV, HK, BL, WW.
-- Added to `CIRCUIT_TYPE_NAMES` as `"Heat Generator"`.
-
-**WEZ treated as non-selectable** (`coordinator.py`):
-- `_non_selectable_types` extended from `{BL, WW}` to `{BL, WW, WEZ}`. WEZ circuits return `selectable=False` from the v3 API (same as BL/WW) but still provide live values — this prevents them from being silently skipped.
-- Unsupported circuit types now emit a `DEBUG` log line (`Skipping unsupported circuit type ...`) to aid future debugging when Hoval adds new types.
-
-**WEZ sensor entities** (`sensor.py`):
-- All 13 BL sensor `circuit_types` frozensets extended to also include `CIRCUIT_TYPE_WEZ`. WEZ and BL share the same live-value key names (`tempActual`, `tempTarget`, `returnTemperature`, `operatingHours`, `operatingHoursOver50`, `operationCycles`, `heatAmount`, `totalEnergy`, electric-heater keys). If a key is absent for a given WEZ circuit, the sensor shows unavailable — no extra configuration needed.
-- New `circuit_status_wez` diagnostic sensor (key `circuit_status_wez`, icon `mdi:heat-pump`, `EntityCategory.DIAGNOSTIC`) for WEZ circuits, mirroring the existing `circuit_status_bl`.
-- `CIRCUIT_TYPE_WEZ` imported in sensor.py.
-
-**Translations** (`strings.json`, `translations/en.json`):
-- `circuit_status_wez` key added with name `"Heat generator status"`.
-
-**Orphaned entity cleanup** (`__init__.py`):
-- New `_PLANT_LEVEL_ENTITY_SUFFIXES` frozenset enumerates all unique-id suffixes that belong to the plant device (not a specific circuit). Used by the cleanup to avoid accidentally removing plant-level entities.
-- New `_async_cleanup_orphaned_entities(hass, entry, coordinator)` async helper: runs once during `async_setup_entry` after all platforms have registered their entities. Scans the HA entity registry for entities belonging to this config entry whose unique_id does not match any current circuit path or plant-level suffix, and removes them. Logs each removal at INFO level so users can see exactly what was cleaned up. This prevents "entity is no longer being provided" warnings when the API changes a circuit type between HA restarts.
-- `homeassistant.helpers.entity_registry` imported in `__init__.py`.
-
-**Tests** (`tests/test_coordinator.py`):
-- New `TestWEZCircuitType` class: 14 tests covering WEZ `HovalCircuitData` instantiation, all expected live-value keys, missing-key `None` fallback, `circuit_status` field, presence in `SUPPORTED_CIRCUIT_TYPES`, `CIRCUIT_TYPE_NAMES` mapping, and `resolve_fan_speed` default behaviour for WEZ circuits.
 
 ### v0.16.0
 Implements all four improvements suggested at the end of the v0.15.9 release notes.

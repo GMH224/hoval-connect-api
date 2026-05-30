@@ -27,7 +27,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
 from . import HovalConnectConfigEntry, circuit_device_info, plant_device_info
-from .const import CIRCUIT_TYPE_BL, CIRCUIT_TYPE_HK, CIRCUIT_TYPE_HV, CIRCUIT_TYPE_WEZ, CIRCUIT_TYPE_WW
+from .const import CIRCUIT_TYPE_BL, CIRCUIT_TYPE_HK, CIRCUIT_TYPE_HV, CIRCUIT_TYPE_WW
 from .coordinator import (
     SIGNAL_NEW_CIRCUITS,
     HovalCircuitData,
@@ -169,14 +169,14 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         circuit_types=frozenset({CIRCUIT_TYPE_HK}),
         value_fn=lambda c: c.live_values.get("roomTempTarget"),
     ),
-    # BL (Boiler/Heat Pump) and WEZ (Heat Generator) sensors — share the same live-value keys
+    # BL (Boiler/Heat Pump) sensors
     HovalSensorEntityDescription(
         key="boiler_temp_actual",
         translation_key="boiler_temp_actual",
         device_class=SensorDeviceClass.TEMPERATURE,
         native_unit_of_measurement=UnitOfTemperature.CELSIUS,
         state_class=SensorStateClass.MEASUREMENT,
-        circuit_types=frozenset({CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WEZ}),
+        circuit_types=frozenset({CIRCUIT_TYPE_BL}),
         value_fn=lambda c: c.live_values.get("tempActual"),
     ),
     HovalSensorEntityDescription(
@@ -185,7 +185,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         device_class=SensorDeviceClass.TEMPERATURE,
         native_unit_of_measurement=UnitOfTemperature.CELSIUS,
         state_class=SensorStateClass.MEASUREMENT,
-        circuit_types=frozenset({CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WEZ}),
+        circuit_types=frozenset({CIRCUIT_TYPE_BL}),
         value_fn=lambda c: c.live_values.get("tempTarget"),
     ),
     HovalSensorEntityDescription(
@@ -194,7 +194,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         device_class=SensorDeviceClass.TEMPERATURE,
         native_unit_of_measurement=UnitOfTemperature.CELSIUS,
         state_class=SensorStateClass.MEASUREMENT,
-        circuit_types=frozenset({CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WEZ}),
+        circuit_types=frozenset({CIRCUIT_TYPE_BL}),
         value_fn=lambda c: c.live_values.get("returnTemperature"),
     ),
     HovalSensorEntityDescription(
@@ -203,7 +203,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         native_unit_of_measurement=UnitOfTime.HOURS,
         state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:clock-outline",
-        circuit_types=frozenset({CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WEZ}),
+        circuit_types=frozenset({CIRCUIT_TYPE_BL}),
         value_fn=lambda c: c.live_values.get("operatingHours"),
     ),
     HovalSensorEntityDescription(
@@ -212,7 +212,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         native_unit_of_measurement=UnitOfTime.HOURS,
         state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:clock-fast",
-        circuit_types=frozenset({CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WEZ}),
+        circuit_types=frozenset({CIRCUIT_TYPE_BL}),
         value_fn=lambda c: c.live_values.get("operatingHoursOver50"),
     ),
     HovalSensorEntityDescription(
@@ -221,7 +221,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         native_unit_of_measurement=UnitOfTime.HOURS,
         state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:clock-electric-outline",
-        circuit_types=frozenset({CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WEZ}),
+        circuit_types=frozenset({CIRCUIT_TYPE_BL}),
         value_fn=lambda c: c.live_values.get("operatingHoursElHeater"),
     ),
     HovalSensorEntityDescription(
@@ -229,7 +229,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         translation_key="operation_cycles_el_heater",
         state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:counter",
-        circuit_types=frozenset({CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WEZ}),
+        circuit_types=frozenset({CIRCUIT_TYPE_BL}),
         value_fn=lambda c: c.live_values.get("operationCyclesElHeater"),
     ),
     HovalSensorEntityDescription(
@@ -238,7 +238,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.MEGA_WATT_HOUR,
         state_class=SensorStateClass.TOTAL_INCREASING,
-        circuit_types=frozenset({CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WEZ}),
+        circuit_types=frozenset({CIRCUIT_TYPE_BL}),
         value_fn=lambda c: c.live_values.get("heatAmountElHeater"),
     ),
     HovalSensorEntityDescription(
@@ -247,7 +247,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.MEGA_WATT_HOUR,
         state_class=SensorStateClass.TOTAL_INCREASING,
-        circuit_types=frozenset({CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WEZ}),
+        circuit_types=frozenset({CIRCUIT_TYPE_BL}),
         value_fn=lambda c: c.live_values.get("energyElHeater"),
     ),
     HovalSensorEntityDescription(
@@ -255,7 +255,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         translation_key="el_heater_active",
         icon="mdi:lightning-bolt",
         entity_category=EntityCategory.DIAGNOSTIC,
-        circuit_types=frozenset({CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WEZ}),
+        circuit_types=frozenset({CIRCUIT_TYPE_BL}),
         value_fn=lambda c: c.live_values.get("elHeaterActive"),
     ),
     HovalSensorEntityDescription(
@@ -263,7 +263,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         translation_key="operation_cycles",
         state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:counter",
-        circuit_types=frozenset({CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WEZ}),
+        circuit_types=frozenset({CIRCUIT_TYPE_BL}),
         value_fn=lambda c: c.live_values.get("operationCycles"),
     ),
     HovalSensorEntityDescription(
@@ -272,7 +272,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.MEGA_WATT_HOUR,
         state_class=SensorStateClass.TOTAL_INCREASING,
-        circuit_types=frozenset({CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WEZ}),
+        circuit_types=frozenset({CIRCUIT_TYPE_BL}),
         value_fn=lambda c: c.live_values.get("heatAmount"),
     ),
     HovalSensorEntityDescription(
@@ -281,7 +281,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.MEGA_WATT_HOUR,
         state_class=SensorStateClass.TOTAL_INCREASING,
-        circuit_types=frozenset({CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WEZ}),
+        circuit_types=frozenset({CIRCUIT_TYPE_BL}),
         value_fn=lambda c: c.live_values.get("totalEnergy"),
     ),
     # Status diagnostic sensors — sourced from the circuit list response, not live values
@@ -291,13 +291,6 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         icon="mdi:heat-pump",
         entity_category=EntityCategory.DIAGNOSTIC,
         circuit_types=frozenset({CIRCUIT_TYPE_BL}),
-        value_fn=lambda c: c.circuit_status,
-    ),
-    HovalSensorEntityDescription(
-        key="circuit_status_wez",
-        translation_key="circuit_status_wez",
-        icon="mdi:heat-pump",
-        circuit_types=frozenset({CIRCUIT_TYPE_WEZ}),
         value_fn=lambda c: c.circuit_status,
     ),
     HovalSensorEntityDescription(

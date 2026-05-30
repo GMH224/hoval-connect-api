@@ -52,13 +52,6 @@
       },
       "plant_error": {
         "name": "Error"
-      },
-      "wez_active": {
-        "name": "Heat generator active",
-        "state": {
-          "on": "Running",
-          "off": "Idle"
-        }
       }
     },
     "sensor": {
@@ -165,9 +158,6 @@
         "name": "Hot water temperature bottom"
       },
       "circuit_status_bl": {
-        "name": "Heat generator status"
-      },
-      "circuit_status_wez": {
         "name": "Heat generator status"
       },
       "circuit_status_hk": {
