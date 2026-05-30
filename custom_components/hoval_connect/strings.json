@@ -52,6 +52,13 @@
       },
       "plant_error": {
         "name": "Error"
+      },
+      "wez_active": {
+        "name": "Heat generator active",
+        "state": {
+          "on": "Running",
+          "off": "Idle"
+        }
       }
     },
     "sensor": {

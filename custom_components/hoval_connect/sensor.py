@@ -297,7 +297,6 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         key="circuit_status_wez",
         translation_key="circuit_status_wez",
         icon="mdi:heat-pump",
-        entity_category=EntityCategory.DIAGNOSTIC,
         circuit_types=frozenset({CIRCUIT_TYPE_WEZ}),
         value_fn=lambda c: c.circuit_status,
     ),
