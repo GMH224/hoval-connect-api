@@ -923,6 +923,21 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 ),
             )
 
+            # Log every circuit from the API — supported or not — so that future
+            # circuit types can be identified and programmed into HACS if needed.
+            for _c in circuits_raw:
+                _ctype = _c.get("type", "")
+                _LOGGER.info(
+                    "Circuit inventory: plant=%s type=%s path=%s name=%r "
+                    "selectable=%s supported=%s",
+                    plant_id,
+                    _ctype,
+                    _c.get("path", "<no-path>"),
+                    _c.get("name", "<no-name>"),
+                    _c.get("selectable", False),
+                    _ctype in SUPPORTED_CIRCUIT_TYPES,
+                )
+
             # Build list of supported circuits
             supported_circuits: list[tuple[str, str, dict]] = []
             for circuit in circuits_raw:
