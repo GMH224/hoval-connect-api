@@ -160,6 +160,9 @@
       "circuit_status_bl": {
         "name": "Heat generator status"
       },
+      "circuit_status_wez": {
+        "name": "Heat generator status"
+      },
       "circuit_status_hk": {
         "name": "Heating circuit status"
       },

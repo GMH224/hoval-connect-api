@@ -28,6 +28,7 @@ CIRCUIT_TYPE_HV = "HV"
 CIRCUIT_TYPE_HK = "HK"
 CIRCUIT_TYPE_BL = "BL"
 CIRCUIT_TYPE_WW = "WW"
+CIRCUIT_TYPE_WEZ = "WEZ"   # Wärmeerzeuger — heat generator (v3 API type for heat pump / boiler)
 CIRCUIT_TYPE_FRIWA = "FRIWA"
 CIRCUIT_TYPE_SOL = "SOL"
 CIRCUIT_TYPE_SOLB = "SOLB"
@@ -35,7 +36,13 @@ CIRCUIT_TYPE_PS = "PS"
 CIRCUIT_TYPE_GW = "GW"
 
 # Supported circuit types for this integration
-SUPPORTED_CIRCUIT_TYPES = {CIRCUIT_TYPE_HV, CIRCUIT_TYPE_HK, CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WW}
+SUPPORTED_CIRCUIT_TYPES = {
+    CIRCUIT_TYPE_HV,
+    CIRCUIT_TYPE_HK,
+    CIRCUIT_TYPE_BL,
+    CIRCUIT_TYPE_WW,
+    CIRCUIT_TYPE_WEZ,
+}
 
 # Human-readable names for circuit types
 CIRCUIT_TYPE_NAMES = {
@@ -43,6 +50,7 @@ CIRCUIT_TYPE_NAMES = {
     CIRCUIT_TYPE_HK: "Heating Circuit",
     CIRCUIT_TYPE_BL: "Boiler",
     CIRCUIT_TYPE_WW: "Hot Water",
+    CIRCUIT_TYPE_WEZ: "Heat Generator",
     CIRCUIT_TYPE_FRIWA: "Fresh Water",
     CIRCUIT_TYPE_SOL: "Solar",
     CIRCUIT_TYPE_SOLB: "Solar Buffer",

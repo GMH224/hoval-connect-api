@@ -21,6 +21,7 @@ from homeassistant.util import dt as dt_util
 from .api import HovalApiError, HovalAuthError, HovalConnectApi
 from .const import (
     CIRCUIT_TYPE_BL,
+    CIRCUIT_TYPE_WEZ,
     CIRCUIT_TYPE_WW,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
@@ -909,8 +910,8 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 )
                 raise _CircuitListError(str(err)) from err
 
-            # BL/WW circuits have selectable=False but still provide live values
-            _non_selectable_types = {CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WW}
+            # BL/WW/WEZ circuits have selectable=False but still provide live values
+            _non_selectable_types = {CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WW, CIRCUIT_TYPE_WEZ}
 
             _LOGGER.debug(
                 "Fetched %d circuits (%d supported)",
@@ -923,26 +924,17 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 ),
             )
 
-            # Log every circuit from the API — supported or not — so that future
-            # circuit types can be identified and programmed into HACS if needed.
-            for _c in circuits_raw:
-                _ctype = _c.get("type", "")
-                _LOGGER.info(
-                    "Circuit inventory: plant=%s type=%s path=%s name=%r "
-                    "selectable=%s supported=%s",
-                    plant_id,
-                    _ctype,
-                    _c.get("path", "<no-path>"),
-                    _c.get("name", "<no-name>"),
-                    _c.get("selectable", False),
-                    _ctype in SUPPORTED_CIRCUIT_TYPES,
-                )
-
             # Build list of supported circuits
             supported_circuits: list[tuple[str, str, dict]] = []
             for circuit in circuits_raw:
                 ctype = circuit.get("type", "")
                 if ctype not in SUPPORTED_CIRCUIT_TYPES:
+                    _LOGGER.debug(
+                        "Skipping unsupported circuit type %r for plant %s (path=%s)",
+                        ctype,
+                        plant_id,
+                        circuit.get("path", "<unknown>"),
+                    )
                     continue
                 if not circuit.get("selectable", False) and ctype not in _non_selectable_types:
                     continue

@@ -131,6 +131,34 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
+### v0.17.0
+Fixes "entity is no longer being provided by the hoval_connect integration" errors that appeared after upgrading to v0.16.0, caused by Hoval returning heat-generator circuits as type `WEZ` in the v3 API instead of `BL`.
+
+**`CIRCUIT_TYPE_WEZ` added** (`const.py`):
+- New constant `CIRCUIT_TYPE_WEZ = "WEZ"` (Wärmeerzeuger — German for heat generator).
+- Added to `SUPPORTED_CIRCUIT_TYPES` alongside HV, HK, BL, WW.
+- Added to `CIRCUIT_TYPE_NAMES` as `"Heat Generator"`.
+
+**WEZ treated as non-selectable** (`coordinator.py`):
+- `_non_selectable_types` extended from `{BL, WW}` to `{BL, WW, WEZ}`. WEZ circuits return `selectable=False` from the v3 API (same as BL/WW) but still provide live values — this prevents them from being silently skipped.
+- Unsupported circuit types now emit a `DEBUG` log line (`Skipping unsupported circuit type ...`) to aid future debugging when Hoval adds new types.
+
+**WEZ sensor entities** (`sensor.py`):
+- All 13 BL sensor `circuit_types` frozensets extended to also include `CIRCUIT_TYPE_WEZ`. WEZ and BL share the same live-value key names (`tempActual`, `tempTarget`, `returnTemperature`, `operatingHours`, `operatingHoursOver50`, `operationCycles`, `heatAmount`, `totalEnergy`, electric-heater keys). If a key is absent for a given WEZ circuit, the sensor shows unavailable — no extra configuration needed.
+- New `circuit_status_wez` diagnostic sensor (key `circuit_status_wez`, icon `mdi:heat-pump`, `EntityCategory.DIAGNOSTIC`) for WEZ circuits, mirroring the existing `circuit_status_bl`.
+- `CIRCUIT_TYPE_WEZ` imported in sensor.py.
+
+**Translations** (`strings.json`, `translations/en.json`):
+- `circuit_status_wez` key added with name `"Heat generator status"`.
+
+**Orphaned entity cleanup** (`__init__.py`):
+- New `_PLANT_LEVEL_ENTITY_SUFFIXES` frozenset enumerates all unique-id suffixes that belong to the plant device (not a specific circuit). Used by the cleanup to avoid accidentally removing plant-level entities.
+- New `_async_cleanup_orphaned_entities(hass, entry, coordinator)` async helper: runs once during `async_setup_entry` after all platforms have registered their entities. Scans the HA entity registry for entities belonging to this config entry whose unique_id does not match any current circuit path or plant-level suffix, and removes them. Logs each removal at INFO level so users can see exactly what was cleaned up. This prevents "entity is no longer being provided" warnings when the API changes a circuit type between HA restarts.
+- `homeassistant.helpers.entity_registry` imported in `__init__.py`.
+
+**Tests** (`tests/test_coordinator.py`):
+- New `TestWEZCircuitType` class: 14 tests covering WEZ `HovalCircuitData` instantiation, all expected live-value keys, missing-key `None` fallback, `circuit_status` field, presence in `SUPPORTED_CIRCUIT_TYPES`, `CIRCUIT_TYPE_NAMES` mapping, and `resolve_fan_speed` default behaviour for WEZ circuits.
+
 ### v0.16.0
 Implements all four improvements suggested at the end of the v0.15.9 release notes.
 
