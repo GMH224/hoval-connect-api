@@ -31,7 +31,7 @@ The integration lives in `custom_components/hoval_connect/`. User setup is email
 - `select.py` — Program selection (week1/week2/ecoMode/standby/constant) with user-defined names; applies to HV, HK, **and WW** circuits
 - `sensor.py` — Circuit-type-filtered sensors (HV/HK/BL/WW) + 6 plant-level sensors (events, weather); includes `circuit_status` diagnostic sensor for BL, HK, and WW (sourced from `HovalCircuitData.circuit_status`, populated from `CircuitV3DTO.circuitStatus` in the circuit list response)
 - `water_heater.py` — WW hot water entity (`WaterHeaterEntity`); exposes current/target temperature and operation modes heat_pump / high_demand / off; `set_temperature` posts a `midnight`-duration temporary-change override; `set_operation_mode` switches between week-program and standby; registers the `reset_ww_boost` entity service via `async_get_current_platform()` → `async_register_entity_service`, which calls `async_reset_temporary_change` (DELETEs the temporary-change endpoint without touching the week program)
-- `binary_sensor.py` — Plant online status + error/warning status
+- `binary_sensor.py` — Plant online/error status + circuit-level binary sensors (WEZ/BL heat generator active state via `HovalCircuitBinarySensor`); uses `HovalCircuitBinarySensorDescription` with `circuit_types` filter, same pattern as sensor.py
 - `diagnostics.py` — Diagnostic export with PII redaction
 - `const.py` — API URLs, OAuth client ID, token TTLs, polling interval, circuit types, duration enums, `SERVICE_RESET_WW_BOOST`
 - `__init__.py` — Entry setup, platform forwarding, `plant_device_info`/`circuit_device_info` helpers
@@ -41,7 +41,7 @@ The integration lives in `custom_components/hoval_connect/`. User setup is email
 - Entities use `CoordinatorEntity` — no direct API calls, all data comes from the coordinator
 - Device hierarchy: one parent device per plant, one child device per plant+circuit (linked via `via_device`)
 - Circuit devices identified by `{plantId}_{circuitPath}`
-- Supports HV (ventilation), HK (heating), BL (boiler), and WW (warm water) circuit types (`SUPPORTED_CIRCUIT_TYPES` in `const.py`)
+- Supports HV (ventilation), HK (heating), BL (boiler), WW (warm water), and WEZ (Wärmeerzeuger / heat generator) circuit types (`SUPPORTED_CIRCUIT_TYPES` in `const.py`)
 - Sensor descriptions use `circuit_types: frozenset[str] | None` to filter which sensors appear on which circuit types (`None` = all types)
 - Fan speed resolution uses smart fallback chain: live airVolume → `targetValue` (HV percentage from circuit list) → program air volume → default 40% (API rejects value=0)
 - All entity platforms use `translation_key` for entity names (not hardcoded `_attr_name`)
