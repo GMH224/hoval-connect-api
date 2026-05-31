@@ -131,6 +131,58 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
+### v0.16.1
+**Bug fix — BL (boiler) circuit loses all entities after Hoval May 2026 API change**
+
+#### Root cause
+Hoval updated their API backend in late May 2026 to return HTTP 204 (no content)
+from `GET /v3/plants/{plantId}/circuits/{circuitPath}/programs` for non-programmable
+circuits such as BL (boiler). Previously this endpoint returned HTTP 404, which the
+integration correctly treated as an exception via `asyncio.gather(return_exceptions=True)`.
+
+The `_request` helper maps any response with `status == 204` or `content_length == 0`
+to a Python `None` return value. `None` is not a `BaseException`, so the guard
+`if not isinstance(programs, BaseException)` was True, and `_fetch_circuit` called
+`_resolve_active_program_value(None, ...)`. That function immediately executed
+`programs.get("dayPrograms", {})` — raising `AttributeError: 'NoneType' has no
+attribute 'get'`.
+
+This `AttributeError` propagated out of `_fetch_circuit` and was captured by the
+outer `asyncio.gather(*all_tasks, return_exceptions=True)` in `_fetch_all_data`,
+causing the BL circuit to be silently skipped (`"Circuit fetch failed"` debug log)
+and never added to `plant_data.circuits`. With no circuit in the coordinator data
+no entities were created for the Hoval Heatgenerator device.
+
+#### Fixes (`coordinator.py`, `api.py`)
+1. **`_resolve_active_program_value`** — Added early-exit guard:
+   `if programs is None: return None, None, None`. Prevents the `AttributeError`
+   even if `None` reaches the function through any path (safety net).
+
+2. **`_fetch_circuit` programs block** — Changed condition from
+   `if not isinstance(programs, BaseException)` to
+   `if programs is not None and not isinstance(programs, BaseException)`.
+   `None` now falls through to the new `elif programs is None` branch, which
+   logs a debug message and leaves all program fields at their `None` defaults.
+   This is the primary fix: `None` programs are handled gracefully, `_fetch_circuit`
+   returns normally, and the BL circuit is added to `plant_data.circuits` → entities
+   are created.
+
+3. **`_fetch_circuit` live-values block** — Added `isinstance(lv_raw, dict)` guard
+   that extracts `lv_raw.get("content", [])` before building `live_values`. This
+   defends against the live-values endpoint also adopting the paginated wrapper shape.
+   The comprehension also adds `if isinstance(v, dict)` to skip any non-dict items.
+
+4. **`api.get_circuits`** — Now returns a normalised list regardless of whether the
+   endpoint sends a plain list or a paginated wrapper `{"content": [...], ...}`.
+
+5. **`api.get_live_values`** — Same normalisation: plain list or paginated wrapper
+   both produce a plain list of `{"key": ..., "value": ...}` objects.
+
+6. **`api.get_plants`** — Full pagination loop: fetches all pages (12 items each)
+   and returns a flat list. Handles both old (plain list) and new (Spring Page wrapper)
+   API shapes. Previously only page 0 was fetched; users with >12 plants would have
+   had plants silently missing.
+
 ### v0.16.0
 Implements all four improvements suggested at the end of the v0.15.9 release notes.
 

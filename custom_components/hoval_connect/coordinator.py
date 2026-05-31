@@ -45,13 +45,19 @@ _V1_PROGRAM_MAP: dict[str, str] = {
 
 
 def _resolve_active_program_value(
-    programs: dict[str, Any], now: datetime, active_program: str | None = None
+    programs: dict[str, Any] | None, now: datetime, active_program: str | None = None
 ) -> tuple[str | None, str | None, float | None]:
     """Resolve the currently active week, day program name, and air volume.
 
     Returns (week_name, day_program_name, current_phase_value).
     active_program is used to pick week1 vs week2; defaults to week1.
+
+    programs may be None when the API returns an empty (204) response for
+    non-programmable circuits such as BL (boiler). In that case all three
+    values are returned as None.
     """
+    if programs is None:
+        return None, None, None
     day_programs = programs.get("dayPrograms", {})
     day_configs = day_programs.get("dayConfigurations", [])
     if not day_configs:
@@ -991,7 +997,19 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                     results = [live_result[0], cached_prog[0]]
 
                 if not isinstance(results[0], BaseException):
-                    circuit_data.live_values = {v["key"]: v["value"] for v in results[0]}
+                    lv_raw = results[0]
+                    # Guard against paginated API response shape: {"content": [...], ...}
+                    # The live-values endpoint may return a wrapper object instead of a
+                    # plain list after Hoval's backend pagination enforcement (May 2026).
+                    if isinstance(lv_raw, dict):
+                        _LOGGER.debug(
+                            "Live-values for %s returned paginated wrapper; extracting 'content'",
+                            path,
+                        )
+                        lv_raw = lv_raw.get("content", [])
+                    circuit_data.live_values = {
+                        v["key"]: v["value"] for v in lv_raw if isinstance(v, dict)
+                    }
                     _LOGGER.debug("Circuit %s live_values: %s", path, circuit_data.live_values)
                     # Record circuit-level success for reliability tracking
                     ch = self._connection_health.get_circuit_health(path)
@@ -1009,7 +1027,12 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 circuit_data.circuit_consecutive_failures = ch.consecutive_failures
 
                 programs = results[1]
-                if not isinstance(programs, BaseException):
+                # programs may be None when the API returns HTTP 204 / empty body for
+                # non-programmable circuits (e.g. BL/boiler). Treat None the same as a
+                # missing-programs exception so we don't crash _fetch_circuit with an
+                # AttributeError in _resolve_active_program_value.  This was the root
+                # cause of BL entities disappearing after Hoval's May 2026 API change.
+                if programs is not None and not isinstance(programs, BaseException):
                     if need_programs:
                         self._program_cache[path] = (programs, time.time())
                     now = dt_util.now()
@@ -1026,6 +1049,12 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                         circuit_data.program_names["week1"] = w1["name"]
                     if w2.get("name"):
                         circuit_data.program_names["week2"] = w2["name"]
+                elif programs is None:
+                    _LOGGER.debug(
+                        "Programs endpoint returned no content for %s "
+                        "(non-programmable circuit or API returned empty body)",
+                        path,
+                    )
                 else:
                     _LOGGER.debug("Programs not available for %s: %s", path, programs)
 

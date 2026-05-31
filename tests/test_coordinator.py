@@ -251,6 +251,22 @@ class TestResolveActiveProgramValue:
         week, day, value = _resolve_active_program_value(programs, now)
         assert value == 30
 
+    def test_none_programs_returns_all_none(self):
+        """Regression test: programs=None must not raise AttributeError.
+
+        Hoval's API started returning HTTP 204 (no content) for non-programmable
+        circuits (e.g. BL/boiler) in May 2026. _request() maps 204 to Python None.
+        Previously _resolve_active_program_value would crash with
+        AttributeError: 'NoneType' has no attribute 'get', propagating out of
+        _fetch_circuit and causing the circuit to be silently skipped — resulting
+        in 'This device has no entities' for the Hoval Heatgenerator in HA.
+        """
+        now = datetime(2024, 1, 8, 10, 0)
+        week, day, value = _resolve_active_program_value(None, now)
+        assert week is None
+        assert day is None
+        assert value is None
+
 
 class TestV1ProgramMap:
     """Tests for _V1_PROGRAM_MAP normalization."""

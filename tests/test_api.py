@@ -342,6 +342,125 @@ class TestHovalConnectApiEndpoints:
         assert result == plants_data
 
     @pytest.mark.asyncio
+    async def test_get_plants_paginated_single_page(self):
+        """get_plants handles Spring Page wrapper {"content": [...], "last": True}."""
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+
+        plants_data = [{"plantExternalId": "p1"}, {"plantExternalId": "p2"}]
+        page_resp = _make_response(200, {"content": plants_data, "last": True, "totalPages": 1})
+        session.request = MagicMock(return_value=page_resp)
+
+        api = HovalConnectApi(session, "test@example.com", "pass")
+        result = await api.get_plants()
+
+        assert result == plants_data
+        # Should only fetch one page
+        assert session.request.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_get_plants_paginated_multiple_pages(self):
+        """get_plants fetches all pages and returns a flat list."""
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+
+        page0 = [{"plantExternalId": f"p{i}"} for i in range(12)]
+        page1 = [{"plantExternalId": "p12"}]
+        resp_page0 = _make_response(200, {"content": page0, "last": False, "totalPages": 2})
+        resp_page1 = _make_response(200, {"content": page1, "last": True, "totalPages": 2})
+        session.request = MagicMock(side_effect=[resp_page0, resp_page1])
+
+        api = HovalConnectApi(session, "test@example.com", "pass")
+        result = await api.get_plants()
+
+        assert len(result) == 13
+        assert result[0]["plantExternalId"] == "p0"
+        assert result[12]["plantExternalId"] == "p12"
+        assert session.request.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_get_circuits_plain_list(self):
+        """get_circuits returns a plain list unchanged."""
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+        pat_resp = _make_response(200, {"token": "pat-123"})
+        session.get = MagicMock(return_value=pat_resp)
+
+        circuits = [{"type": "HK", "path": "1.1.0"}, {"type": "BL", "path": "1.10.1"}]
+        api_resp = _make_response(200, circuits)
+        session.request = MagicMock(return_value=api_resp)
+
+        api = HovalConnectApi(session, "test@example.com", "pass")
+        result = await api.get_circuits("plant-1")
+
+        assert result == circuits
+
+    @pytest.mark.asyncio
+    async def test_get_circuits_paginated_wrapper(self):
+        """get_circuits extracts 'content' when API returns a paginated wrapper."""
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+        pat_resp = _make_response(200, {"token": "pat-123"})
+        session.get = MagicMock(return_value=pat_resp)
+
+        circuits = [{"type": "HK", "path": "1.1.0"}, {"type": "BL", "path": "1.10.1"}]
+        paginated = {"content": circuits, "totalElements": 2, "totalPages": 1, "last": True}
+        api_resp = _make_response(200, paginated)
+        session.request = MagicMock(return_value=api_resp)
+
+        api = HovalConnectApi(session, "test@example.com", "pass")
+        result = await api.get_circuits("plant-1")
+
+        assert result == circuits
+
+    @pytest.mark.asyncio
+    async def test_get_live_values_plain_list(self):
+        """get_live_values returns a plain list unchanged."""
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+        pat_resp = _make_response(200, {"token": "pat-123"})
+        session.get = MagicMock(return_value=pat_resp)
+
+        lv = [{"key": "tempActual", "value": "24.5"}, {"key": "operatingHours", "value": "13751"}]
+        api_resp = _make_response(200, lv)
+        session.request = MagicMock(return_value=api_resp)
+
+        api = HovalConnectApi(session, "test@example.com", "pass")
+        result = await api.get_live_values("plant-1", "1.10.1", "BL")
+
+        assert result == lv
+
+    @pytest.mark.asyncio
+    async def test_get_live_values_paginated_wrapper(self):
+        """get_live_values extracts 'content' when the API returns a paginated wrapper.
+
+        Regression test: Hoval's May 2026 API change introduced pagination on this
+        endpoint. Without the fix the coordinator would receive a dict, iterate over
+        its string keys, and crash with TypeError inside _fetch_circuit — causing the
+        BL (and potentially other) circuit to be silently dropped from plant_data.circuits.
+        """
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+        pat_resp = _make_response(200, {"token": "pat-123"})
+        session.get = MagicMock(return_value=pat_resp)
+
+        lv = [{"key": "tempActual", "value": "24.5"}, {"key": "operatingHours", "value": "13751"}]
+        paginated = {"content": lv, "totalElements": 2, "size": 12, "last": True}
+        api_resp = _make_response(200, paginated)
+        session.request = MagicMock(return_value=api_resp)
+
+        api = HovalConnectApi(session, "test@example.com", "pass")
+        result = await api.get_live_values("plant-1", "1.10.1", "BL")
+
+        assert result == lv
+
+    @pytest.mark.asyncio
     async def test_get_plant_settings_uses_request(self):
         """Verify get_plant_settings goes through _request (not raw session.get)."""
         session = _make_session()
