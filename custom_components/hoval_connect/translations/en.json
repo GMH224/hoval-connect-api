@@ -100,6 +100,9 @@
       "weather_temperature": {
         "name": "Forecast temperature"
       },
+      "room_temp_actual": {
+        "name": "Room temperature"
+      },
       "flow_temp_actual": {
         "name": "Flow temperature"
       },

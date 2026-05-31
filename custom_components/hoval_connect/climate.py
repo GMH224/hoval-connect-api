@@ -105,33 +105,39 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
 
     @property
     def current_temperature(self) -> float | None:
-        """Return the current temperature."""
+        """Return the current room temperature.
+
+        Live-values key for HK circuits is 'roomTempActual'.  The fallback
+        keys cover future circuit types that may use different field names.
+        """
         circuit = self._circuit
         if circuit is None:
             return None
-        # Try live value first, fall back to circuit data
-        val = circuit.live_values.get("actualTemperature") or circuit.live_values.get(
-            "roomTemperature"
-        )
-        if val is not None:
-            try:
-                return float(val)
-            except (ValueError, TypeError):
-                return None
+        for key in ("roomTempActual", "actualTemperature", "roomTemperature"):
+            val = circuit.live_values.get(key)
+            if val is not None:
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    continue
         return None
 
     @property
     def target_temperature(self) -> float | None:
-        """Return the target temperature."""
+        """Return the target room temperature.
+
+        Live-values key for HK circuits is 'roomTempTarget'.
+        """
         circuit = self._circuit
         if circuit is None:
             return None
-        val = circuit.live_values.get("targetTemperature")
-        if val is not None:
-            try:
-                return float(val)
-            except (ValueError, TypeError):
-                pass
+        for key in ("roomTempTarget", "targetTemperature"):
+            val = circuit.live_values.get(key)
+            if val is not None:
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    continue
         return None
 
     @property
@@ -152,7 +158,12 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
 
     @property
     def hvac_action(self) -> HVACAction | None:
-        """Return the current HVAC action."""
+        """Return the current HVAC action.
+
+        The 'status' key in live values reflects the circuit's operating state
+        (e.g. 'heating', 'off').  'circuitStatus' from the circuit-list
+        endpoint is a fallback for when live values are unavailable.
+        """
         circuit = self._circuit
         if circuit is None:
             return None
@@ -160,8 +171,10 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
         mode = override if override is not None else circuit.operation_mode
         if mode == OPERATION_MODE_STANDBY:
             return HVACAction.OFF
-        # Check circuit status from live values
-        status = circuit.live_values.get("circuitStatus", "").upper()
+        # Prefer the live-values 'status' key; fall back to circuit-list field.
+        status = (
+            circuit.live_values.get("status") or circuit.circuit_status or ""
+        ).upper()
         if status == "HEATING":
             return HVACAction.HEATING
         if status == "COOLING":

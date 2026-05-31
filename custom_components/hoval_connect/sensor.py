@@ -143,6 +143,15 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
     ),
     # HK additional sensors
     HovalSensorEntityDescription(
+        key="room_temp_actual",
+        translation_key="room_temp_actual",
+        device_class=SensorDeviceClass.TEMPERATURE,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        state_class=SensorStateClass.MEASUREMENT,
+        circuit_types=frozenset({CIRCUIT_TYPE_HK}),
+        value_fn=lambda c: c.live_values.get("roomTempActual"),
+    ),
+    HovalSensorEntityDescription(
         key="flow_temp_actual",
         translation_key="flow_temp_actual",
         device_class=SensorDeviceClass.TEMPERATURE,

@@ -131,6 +131,62 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
+### v0.17.0 — Production audit & bug fixes
+
+Full code audit across all platforms following the v0.16.x BL-circuit debugging
+session. No new features; all changes are correctness fixes and hardening.
+
+#### Bug fixes
+
+**`climate.py` — HK current/target temperature was always `None`**
+The `current_temperature` property looked for `"actualTemperature"` and
+`"roomTemperature"` in live values; the actual HK field is `"roomTempActual"`.
+`target_temperature` looked for `"targetTemperature"`; the actual field is
+`"roomTempTarget"`.  Both properties have been updated with the correct primary
+key and the old names as fallbacks for future circuit types.
+
+**`climate.py` — `hvac_action` was always `HVACAction.IDLE`**
+The property read `circuit.live_values.get("circuitStatus", "")`, but the
+`circuitStatus` key never appears in live values — it comes from the circuit-list
+response and is stored in `circuit.circuit_status`.  The live-values equivalent is
+the `"status"` key (e.g. `"heating"`, `"off"`).  The property now reads
+`circuit.live_values.get("status") or circuit.circuit_status` so both sources
+are consulted.
+
+**`sensor.py` — missing `room_temp_actual` sensor for HK circuits**
+`roomTempActual` is present in HK live values and is used by the fixed climate
+entity, but was not exposed as a standalone sensor.  Added
+`HovalSensorEntityDescription(key="room_temp_actual", ...)` with
+`circuit_types=frozenset({CIRCUIT_TYPE_HK})`.
+
+**`coordinator.py` — `restore_from_store` crashes on corrupt storage data**
+`HovalCircuitHealth.restore_from_store` and
+`HovalConnectionHealth.restore_from_store` both called `int(data.get(field, 0))`
+without a try/except.  A corrupt `.storage` file (e.g. type coercion from a
+previous version) would raise `ValueError` and prevent the integration from
+loading.  All integer conversions are now wrapped in `try/except (TypeError, ValueError)`.
+
+**`coordinator.py` — `ch` variable could be unbound (UnboundLocalError)**
+The `HovalCircuitHealth` object was assigned inside the `if/else` block for live
+values.  If an unexpected exception occurred after the `if` branch was entered
+but before the assignment, `circuit_data.circuit_failure_rate_1h = ch.failure_rate_1h`
+would raise `UnboundLocalError`.  `ch` is now fetched before the if/else.
+
+**`coordinator.py` — `lv_raw` type guard**
+Added `if not isinstance(lv_raw, list): lv_raw = []` after the paginated-wrapper
+unwrap, so an unexpected non-list (e.g. `None` from a future `api.py` regression)
+is handled gracefully rather than crashing the comprehension.
+
+#### Other changes
+- `coordinator.py` — trimmed the 25-line inline bug-history comment from the
+  programs block to 6 lines; full history remains in CLAUDE.md (v0.16.2 entry).
+- `hacs.json` — added `"render_readme": true`.
+- `manifest.json` — version `0.17.0`.
+- `strings.json` / `translations/en.json` — added `room_temp_actual` entry
+  ("Room temperature").
+- `tests/test_coordinator.py` — comprehensive rewrite: all existing tests
+  preserved, new tests added for every fix above plus defensive edge cases.
+
 ### v0.16.2
 **Bug fix — BL (boiler) circuit STILL loses all entities (v0.16.1 fix was incomplete)**
 

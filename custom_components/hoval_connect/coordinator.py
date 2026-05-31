@@ -205,8 +205,14 @@ class HovalCircuitHealth:
         }
 
     def restore_from_store(self, data: dict) -> None:
-        self.total_polls = int(data.get("total_polls", 0))
-        self.total_failures = int(data.get("total_failures", 0))
+        try:
+            self.total_polls = int(data.get("total_polls", 0))
+        except (TypeError, ValueError):
+            pass
+        try:
+            self.total_failures = int(data.get("total_failures", 0))
+        except (TypeError, ValueError):
+            pass
 
     def as_diagnostic_dict(self) -> dict:
         return {
@@ -445,10 +451,15 @@ class HovalConnectionHealth:
         restored. Session-only fields (consecutive_failures, last_success,
         last_error_*, rolling deques) are intentionally left at their
         zero/None defaults.
+
+        All integer conversions are wrapped in try/except so a corrupted
+        storage file does not crash the integration on startup.
         """
-        self.total_polls = int(data.get("total_polls", 0))
-        self.total_failures = int(data.get("total_failures", 0))
-        self.auth_failures = int(data.get("auth_failures", 0))
+        for attr in ("total_polls", "total_failures", "auth_failures"):
+            try:
+                setattr(self, attr, int(data.get(attr, 0)))
+            except (TypeError, ValueError):
+                pass
         self.error_counts = {
             k: int(v)
             for k, v in data.get("error_counts", {}).items()
@@ -1001,27 +1012,29 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
 
                 if not isinstance(results[0], BaseException):
                     lv_raw = results[0]
-                    # Guard against paginated API response shape: {"content": [...], ...}
-                    # The live-values endpoint may return a wrapper object instead of a
-                    # plain list after Hoval's backend pagination enforcement (May 2026).
+                    # Normalise paginated wrapper → plain list (Hoval May 2026 change).
                     if isinstance(lv_raw, dict):
-                        _LOGGER.debug(
-                            "Live-values for %s returned paginated wrapper; extracting 'content'",
-                            path,
-                        )
                         lv_raw = lv_raw.get("content", [])
+                    # Defensive: api.get_live_values() always returns a list, but
+                    # guard against any future regression that returns None / other.
+                    if not isinstance(lv_raw, list):
+                        _LOGGER.warning(
+                            "Live-values for %s returned unexpected type %s; treating as empty",
+                            path, type(lv_raw).__name__,
+                        )
+                        lv_raw = []
                     circuit_data.live_values = {
                         v["key"]: v["value"]
                         for v in lv_raw
                         if isinstance(v, dict) and "key" in v and "value" in v
                     }
                     _LOGGER.debug("Circuit %s live_values: %s", path, circuit_data.live_values)
-                    # Record circuit-level success for reliability tracking
+                    # Initialise ch before recording so the variable is always
+                    # bound even if an unlikely exception occurs in the block above.
                     ch = self._connection_health.get_circuit_health(path)
                     ch.record_success(dt_util.utcnow())
                 else:
                     _LOGGER.debug("Live values not available for %s: %s", path, results[0])
-                    # Record circuit-level failure with a compact error string
                     ch = self._connection_health.get_circuit_health(path)
                     ch.record_failure(dt_util.utcnow(), str(results[0]))
 
@@ -1032,28 +1045,12 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 circuit_data.circuit_consecutive_failures = ch.consecutive_failures
 
                 programs = results[1]
-                # Only process programs when the API returned a proper dict.
-                #
-                # After Hoval's May 2026 API change, the programs endpoint for
-                # non-programmable circuits (BL/boiler, operationMode=None) may
-                # return either:
-                #   • HTTP 204 / empty body  → _request returns Python None
-                #   • HTTP 200 with body []  → _request returns an empty list
-                #
-                # v0.16.1 guarded against None only.  An empty JSON array []
-                # passes the old "is not None and not BaseException" test, enters
-                # this block, caches [] in _program_cache, then crashes in
-                # _resolve_active_program_value with:
-                #     AttributeError: 'list' object has no attribute 'get'
-                # That AttributeError propagated out of _fetch_circuit, was
-                # captured by the outer asyncio.gather(return_exceptions=True),
-                # and caused BL to be silently dropped from plant_data.circuits
-                # every single poll — even after HA restart, because [] was also
-                # written to the cache before the crash.
-                #
-                # The correct guard is isinstance(programs, dict): only a proper
-                # dict may be processed or cached.  None, [], or any other
-                # unexpected type is handled in the else branch below.
+                # Guard: only process programs when the API returned a proper dict.
+                # Non-programmable circuits (BL, operationMode=None) may return
+                # HTTP 204 → None or HTTP 200 with body [] after Hoval's May 2026
+                # change.  [] is not None and not an exception, so a weaker guard
+                # would enter this block and crash on [].get("dayPrograms", {}).
+                # Non-dict values are never cached.  See CLAUDE.md for full history.
                 if isinstance(programs, dict):
                     if need_programs:
                         self._program_cache[path] = (programs, time.time())
