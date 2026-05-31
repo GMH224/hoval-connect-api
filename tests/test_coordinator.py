@@ -252,17 +252,51 @@ class TestResolveActiveProgramValue:
         assert value == 30
 
     def test_none_programs_returns_all_none(self):
-        """Regression test: programs=None must not raise AttributeError.
+        """programs=None (HTTP 204) must not raise AttributeError.
 
         Hoval's API started returning HTTP 204 (no content) for non-programmable
-        circuits (e.g. BL/boiler) in May 2026. _request() maps 204 to Python None.
-        Previously _resolve_active_program_value would crash with
-        AttributeError: 'NoneType' has no attribute 'get', propagating out of
-        _fetch_circuit and causing the circuit to be silently skipped — resulting
-        in 'This device has no entities' for the Hoval Heatgenerator in HA.
+        circuits in May 2026. _request() maps 204 to Python None.  Previously
+        _resolve_active_program_value would crash with
+        AttributeError: 'NoneType' has no attribute 'get'.
         """
         now = datetime(2024, 1, 8, 10, 0)
         week, day, value = _resolve_active_program_value(None, now)
+        assert week is None
+        assert day is None
+        assert value is None
+
+    def test_empty_list_programs_returns_all_none(self):
+        """programs=[] (HTTP 200 with body []) must not raise AttributeError.
+
+        This is the PRIMARY regression fixed in v0.16.2.
+
+        Hoval's May 2026 API change made the programs endpoint return HTTP 200
+        with body [] (an empty JSON array) for non-programmable circuits such as
+        BL (boiler, operationMode=None).
+
+        v0.16.1 only guarded against None; [] passed the old
+        'is not None and not BaseException' check, entered the processing block,
+        and crashed at [].get("dayPrograms", {}) with:
+            AttributeError: 'list' object has no attribute 'get'
+
+        That AttributeError propagated out of _fetch_circuit, was captured by
+        asyncio.gather(return_exceptions=True), and caused BL to be silently
+        dropped from plant_data.circuits — resulting in 'This device has no
+        entities' on the Hoval Heatgenerator device page.
+
+        The fix is to use isinstance(programs, dict) as the guard so that [],
+        None, and any other non-dict type all fall through gracefully.
+        """
+        now = datetime(2024, 1, 8, 10, 0)
+        week, day, value = _resolve_active_program_value([], now)
+        assert week is None
+        assert day is None
+        assert value is None
+
+    def test_empty_dict_programs_returns_all_none(self):
+        """programs={} (empty dict) must return (None, None, None) safely."""
+        now = datetime(2024, 1, 8, 10, 0)
+        week, day, value = _resolve_active_program_value({}, now)
         assert week is None
         assert day is None
         assert value is None

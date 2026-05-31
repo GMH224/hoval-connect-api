@@ -131,6 +131,60 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
+### v0.16.2
+**Bug fix — BL (boiler) circuit STILL loses all entities (v0.16.1 fix was incomplete)**
+
+#### Root cause of v0.16.1 regression
+
+v0.16.1 guarded against `programs is None` in `_fetch_circuit`.  This handled
+the case where Hoval's programs endpoint returned HTTP 204 (empty body), which
+`_request()` converts to Python `None`.
+
+However, Hoval's API update (late May 2026) made the endpoint return
+**HTTP 200 with body `[]`** (an empty JSON array) for non-programmable circuits
+such as BL/boiler (those with `operationMode=None`).
+
+`[]` is **not** `None` and **not** a `BaseException`, so the v0.16.1 guard
+`if programs is not None and not isinstance(programs, BaseException)` evaluated
+to **True**, entering the processing block.  Two things then happened:
+
+1. `self._program_cache[path] = ([], time.time())` — the empty list was cached,
+   poisoning the cache for subsequent polls within the TTL window.
+2. `_resolve_active_program_value([], now, ...)` was called.  The function's
+   v0.16.1 guard was `if programs is None`, which is False for `[]`, so execution
+   continued to `[].get("dayPrograms", {})` →
+   **`AttributeError: 'list' object has no attribute 'get'`**.
+
+This `AttributeError` propagated out of `_fetch_circuit`, was captured by the
+outer `asyncio.gather(*all_tasks, return_exceptions=True)` in `_fetch_all_data`,
+and caused BL to be logged as `"Circuit fetch failed"` and silently dropped from
+`plant_data.circuits`.  With no BL circuit in coordinator data, no sensor or
+diagnostic entities were created for the Hoval Heatgenerator device.
+
+The cached `[]` made it self-perpetuating: on subsequent polls within the 5-minute
+TTL, `results[1]` was read from cache as `[]`, re-entered the block, and crashed
+again — even after HA restart (the cache is in-memory, so the poisoned entry did
+not persist across restarts, but the API kept returning `[]` each fresh poll).
+
+#### Fixes (`coordinator.py`)
+
+1. **`_fetch_circuit` programs condition** — Changed from
+   `if programs is not None and not isinstance(programs, BaseException)` to
+   **`if isinstance(programs, dict)`**.  Only a proper dict is a valid programs
+   payload; anything else (`None`, `[]`, an int, a string, …) falls through to
+   the `else` branch which logs the type and value at DEBUG level and leaves all
+   program fields at their `None` defaults.  Non-dict values are **not cached**,
+   so the cache is never poisoned.
+
+2. **`_resolve_active_program_value` guard** — Changed from
+   `if programs is None` to **`if not isinstance(programs, dict)`**.  This makes
+   the function safe against every non-dict input (safety net; the primary fix is
+   #1 above).
+
+3. **Live-values comprehension** — Added `"key" in v and "value" in v` to the
+   filter so items missing the expected fields are silently skipped rather than
+   raising `KeyError`.
+
 ### v0.16.1
 **Bug fix — BL (boiler) circuit loses all entities after Hoval May 2026 API change**
 

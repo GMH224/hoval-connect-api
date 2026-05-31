@@ -52,11 +52,14 @@ def _resolve_active_program_value(
     Returns (week_name, day_program_name, current_phase_value).
     active_program is used to pick week1 vs week2; defaults to week1.
 
-    programs may be None when the API returns an empty (204) response for
-    non-programmable circuits such as BL (boiler). In that case all three
-    values are returned as None.
+    programs must be a dict.  Non-programmable circuits (e.g. BL/boiler) may
+    yield None (HTTP 204) or an empty JSON array [] from the programs endpoint
+    after Hoval's May 2026 API change.  Any non-dict value is treated as
+    "no programs available" and all three return values will be None.
+    This guard prevents AttributeError crashes that silently dropped the BL
+    circuit from plant_data.circuits.
     """
-    if programs is None:
+    if not isinstance(programs, dict):
         return None, None, None
     day_programs = programs.get("dayPrograms", {})
     day_configs = day_programs.get("dayConfigurations", [])
@@ -1008,7 +1011,9 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                         )
                         lv_raw = lv_raw.get("content", [])
                     circuit_data.live_values = {
-                        v["key"]: v["value"] for v in lv_raw if isinstance(v, dict)
+                        v["key"]: v["value"]
+                        for v in lv_raw
+                        if isinstance(v, dict) and "key" in v and "value" in v
                     }
                     _LOGGER.debug("Circuit %s live_values: %s", path, circuit_data.live_values)
                     # Record circuit-level success for reliability tracking
@@ -1027,12 +1032,29 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 circuit_data.circuit_consecutive_failures = ch.consecutive_failures
 
                 programs = results[1]
-                # programs may be None when the API returns HTTP 204 / empty body for
-                # non-programmable circuits (e.g. BL/boiler). Treat None the same as a
-                # missing-programs exception so we don't crash _fetch_circuit with an
-                # AttributeError in _resolve_active_program_value.  This was the root
-                # cause of BL entities disappearing after Hoval's May 2026 API change.
-                if programs is not None and not isinstance(programs, BaseException):
+                # Only process programs when the API returned a proper dict.
+                #
+                # After Hoval's May 2026 API change, the programs endpoint for
+                # non-programmable circuits (BL/boiler, operationMode=None) may
+                # return either:
+                #   • HTTP 204 / empty body  → _request returns Python None
+                #   • HTTP 200 with body []  → _request returns an empty list
+                #
+                # v0.16.1 guarded against None only.  An empty JSON array []
+                # passes the old "is not None and not BaseException" test, enters
+                # this block, caches [] in _program_cache, then crashes in
+                # _resolve_active_program_value with:
+                #     AttributeError: 'list' object has no attribute 'get'
+                # That AttributeError propagated out of _fetch_circuit, was
+                # captured by the outer asyncio.gather(return_exceptions=True),
+                # and caused BL to be silently dropped from plant_data.circuits
+                # every single poll — even after HA restart, because [] was also
+                # written to the cache before the crash.
+                #
+                # The correct guard is isinstance(programs, dict): only a proper
+                # dict may be processed or cached.  None, [], or any other
+                # unexpected type is handled in the else branch below.
+                if isinstance(programs, dict):
                     if need_programs:
                         self._program_cache[path] = (programs, time.time())
                     now = dt_util.now()
@@ -1049,14 +1071,19 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                         circuit_data.program_names["week1"] = w1["name"]
                     if w2.get("name"):
                         circuit_data.program_names["week2"] = w2["name"]
-                elif programs is None:
-                    _LOGGER.debug(
-                        "Programs endpoint returned no content for %s "
-                        "(non-programmable circuit or API returned empty body)",
-                        path,
-                    )
-                else:
+                elif isinstance(programs, BaseException):
                     _LOGGER.debug("Programs not available for %s: %s", path, programs)
+                else:
+                    # None (HTTP 204 / empty body) or unexpected type such as []
+                    # (empty JSON array).  Log the type so future API surprises are
+                    # visible in the HA log at debug level.
+                    _LOGGER.debug(
+                        "Programs endpoint for %s returned %s (type=%s); "
+                        "circuit has no programs — skipping program processing",
+                        path,
+                        repr(programs),
+                        type(programs).__name__,
+                    )
 
                 return circuit_data
 
