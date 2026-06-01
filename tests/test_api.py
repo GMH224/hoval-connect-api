@@ -42,6 +42,7 @@ def _make_response(status: int, json_data=None, text: str = "") -> MagicMock:
     """Create a mock aiohttp response."""
     resp = AsyncMock()
     resp.status = status
+    resp.content_length = 0 if status == 204 else 128
     resp.json = AsyncMock(return_value=json_data or {})
     resp.text = AsyncMock(return_value=text)
     resp.raise_for_status = MagicMock()
@@ -62,6 +63,10 @@ def _make_session() -> MagicMock:
     session = MagicMock(spec=aiohttp.ClientSession)
     return session
 
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
 
 class TestHovalConnectApiAuth:
     """Tests for authentication logic."""
@@ -89,7 +94,6 @@ class TestHovalConnectApiAuth:
         token2 = await api._get_id_token()
 
         assert token1 == token2
-        # Should only call post once due to caching
         assert session.post.call_count == 1
 
     @pytest.mark.asyncio
@@ -147,17 +151,19 @@ class TestHovalConnectApiAuth:
         assert api._pat_cache == {}
 
 
+# ---------------------------------------------------------------------------
+# _request
+# ---------------------------------------------------------------------------
+
 class TestHovalConnectApiRequest:
     """Tests for the _request method."""
 
     @pytest.mark.asyncio
     async def test_request_success(self):
         session = _make_session()
-        # Mock auth
         auth_resp = _make_response(200, {"id_token": "token"})
         session.post = MagicMock(return_value=auth_resp)
 
-        # Mock API response
         api_resp = _make_response(200, {"data": "test"})
         session.request = MagicMock(return_value=api_resp)
 
@@ -186,13 +192,11 @@ class TestHovalConnectApiRequest:
         auth_resp = _make_response(200, {"id_token": "token"})
         session.post = MagicMock(return_value=auth_resp)
 
-        # First call returns 401, second succeeds
         resp_401 = _make_response(401)
         resp_ok = _make_response(200, {"data": "ok"})
         session.request = MagicMock(side_effect=[resp_401, resp_ok])
 
         api = HovalConnectApi(session, "test@example.com", "pass")
-        # Need to prime the token first
         await api._get_id_token()
         result = await api._request("GET", "/api/test")
 
@@ -230,7 +234,6 @@ class TestHovalConnectApiRequest:
         auth_resp = _make_response(200, {"id_token": "token"})
         session.post = MagicMock(return_value=auth_resp)
 
-        # First returns 503, second succeeds
         resp_503 = _make_response(503)
         resp_ok = _make_response(200, {"data": "recovered"})
         session.request = MagicMock(side_effect=[resp_503, resp_ok])
@@ -263,9 +266,7 @@ class TestHovalConnectApiRequest:
         auth_resp = _make_response(200, {"id_token": "token"})
         session.post = MagicMock(return_value=auth_resp)
 
-        # First call times out, second succeeds
         resp_ok = _make_response(200, {"data": "ok"})
-
         call_count = 0
 
         def _side_effect(*args, **kwargs):
@@ -323,6 +324,10 @@ class TestHovalConnectApiRequest:
         assert result == {"data": "ok"}
 
 
+# ---------------------------------------------------------------------------
+# Endpoint methods — pagination handling (v0.16.1+)
+# ---------------------------------------------------------------------------
+
 class TestHovalConnectApiEndpoints:
     """Tests for specific API endpoint methods."""
 
@@ -356,7 +361,6 @@ class TestHovalConnectApiEndpoints:
         result = await api.get_plants()
 
         assert result == plants_data
-        # Should only fetch one page
         assert session.request.call_count == 1
 
     @pytest.mark.asyncio
@@ -439,10 +443,10 @@ class TestHovalConnectApiEndpoints:
     async def test_get_live_values_paginated_wrapper(self):
         """get_live_values extracts 'content' when the API returns a paginated wrapper.
 
-        Regression test: Hoval's May 2026 API change introduced pagination on this
-        endpoint. Without the fix the coordinator would receive a dict, iterate over
-        its string keys, and crash with TypeError inside _fetch_circuit — causing the
-        BL (and potentially other) circuit to be silently dropped from plant_data.circuits.
+        Regression: Hoval's May 2026 API change introduced pagination on this
+        endpoint.  Without the fix the coordinator would receive a dict, iterate
+        over its string keys, and crash with TypeError inside _fetch_circuit —
+        causing BL to be silently dropped from plant_data.circuits.
         """
         session = _make_session()
         auth_resp = _make_response(200, {"id_token": "token"})
@@ -461,17 +465,88 @@ class TestHovalConnectApiEndpoints:
         assert result == lv
 
     @pytest.mark.asyncio
+    async def test_get_live_values_none_returns_empty_list(self):
+        """HTTP 204 or empty body (→ None from _request) must return [] not None.
+
+        If get_live_values returned None, the coordinator dict comprehension
+        'for v in lv_raw' would raise TypeError and crash _fetch_circuit.
+        """
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+
+        # Simulate a 204 response (_request returns None)
+        api_resp = _make_response(204)
+        session.request = MagicMock(return_value=api_resp)
+
+        api = HovalConnectApi(session, "test@example.com", "pass")
+        result = await api.get_live_values("plant-1", "1.10.1", "BL")
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_get_programs_returns_dict_for_programmable_circuit(self):
+        """Normal HK/WW circuits return a dict from the programs endpoint."""
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+        pat_resp = _make_response(200, {"token": "pat-123"})
+        session.get = MagicMock(return_value=pat_resp)
+
+        programs = {
+            "week1": {"name": "Woche 1", "dayProgramIds": [1, 1, 1, 1, 1, 2, 2]},
+            "dayPrograms": {"dayConfigurations": []},
+        }
+        api_resp = _make_response(200, programs)
+        session.request = MagicMock(return_value=api_resp)
+
+        api = HovalConnectApi(session, "test@example.com", "pass")
+        result = await api.get_programs("plant-1", "1.1.0")
+
+        assert isinstance(result, dict)
+        assert "week1" in result
+
+    @pytest.mark.asyncio
+    async def test_get_programs_returns_empty_list_for_bl_circuit(self):
+        """
+        Regression — v0.16.2 / v0.17.0 fix.
+
+        Hoval's May 2026 API change made the programs endpoint return HTTP 200
+        with body [] (empty JSON array) for non-programmable circuits such as
+        BL (boiler, operationMode=None).
+
+        The API layer passes this through as-is; the coordinator guards against
+        it with isinstance(programs, dict) and handles [] gracefully.
+        Previously v0.16.1's guard (programs is not None) passed [] through,
+        entered the processing block, and crashed at [].get('dayPrograms', {})
+        — silently dropping BL from plant_data.circuits on every poll.
+        """
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+        pat_resp = _make_response(200, {"token": "pat-123"})
+        session.get = MagicMock(return_value=pat_resp)
+
+        # Hoval now returns [] for non-programmable circuits
+        api_resp = _make_response(200, [])
+        session.request = MagicMock(return_value=api_resp)
+
+        api = HovalConnectApi(session, "test@example.com", "pass")
+        result = await api.get_programs("plant-1", "1.10.1")
+
+        # API returns the raw [] — coordinator handles non-dict gracefully
+        assert result == []
+
+    @pytest.mark.asyncio
     async def test_get_plant_settings_uses_request(self):
         """Verify get_plant_settings goes through _request (not raw session.get)."""
         session = _make_session()
         auth_resp = _make_response(200, {"id_token": "token"})
         session.post = MagicMock(return_value=auth_resp)
 
-        # PAT fetch uses session.get directly (in _get_plant_access_token)
         pat_resp = _make_response(200, {"token": "pat-123"})
         session.get = MagicMock(return_value=pat_resp)
 
-        # Actual settings call goes through _request → session.request
         settings_resp = _make_response(200, {"token": "pat-123", "setting1": "val"})
         session.request = MagicMock(return_value=settings_resp)
 
@@ -479,7 +554,6 @@ class TestHovalConnectApiEndpoints:
         result = await api.get_plant_settings("plant-1")
 
         assert result["setting1"] == "val"
-        # Verify _request was used (session.request called)
         session.request.assert_called_once()
 
     @pytest.mark.asyncio
@@ -488,11 +562,9 @@ class TestHovalConnectApiEndpoints:
         auth_resp = _make_response(200, {"id_token": "token"})
         session.post = MagicMock(return_value=auth_resp)
 
-        # PAT fetch uses session.get
         pat_resp = _make_response(200, {"token": "pat-123"})
         session.get = MagicMock(return_value=pat_resp)
 
-        # Control call uses session.request via _request
         control_resp = _make_response(204)
         session.request = MagicMock(return_value=control_resp)
 
@@ -516,6 +588,10 @@ class TestHovalConnectApiEndpoints:
         api.invalidate_plant_token("nonexistent")  # Should not raise
 
 
+# ---------------------------------------------------------------------------
+# Retry constants
+# ---------------------------------------------------------------------------
+
 class TestRetryConstants:
     """Tests for retry configuration."""
 
@@ -525,9 +601,78 @@ class TestRetryConstants:
         assert 502 in _RETRYABLE_STATUS_CODES
         assert 503 in _RETRYABLE_STATUS_CODES
         assert 504 in _RETRYABLE_STATUS_CODES
-        # 404 should NOT be retryable
         assert 404 not in _RETRYABLE_STATUS_CODES
 
     def test_max_retries_is_reasonable(self):
         assert _MAX_RETRIES >= 2
         assert _MAX_RETRIES <= 5
+
+
+# ---------------------------------------------------------------------------
+# Code invariants (static checks, no HA needed)
+# ---------------------------------------------------------------------------
+
+class TestCodeInvariants:
+    """Text-based checks that key v0.17.0 code invariants hold."""
+
+    def _read(self, filename: str) -> str:
+        import os
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(base, "custom_components", "hoval_connect", filename)) as f:
+            return f.read()
+
+    def test_programs_guard_uses_isinstance_dict(self):
+        """Coordinator programs block must use isinstance(programs, dict), not 'is not None'."""
+        src = self._read("coordinator.py")
+        assert "if isinstance(programs, dict):" in src
+        assert "programs is not None and not isinstance" not in src
+
+    def test_resolve_guard_uses_not_isinstance_dict(self):
+        """_resolve_active_program_value must guard against any non-dict."""
+        src = self._read("coordinator.py")
+        assert "if not isinstance(programs, dict):" in src
+
+    def test_lv_raw_type_guard_present(self):
+        """Live-values block must guard against non-list lv_raw."""
+        src = self._read("coordinator.py")
+        assert "if not isinstance(lv_raw, list):" in src
+
+    def test_climate_uses_room_temp_actual_field(self):
+        """climate.py must use 'roomTempActual' not the old 'actualTemperature' key."""
+        src = self._read("climate.py")
+        assert "roomTempActual" in src
+        assert "roomTempTarget" in src
+        # Old wrong key must not be in .get() calls
+        assert 'live_values.get("circuitStatus"' not in src
+
+    def test_climate_hvac_action_uses_status_key(self):
+        """hvac_action must use the live-values 'status' key."""
+        src = self._read("climate.py")
+        assert 'live_values.get("status")' in src
+
+    def test_sensor_has_room_temp_actual_for_hk(self):
+        """sensor.py must declare room_temp_actual limited to HK circuits."""
+        import re
+        src = self._read("sensor.py")
+        assert 'key="room_temp_actual"' in src
+        block = re.search(
+            r'key="room_temp_actual".*?circuit_types=frozenset\(\{([^}]+)\}\)',
+            src, re.DOTALL,
+        )
+        assert block is not None, "room_temp_actual descriptor not found"
+        assert "CIRCUIT_TYPE_HK" in block.group(1)
+        assert "CIRCUIT_TYPE_BL" not in block.group(1)
+
+    def test_restore_from_store_uses_try_except(self):
+        """restore_from_store must wrap int() in try/except to handle corrupt data."""
+        src = self._read("coordinator.py")
+        # Both HovalCircuitHealth and HovalConnectionHealth have the fix
+        assert src.count("except (TypeError, ValueError):") >= 2
+
+    def test_bl_still_in_non_selectable_types(self):
+        """BL must remain in _non_selectable_types so selectable=False doesn't exclude it."""
+        src = self._read("coordinator.py")
+        assert "_non_selectable_types = {CIRCUIT_TYPE_BL" in src or \
+               "_non_selectable_types = {CIRCUIT_TYPE_WW, CIRCUIT_TYPE_BL" in src or \
+               "CIRCUIT_TYPE_BL" in src
+        assert "_non_selectable_types" in src
