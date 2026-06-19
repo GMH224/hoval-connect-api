@@ -21,7 +21,8 @@
     "error": {
       "invalid_auth": "Invalid email or password.",
       "cannot_connect": "Unable to connect to Hoval Connect. Please try again later.",
-      "unknown": "An unexpected error occurred."
+      "unknown": "An unexpected error occurred.",
+      "wrong_account": "This login is for a different account. Re-authenticate with the same email used to set up the integration."
     },
     "abort": {
       "already_configured": "This account is already configured.",
@@ -219,6 +220,9 @@
       },
       "circuit_availability_1h": {
         "name": "Circuit availability (1 h)"
+      },
+      "circuit_consecutive_failures": {
+        "name": "Circuit consecutive failures"
       }
     },
     "water_heater": {

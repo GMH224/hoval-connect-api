@@ -369,6 +369,14 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         icon="mdi:wifi-check",
         value_fn=lambda c: c.circuit_availability_1h,
     ),
+    HovalSensorEntityDescription(
+        key="circuit_consecutive_failures",
+        translation_key="circuit_consecutive_failures",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:alert-circle-check-outline",
+        value_fn=lambda c: c.circuit_consecutive_failures,
+    ),
 )
 
 PLANT_SENSOR_DESCRIPTIONS: tuple[HovalPlantSensorEntityDescription, ...] = (
@@ -679,9 +687,15 @@ class HovalCircuitSensor(CoordinatorEntity[HovalDataCoordinator], SensorEntity):
         if self.entity_description.native_unit_of_measurement is None:
             return str(val)
         try:
-            return float(val)
+            num = float(val)
         except (ValueError, TypeError):
             return None
+        # Guard monotonic counters: a negative reading is never valid for a
+        # TOTAL_INCREASING sensor and would be misread by HA's long-term
+        # statistics as a meter reset, injecting a spurious spike. Drop it.
+        if self.entity_description.state_class == SensorStateClass.TOTAL_INCREASING and num < 0:
+            return None
+        return num
 
 
 class HovalPlantSensor(CoordinatorEntity[HovalDataCoordinator], SensorEntity):

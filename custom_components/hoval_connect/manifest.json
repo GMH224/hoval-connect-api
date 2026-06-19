@@ -1,11 +1,12 @@
 {
   "domain": "hoval_connect",
   "name": "Hoval Connect",
-  "codeowners": [],
+  "codeowners": ["@hoval-connect"],
   "config_flow": true,
-  "documentation": "https://github.com/your-repo/hoval-connect",
+  "documentation": "https://github.com/hoval-connect/hoval-connect-api",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/hoval-connect/hoval-connect-api/issues",
   "requirements": [],
-  "version": "0.17.0"
+  "version": "0.18.0"
 }

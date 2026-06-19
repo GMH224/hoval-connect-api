@@ -131,6 +131,60 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
+### v0.18.0 — Audit remediation (security, reliability, CI integrity)
+
+Follow-up to the v0.17.0 audit. No new user-facing features; all changes are
+defect fixes, hardening, and toolchain integrity. Test suite expanded to 115
+tests (all passing); `ruff check`, `ruff format --check`, and an enforced
+`--cov-fail-under=30` coverage gate are all green.
+
+#### Reliability / control-safety fixes
+- **`api.py` — single-flight token refresh.** ID-token and plant-access-token
+  refreshes are now serialised behind dedicated `asyncio.Lock`s with
+  double-checked locking, so the coordinator's parallel per-circuit fan-out can
+  no longer trigger a thundering herd of identical auth calls (a source of
+  spurious `429`/auth failures).
+- **`api.py` — guarded token extraction.** A plant-settings response missing the
+  `token` field now raises a categorised `HovalApiError` instead of a bare
+  `KeyError`; the IDP id-token guard was hardened the same way.
+- **`fan.py` / `const.py` — air-volume clamping.** HV fan requests are clamped
+  into the device's valid band `[15, 100]` via the new pure helper
+  `clamp_hv_air_volume()` before being sent, preventing out-of-band commands to
+  the equipment. Helper is unit-tested.
+- **`coordinator.py` — optimistic-override TTL.** Optimistic mode overrides now
+  expire after `_MODE_OVERRIDE_TTL_S` (120 s) so a stale, unconfirmed state
+  cannot mask the real device state indefinitely when polls are failing.
+- **`select.py` — program validation.** A resolved program key is validated
+  against `VALID_API_PROGRAMS` before being sent, instead of forwarding an
+  unmapped display string verbatim.
+- **`config_flow.py` — reauth account pinning.** Re-authentication now requires
+  the same email as the original entry (`wrong_account` error otherwise), so a
+  reauth cannot silently rebind the entry to a different Hoval account.
+- **`sensor.py` — monotonic-counter guard.** Negative readings on
+  `TOTAL_INCREASING` sensors are dropped so HA long-term statistics can't
+  misread them as a meter reset / spurious spike.
+
+#### Toolchain / metadata / tests
+- **CI is green again.** Added `tests/conftest.py` registering the full
+  `homeassistant.*` mock set (including `homeassistant.helpers.storage`) so the
+  no-HA test harness collects in CI; fixed the `_make_response` helper that
+  collapsed a valid `[]` to `{}` (the BL-circuit regression test now passes).
+- **`ruff`** — all `check` and `format --check` findings resolved across
+  `custom_components/`, `examples/`, and `tests/`.
+- **Coverage gate** raised 25 % → 30 % and now enforced in CI
+  (`--cov-fail-under=30`; measured ≈ 33 %).
+- **`manifest.json`** — real `documentation` + `issue_tracker` URLs, a
+  `codeowners` entry, and version `0.18.0`.
+- **`services.yaml`** added describing the `reset_ww_boost` entity service
+  (previously registered/translated but undescribed → Hassfest gap).
+- **`examples/hoval_client.py`** — every `requests` call now has a `(connect,
+  read)` timeout so the sample cannot hang indefinitely.
+- **`sensor.py`** — surfaced the previously-dead `circuit_consecutive_failures`
+  field as a diagnostic sensor (with translation key).
+
+Known limitation (unchanged): this remains a cloud-polling integration and is
+**not** a substitute for a local control/safety path on mission-critical plant.
+
 ### v0.17.0 — Production audit & bug fixes
 
 Full code audit across all platforms following the v0.16.x BL-circuit debugging

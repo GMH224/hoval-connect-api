@@ -7,7 +7,7 @@ They can be run without homeassistant installed by using sys.path manipulation.
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 # Mock homeassistant modules so we can import the coordinator's pure functions
@@ -39,10 +39,10 @@ from custom_components.hoval_connect.coordinator import (  # noqa: E402
     resolve_fan_speed,
 )
 
-
 # ---------------------------------------------------------------------------
 # _resolve_active_program_value
 # ---------------------------------------------------------------------------
+
 
 class TestResolveActiveProgramValue:
     """Tests for _resolve_active_program_value()."""
@@ -51,17 +51,33 @@ class TestResolveActiveProgramValue:
         """Build a minimal programs structure."""
         if phases is None:
             phases = [
-                {"start": {"hours": 6, "minutes": 0},  "end": {"hours": 22, "minutes": 0}, "value": 60},
-                {"start": {"hours": 22, "minutes": 0}, "end": {"hours": 23, "minutes": 59}, "value": 30},
+                {
+                    "start": {"hours": 6, "minutes": 0},
+                    "end": {"hours": 22, "minutes": 0},
+                    "value": 60,
+                },
+                {
+                    "start": {"hours": 22, "minutes": 0},
+                    "end": {"hours": 23, "minutes": 59},
+                    "value": 30,
+                },
             ]
         return {
             "week1": {"name": "Woche 1", "dayProgramIds": [1, 1, 1, 1, 1, 2, 2]},
             "dayPrograms": {
                 "dayConfigurations": [
                     {"id": 1, "name": day_name, "phases": phases},
-                    {"id": 2, "name": "Weekend", "phases": [
-                        {"start": {"hours": 8, "minutes": 0}, "end": {"hours": 22, "minutes": 0}, "value": 50},
-                    ]},
+                    {
+                        "id": 2,
+                        "name": "Weekend",
+                        "phases": [
+                            {
+                                "start": {"hours": 8, "minutes": 0},
+                                "end": {"hours": 22, "minutes": 0},
+                                "value": 50,
+                            },
+                        ],
+                    },
                 ],
             },
         }
@@ -182,6 +198,7 @@ class TestResolveActiveProgramValue:
 # resolve_fan_speed
 # ---------------------------------------------------------------------------
 
+
 class TestResolveFanSpeed:
     """Tests for resolve_fan_speed()."""
 
@@ -219,6 +236,7 @@ class TestResolveFanSpeed:
 # _V1_PROGRAM_MAP
 # ---------------------------------------------------------------------------
 
+
 class TestV1ProgramMap:
     def test_tte_controlled_maps_to_week1(self):
         assert _V1_PROGRAM_MAP.get("tteControlled", "tteControlled") == "week1"
@@ -237,6 +255,7 @@ class TestV1ProgramMap:
 # ---------------------------------------------------------------------------
 # _parse_event / HovalEventData / _is_problem_event
 # ---------------------------------------------------------------------------
+
 
 class TestParseEvent:
     def test_parse_full_event(self):
@@ -309,6 +328,7 @@ class TestIsProblemEvent:
 # HovalCircuitHealth
 # ---------------------------------------------------------------------------
 
+
 class TestHovalCircuitHealth:
     def test_initial_state(self):
         ch = HovalCircuitHealth()
@@ -320,7 +340,7 @@ class TestHovalCircuitHealth:
 
     def test_record_success(self):
         ch = HovalCircuitHealth()
-        ts = datetime.now(timezone.utc)
+        ts = datetime.now(UTC)
         ch.record_success(ts)
         assert ch.total_polls == 1
         assert ch.total_failures == 0
@@ -331,7 +351,7 @@ class TestHovalCircuitHealth:
 
     def test_record_failure(self):
         ch = HovalCircuitHealth()
-        ts = datetime.now(timezone.utc)
+        ts = datetime.now(UTC)
         ch.record_failure(ts, "HTTP 503")
         assert ch.total_polls == 1
         assert ch.total_failures == 1
@@ -343,7 +363,7 @@ class TestHovalCircuitHealth:
 
     def test_consecutive_failures_resets_on_success(self):
         ch = HovalCircuitHealth()
-        ts = datetime.now(timezone.utc)
+        ts = datetime.now(UTC)
         ch.record_failure(ts, "err")
         ch.record_failure(ts, "err")
         assert ch.consecutive_failures == 2
@@ -353,7 +373,7 @@ class TestHovalCircuitHealth:
 
     def test_mixed_polls_failure_rate(self):
         ch = HovalCircuitHealth()
-        ts = datetime.now(timezone.utc)
+        ts = datetime.now(UTC)
         for _ in range(8):
             ch.record_success(ts)
         for _ in range(2):
@@ -363,12 +383,12 @@ class TestHovalCircuitHealth:
 
     def test_error_truncated_to_200_chars(self):
         ch = HovalCircuitHealth()
-        ch.record_failure(datetime.now(timezone.utc), "x" * 300)
+        ch.record_failure(datetime.now(UTC), "x" * 300)
         assert len(ch.last_error) == 200
 
     def test_to_store_dict_only_cumulative_counters(self):
         ch = HovalCircuitHealth()
-        ts = datetime.now(timezone.utc)
+        ts = datetime.now(UTC)
         ch.record_success(ts)
         ch.record_failure(ts, "err")
         d = ch.to_store_dict()
@@ -401,6 +421,7 @@ class TestHovalCircuitHealth:
 # HovalConnectionHealth
 # ---------------------------------------------------------------------------
 
+
 class TestHovalConnectionHealth:
     def test_ema_initialises_on_first_sample(self):
         h = HovalConnectionHealth()
@@ -424,7 +445,7 @@ class TestHovalConnectionHealth:
 
     def test_record_error_increments_all_counters(self):
         h = HovalConnectionHealth()
-        ts = datetime.now(timezone.utc)
+        ts = datetime.now(UTC)
         h._record_error(ts, "timeout", "Poll timeout after 90 s")
         assert h.consecutive_failures == 1
         assert h.total_failures == 1
@@ -435,12 +456,12 @@ class TestHovalConnectionHealth:
 
     def test_record_error_auth_flag(self):
         h = HovalConnectionHealth()
-        h._record_error(datetime.now(timezone.utc), "auth", "Bad token", is_auth=True)
+        h._record_error(datetime.now(UTC), "auth", "Bad token", is_auth=True)
         assert h.auth_failures == 1
 
     def test_error_counts_accumulate(self):
         h = HovalConnectionHealth()
-        ts = datetime.now(timezone.utc)
+        ts = datetime.now(UTC)
         h._record_error(ts, "timeout", "t")
         h._record_error(ts, "timeout", "t")
         h._record_error(ts, "api", "a")
@@ -457,7 +478,7 @@ class TestHovalConnectionHealth:
         h.total_polls = 10
         h.ema_latency_ms = 250.0
         ch = h.get_circuit_health("1.2.3")
-        ch.record_success(datetime.now(timezone.utc))
+        ch.record_success(datetime.now(UTC))
         d = h.to_store_dict()
         assert d["total_polls"] == 10
         assert d["ema_latency_ms"] == 250.0
@@ -465,14 +486,16 @@ class TestHovalConnectionHealth:
 
     def test_restore_from_store_full(self):
         h = HovalConnectionHealth()
-        h.restore_from_store({
-            "total_polls": 1000,
-            "total_failures": 50,
-            "auth_failures": 3,
-            "error_counts": {"timeout": 10, "api": 40},
-            "ema_latency_ms": 350.5,
-            "circuits": {"2.3.4": {"total_polls": 200, "total_failures": 5}},
-        })
+        h.restore_from_store(
+            {
+                "total_polls": 1000,
+                "total_failures": 50,
+                "auth_failures": 3,
+                "error_counts": {"timeout": 10, "api": 40},
+                "ema_latency_ms": 350.5,
+                "circuits": {"2.3.4": {"total_polls": 200, "total_failures": 5}},
+            }
+        )
         assert h.total_polls == 1000
         assert h.total_failures == 50
         assert h.auth_failures == 3
@@ -483,20 +506,24 @@ class TestHovalConnectionHealth:
     def test_restore_from_store_bad_int_graceful(self):
         """Corrupt storage values must not crash the integration."""
         h = HovalConnectionHealth()
-        h.restore_from_store({
-            "total_polls": "bad",
-            "total_failures": None,
-            "auth_failures": [],
-        })
+        h.restore_from_store(
+            {
+                "total_polls": "bad",
+                "total_failures": None,
+                "auth_failures": [],
+            }
+        )
         assert h.total_polls == 0
         assert h.total_failures == 0
         assert h.auth_failures == 0
 
     def test_restore_strips_unknown_error_types(self):
         h = HovalConnectionHealth()
-        h.restore_from_store({
-            "error_counts": {"timeout": 1, "INJECTION_ATTACK": 99, "api": 2},
-        })
+        h.restore_from_store(
+            {
+                "error_counts": {"timeout": 1, "INJECTION_ATTACK": 99, "api": 2},
+            }
+        )
         assert "INJECTION_ATTACK" not in h.error_counts
         assert h.error_counts == {"timeout": 1, "api": 2}
 
@@ -508,14 +535,20 @@ class TestHovalConnectionHealth:
     def test_as_diagnostic_dict_has_required_sections(self):
         h = HovalConnectionHealth()
         d = h.as_diagnostic_dict()
-        assert {"last_success", "last_error", "counters_since_startup",
-                "rolling_1h_window", "latency_ms", "circuits"} <= d.keys()
+        assert {
+            "last_success",
+            "last_error",
+            "counters_since_startup",
+            "rolling_1h_window",
+            "latency_ms",
+            "circuits",
+        } <= d.keys()
         assert "ema" in d["latency_ms"]
         assert "error_counts" in d["counters_since_startup"]
 
     def test_as_diagnostic_dict_circuit_section(self):
         h = HovalConnectionHealth()
-        h.get_circuit_health("5.6.7").record_success(datetime.now(timezone.utc))
+        h.get_circuit_health("5.6.7").record_success(datetime.now(UTC))
         d = h.as_diagnostic_dict()
         assert d["circuits"]["5.6.7"]["total_polls"] == 1
 
@@ -540,3 +573,29 @@ class TestHovalConnectionHealth:
         assert h2.error_counts == {"auth": 2, "timeout": 5}
         assert h2.ema_latency_ms == 123.4
         assert h2._circuit_health["9.9.9"].total_polls == 10
+
+
+# ---------------------------------------------------------------------------
+# clamp_hv_air_volume (H-3 regression)
+# ---------------------------------------------------------------------------
+class TestClampHvAirVolume:
+    """The HV fan must never send an out-of-band air-volume to the device."""
+
+    def test_below_min_clamps_up(self):
+        from custom_components.hoval_connect.const import clamp_hv_air_volume
+
+        assert clamp_hv_air_volume(5) == 15
+        assert clamp_hv_air_volume(0) == 15
+        assert clamp_hv_air_volume(14) == 15
+
+    def test_above_max_clamps_down(self):
+        from custom_components.hoval_connect.const import clamp_hv_air_volume
+
+        assert clamp_hv_air_volume(120) == 100
+
+    def test_in_band_passthrough(self):
+        from custom_components.hoval_connect.const import clamp_hv_air_volume
+
+        assert clamp_hv_air_volume(15) == 15
+        assert clamp_hv_air_volume(55) == 55
+        assert clamp_hv_air_volume(100) == 100

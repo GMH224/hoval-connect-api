@@ -16,6 +16,8 @@ class HovalClient:
     BASE_URL = "https://azure-iot-prod.hoval.com/core"
     IDP_URL = "https://akwc5scsc.accounts.ondemand.com/oauth2/token"
     CLIENT_ID = "991b54b2-7e67-47ef-81fe-572e21c59899"
+    # (connect, read) timeouts in seconds so a stalled call cannot hang forever.
+    TIMEOUT = (8, 20)
 
     def __init__(self, email: str, password: str):
         self.email = email
@@ -37,6 +39,7 @@ class HovalClient:
                 "password": self.password,
                 "scope": "openid",
             },
+            timeout=self.TIMEOUT,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -52,6 +55,7 @@ class HovalClient:
         resp = requests.get(
             f"{self.BASE_URL}/v1/plants/{plant_id}/settings",
             headers={"Authorization": f"Bearer {self._get_id_token()}"},
+            timeout=self.TIMEOUT,
         )
         resp.raise_for_status()
         token = resp.json()["token"]
@@ -68,6 +72,7 @@ class HovalClient:
         resp = requests.get(
             f"{self.BASE_URL}/api/my-plants?size=12&page=0",
             headers=self._headers(),
+            timeout=self.TIMEOUT,
         )
         resp.raise_for_status()
         return resp.json()
@@ -76,6 +81,7 @@ class HovalClient:
         resp = requests.get(
             f"{self.BASE_URL}/v3/plants/{plant_id}/circuits",
             headers=self._headers(plant_id),
+            timeout=self.TIMEOUT,
         )
         resp.raise_for_status()
         return resp.json()
@@ -85,6 +91,7 @@ class HovalClient:
             f"{self.BASE_URL}/v3/api/statistics/live-values/{plant_id}",
             params={"circuitPath": circuit_path, "circuitType": circuit_type},
             headers=self._headers(plant_id),
+            timeout=self.TIMEOUT,
         )
         resp.raise_for_status()
         return resp.json()
@@ -93,6 +100,7 @@ class HovalClient:
         resp = requests.get(
             f"{self.BASE_URL}/v2/api/weather/forecast/{plant_id}",
             headers=self._headers(plant_id),
+            timeout=self.TIMEOUT,
         )
         resp.raise_for_status()
         return resp.json()
@@ -101,6 +109,7 @@ class HovalClient:
         resp = requests.get(
             f"{self.BASE_URL}/v1/plant-events/{plant_id}",
             headers=self._headers(),
+            timeout=self.TIMEOUT,
         )
         resp.raise_for_status()
         return resp.json()
@@ -109,6 +118,7 @@ class HovalClient:
         resp = requests.get(
             f"{self.BASE_URL}/business/plants/{plant_id}/is-online",
             headers=self._headers(plant_id),
+            timeout=self.TIMEOUT,
         )
         resp.raise_for_status()
         return resp.json()

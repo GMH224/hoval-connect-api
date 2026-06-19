@@ -49,8 +49,6 @@ async def async_get_config_entry_diagnostics(
 
     return {
         "config_entry": async_redact_data(dict(entry.data), REDACT_CONFIG),
-        "coordinator_data": async_redact_data(
-            asdict(coordinator.data), REDACT_COORDINATOR
-        ),
+        "coordinator_data": async_redact_data(asdict(coordinator.data), REDACT_COORDINATOR),
         "connection_health": coordinator.connection_health.as_diagnostic_dict(),
     }

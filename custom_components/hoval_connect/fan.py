@@ -20,9 +20,12 @@ from .const import (
     CONF_TURN_ON_MODE,
     DEFAULT_OVERRIDE_DURATION,
     DEFAULT_TURN_ON_MODE,
+    HV_AIR_VOLUME_MAX,
+    HV_AIR_VOLUME_MIN,
     OPERATION_MODE_REGULAR,
     OPERATION_MODE_STANDBY,
     TURN_ON_RESUME,
+    clamp_hv_air_volume,
 )
 from .coordinator import SIGNAL_NEW_CIRCUITS, HovalCircuitData, HovalDataCoordinator
 
@@ -151,14 +154,31 @@ class HovalFan(CoordinatorEntity[HovalDataCoordinator], FanEntity):
         return max(0, min(100, int(float(val))))
 
     async def _send_percentage(self, percentage: int) -> None:
-        """Actually send the percentage to the API (called after debounce)."""
+        """Actually send the percentage to the API (called after debounce).
+
+        The requested percentage is clamped into the HV device's valid
+        air-volume band [HV_AIR_VOLUME_MIN, HV_AIR_VOLUME_MAX] before being
+        sent. HA already constrains percentages to 0–100, but values between 1
+        and the device minimum would otherwise be forwarded verbatim and
+        rejected (or undefined-behaved) by the cloud/firmware. 0 is handled as
+        turn-off earlier in async_set_percentage and never reaches here.
+        """
         self._pending_percentage = None
+        clamped = clamp_hv_air_volume(percentage)
+        if clamped != percentage:
+            _LOGGER.debug(
+                "Clamped requested air volume %d%% to device band %d-%d%% → %d%%",
+                percentage,
+                HV_AIR_VOLUME_MIN,
+                HV_AIR_VOLUME_MAX,
+                clamped,
+            )
         try:
             await self.coordinator.async_control_and_refresh(
                 self.coordinator.api.set_temporary_change(
                     self._plant_id,
                     self._circuit_path,
-                    value=percentage,
+                    value=clamped,
                     duration=self._override_duration,
                 ),
                 circuit_path=self._circuit_path,

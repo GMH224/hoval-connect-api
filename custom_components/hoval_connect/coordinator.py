@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -24,8 +25,6 @@ from .const import (
     CIRCUIT_TYPE_WW,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
-    HEALTH_STORAGE_KEY,
-    HEALTH_STORAGE_VERSION,
     PROGRAM_CACHE_TTL,
     SUPPORTED_CIRCUIT_TYPES,
 )
@@ -109,8 +108,8 @@ def _resolve_active_program_value(
 # Timestamps are kept for up to _HEALTH_HISTORY_SIZE poll cycles.
 # At the fastest polling interval (30 s) this covers 90 minutes — enough to
 # compute accurate 1-hour rates even after a burst of rapid polls.
-_HEALTH_HISTORY_SIZE = 180   # ~90 min at 30 s polling / ~3 h at 60 s
-_LATENCY_HISTORY_SIZE = 60   # p95 needs enough samples to be meaningful
+_HEALTH_HISTORY_SIZE = 180  # ~90 min at 30 s polling / ~3 h at 60 s
+_LATENCY_HISTORY_SIZE = 60  # p95 needs enough samples to be meaningful
 
 # Exponential-moving-average decay factor: 10 % weight to each new sample.
 # α = 0.1 means the EMA takes ~22 samples to reflect a step-change by 90 %,
@@ -121,10 +120,18 @@ _EMA_ALPHA = 0.1
 # Using async_delay_save means rapid polls only trigger one I/O per window.
 _HEALTH_SAVE_DELAY_S = 30.0
 
+# Maximum lifetime of an optimistic mode override (seconds).
+# Overrides are normally cleared at the end of the next successful poll, but if
+# polls keep failing an override could otherwise persist indefinitely and show
+# a state that was never confirmed by the device. This TTL bounds that window so
+# a stale optimistic value cannot mask reality forever.
+_MODE_OVERRIDE_TTL_S = 120.0
+
 
 # ---------------------------------------------------------------------------
 # Per-circuit reliability tracker
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class HovalCircuitHealth:
@@ -181,7 +188,7 @@ class HovalCircuitHealth:
     @property
     def failure_rate_1h(self) -> float | None:
         """Percentage of live-values polls that failed in the last hour."""
-        cutoff = datetime.now(timezone.utc) - timedelta(seconds=3600)
+        cutoff = datetime.now(UTC) - timedelta(seconds=3600)
         polls = sum(1 for t in self._poll_times if t >= cutoff)
         if polls == 0:
             return None
@@ -205,14 +212,10 @@ class HovalCircuitHealth:
         }
 
     def restore_from_store(self, data: dict) -> None:
-        try:
+        with contextlib.suppress(TypeError, ValueError):
             self.total_polls = int(data.get("total_polls", 0))
-        except (TypeError, ValueError):
-            pass
-        try:
+        with contextlib.suppress(TypeError, ValueError):
             self.total_failures = int(data.get("total_failures", 0))
-        except (TypeError, ValueError):
-            pass
 
     def as_diagnostic_dict(self) -> dict:
         return {
@@ -308,7 +311,7 @@ class HovalConnectionHealth:
 
     @staticmethod
     def _utcnow() -> datetime:
-        return datetime.now(timezone.utc)
+        return datetime.now(UTC)
 
     def _count_in_window(self, bucket: deque[datetime], window_s: int) -> int:
         """Count timestamps that fall within the last window_s seconds."""
@@ -438,10 +441,7 @@ class HovalConnectionHealth:
             "auth_failures": self.auth_failures,
             "error_counts": dict(self.error_counts),
             "ema_latency_ms": self.ema_latency_ms,
-            "circuits": {
-                path: ch.to_store_dict()
-                for path, ch in self._circuit_health.items()
-            },
+            "circuits": {path: ch.to_store_dict() for path, ch in self._circuit_health.items()},
         }
 
     def restore_from_store(self, data: dict) -> None:
@@ -456,10 +456,8 @@ class HovalConnectionHealth:
         storage file does not crash the integration on startup.
         """
         for attr in ("total_polls", "total_failures", "auth_failures"):
-            try:
+            with contextlib.suppress(TypeError, ValueError):
                 setattr(self, attr, int(data.get(attr, 0)))
-            except (TypeError, ValueError):
-                pass
         self.error_counts = {
             k: int(v)
             for k, v in data.get("error_counts", {}).items()
@@ -522,8 +520,7 @@ class HovalConnectionHealth:
                 "sample_count": len(self._latency_samples),
             },
             "circuits": {
-                path: ch.as_diagnostic_dict()
-                for path, ch in sorted(self._circuit_health.items())
+                path: ch.as_diagnostic_dict() for path, ch in sorted(self._circuit_health.items())
             },
         }
 
@@ -690,9 +687,10 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         self.api = api
         self._health_store = health_store
         self.control_lock = asyncio.Lock()
-        # Optimistic mode override per circuit (set by control actions,
-        # cleared on next poll). Key: circuit_path, value: operation mode string.
-        self._mode_override: dict[str, str] = {}
+        # Optimistic mode override per circuit (set by control actions, cleared
+        # on next successful poll OR when it exceeds _MODE_OVERRIDE_TTL_S).
+        # Value: (operation_mode_string, monotonic_timestamp).
+        self._mode_override: dict[str, tuple[str, float]] = {}
         # Program cache: key=circuit_path, value=(programs_data, timestamp)
         self._program_cache: dict[str, tuple[Any, float]] = {}
         self._program_cache_ttl = PROGRAM_CACHE_TTL.total_seconds()
@@ -708,11 +706,23 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
 
     def set_mode_override(self, circuit_path: str, mode: str) -> None:
         """Set optimistic mode override after a control action."""
-        self._mode_override[circuit_path] = mode
+        self._mode_override[circuit_path] = (mode, time.monotonic())
 
     def get_mode_override(self, circuit_path: str) -> str | None:
-        """Get the optimistic mode override for a circuit."""
-        return self._mode_override.get(circuit_path)
+        """Get the optimistic mode override for a circuit, if still fresh.
+
+        Returns None once the override exceeds _MODE_OVERRIDE_TTL_S so a stale
+        optimistic value cannot mask the real device state indefinitely when
+        polls are failing.
+        """
+        entry = self._mode_override.get(circuit_path)
+        if entry is None:
+            return None
+        mode, ts = entry
+        if time.monotonic() - ts > _MODE_OVERRIDE_TTL_S:
+            self._mode_override.pop(circuit_path, None)
+            return None
+        return mode
 
     async def async_control_and_refresh(
         self,
@@ -840,9 +850,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
             # Categorised separately so error_counts distinguishes this from a
             # generic API failure on a less-critical endpoint.
             _ts = dt_util.utcnow()
-            self._connection_health._record_error(
-                _ts, ERROR_TYPE_CIRCUIT_LIST, str(err)[:200]
-            )
+            self._connection_health._record_error(_ts, ERROR_TYPE_CIRCUIT_LIST, str(err)[:200])
             _LOGGER.warning(
                 "Circuit list fetch failed (consecutive=%d): %s",
                 self._connection_health.consecutive_failures,
@@ -852,9 +860,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
 
         except HovalApiError as err:
             _ts = dt_util.utcnow()
-            self._connection_health._record_error(
-                _ts, ERROR_TYPE_API, str(err)[:200]
-            )
+            self._connection_health._record_error(_ts, ERROR_TYPE_API, str(err)[:200])
             _LOGGER.warning(
                 "API error during poll (consecutive=%d, total_failures=%d): %s",
                 self._connection_health.consecutive_failures,
@@ -990,8 +996,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 # Check program cache
                 cached_prog = self._program_cache.get(path)
                 need_programs = (
-                    cached_prog is None
-                    or time.time() - cached_prog[1] > self._program_cache_ttl
+                    cached_prog is None or time.time() - cached_prog[1] > self._program_cache_ttl
                 )
 
                 # Fetch live values (always) + programs (only if cache expired)
@@ -1020,7 +1025,8 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                     if not isinstance(lv_raw, list):
                         _LOGGER.warning(
                             "Live-values for %s returned unexpected type %s; treating as empty",
-                            path, type(lv_raw).__name__,
+                            path,
+                            type(lv_raw).__name__,
                         )
                         lv_raw = []
                     circuit_data.live_values = {

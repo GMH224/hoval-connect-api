@@ -172,9 +172,7 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
         if mode == OPERATION_MODE_STANDBY:
             return HVACAction.OFF
         # Prefer the live-values 'status' key; fall back to circuit-list field.
-        status = (
-            circuit.live_values.get("status") or circuit.circuit_status or ""
-        ).upper()
+        status = (circuit.live_values.get("status") or circuit.circuit_status or "").upper()
         if status == "HEATING":
             return HVACAction.HEATING
         if status == "COOLING":

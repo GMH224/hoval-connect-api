@@ -20,7 +20,12 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import HovalConnectConfigEntry, circuit_device_info
 from .api import HovalApiError
-from .const import CIRCUIT_TYPE_WW, OPERATION_MODE_REGULAR, OPERATION_MODE_STANDBY, SERVICE_RESET_WW_BOOST
+from .const import (
+    CIRCUIT_TYPE_WW,
+    OPERATION_MODE_REGULAR,
+    OPERATION_MODE_STANDBY,
+    SERVICE_RESET_WW_BOOST,
+)
 from .coordinator import SIGNAL_NEW_CIRCUITS, HovalCircuitData, HovalDataCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -32,9 +37,9 @@ WW_MAX_TEMP = 65.0
 WW_TEMP_STEP = 1.0
 
 # Operation modes exposed to HA
-_OP_HEAT_PUMP = STATE_HEAT_PUMP   # "heat_pump"  — normal week-program operation
+_OP_HEAT_PUMP = STATE_HEAT_PUMP  # "heat_pump"  — normal week-program operation
 _OP_HIGH_DEMAND = STATE_HIGH_DEMAND  # "high_demand" — temporary boost override active
-_OP_OFF = STATE_OFF               # "off"         — circuit in standby
+_OP_OFF = STATE_OFF  # "off"         — circuit in standby
 
 
 async def async_setup_entry(
@@ -95,8 +100,7 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
     _attr_target_temperature_step = WW_TEMP_STEP
     _attr_operation_list = [_OP_HEAT_PUMP, _OP_HIGH_DEMAND, _OP_OFF]
     _attr_supported_features = (
-        WaterHeaterEntityFeature.TARGET_TEMPERATURE
-        | WaterHeaterEntityFeature.OPERATION_MODE
+        WaterHeaterEntityFeature.TARGET_TEMPERATURE | WaterHeaterEntityFeature.OPERATION_MODE
     )
 
     def __init__(
@@ -251,6 +255,4 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
                 mode_override=OPERATION_MODE_REGULAR,
             )
         except HovalApiError as err:
-            raise HomeAssistantError(
-                f"Failed to reset hot water temporary boost: {err}"
-            ) from err
+            raise HomeAssistantError(f"Failed to reset hot water temporary boost: {err}") from err

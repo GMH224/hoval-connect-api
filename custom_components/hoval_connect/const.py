@@ -67,6 +67,23 @@ TURN_ON_WEEK2 = "week2"
 CONF_TURN_ON_MODE = "turn_on_mode"
 DEFAULT_TURN_ON_MODE = TURN_ON_RESUME
 
+# HV (HomeVent) air-volume operating bounds, in percent.
+# The Hoval cloud/firmware rejects or undefined-behaves on values below the
+# device minimum; the fan entity clamps user/automation requests into this band
+# before sending a temporary-change command.
+HV_AIR_VOLUME_MIN = 15
+HV_AIR_VOLUME_MAX = 100
+
+
+def clamp_hv_air_volume(percentage: float) -> int:
+    """Clamp a requested HV air-volume percentage into the device's valid band.
+
+    Pure helper (no HA imports) so it is directly unit-testable. Returns an int
+    in [HV_AIR_VOLUME_MIN, HV_AIR_VOLUME_MAX].
+    """
+    return int(max(HV_AIR_VOLUME_MIN, min(HV_AIR_VOLUME_MAX, percentage)))
+
+
 # Service names
 SERVICE_RESET_WW_BOOST = "reset_ww_boost"
 

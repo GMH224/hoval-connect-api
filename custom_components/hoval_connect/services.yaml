@@ -1,0 +1,9 @@
+reset_ww_boost:
+  name: Reset hot water boost
+  description: >-
+    Cancel any active temporary hot-water temperature override (boost) on the
+    targeted water heater entity and resume its normal week/day program.
+  target:
+    entity:
+      integration: hoval_connect
+      domain: water_heater

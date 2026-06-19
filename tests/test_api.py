@@ -43,7 +43,7 @@ def _make_response(status: int, json_data=None, text: str = "") -> MagicMock:
     resp = AsyncMock()
     resp.status = status
     resp.content_length = 0 if status == 204 else 128
-    resp.json = AsyncMock(return_value=json_data or {})
+    resp.json = AsyncMock(return_value=json_data if json_data is not None else {})
     resp.text = AsyncMock(return_value=text)
     resp.raise_for_status = MagicMock()
     if status >= 400:
@@ -67,6 +67,7 @@ def _make_session() -> MagicMock:
 # ---------------------------------------------------------------------------
 # Authentication
 # ---------------------------------------------------------------------------
+
 
 class TestHovalConnectApiAuth:
     """Tests for authentication logic."""
@@ -154,6 +155,7 @@ class TestHovalConnectApiAuth:
 # ---------------------------------------------------------------------------
 # _request
 # ---------------------------------------------------------------------------
+
 
 class TestHovalConnectApiRequest:
     """Tests for the _request method."""
@@ -328,6 +330,7 @@ class TestHovalConnectApiRequest:
 # Endpoint methods — pagination handling (v0.16.1+)
 # ---------------------------------------------------------------------------
 
+
 class TestHovalConnectApiEndpoints:
     """Tests for specific API endpoint methods."""
 
@@ -475,6 +478,9 @@ class TestHovalConnectApiEndpoints:
         auth_resp = _make_response(200, {"id_token": "token"})
         session.post = MagicMock(return_value=auth_resp)
 
+        pat_resp = _make_response(200, {"token": "pat-123"})
+        session.get = MagicMock(return_value=pat_resp)
+
         # Simulate a 204 response (_request returns None)
         api_resp = _make_response(204)
         session.request = MagicMock(return_value=api_resp)
@@ -592,6 +598,7 @@ class TestHovalConnectApiEndpoints:
 # Retry constants
 # ---------------------------------------------------------------------------
 
+
 class TestRetryConstants:
     """Tests for retry configuration."""
 
@@ -612,11 +619,13 @@ class TestRetryConstants:
 # Code invariants (static checks, no HA needed)
 # ---------------------------------------------------------------------------
 
+
 class TestCodeInvariants:
     """Text-based checks that key v0.17.0 code invariants hold."""
 
     def _read(self, filename: str) -> str:
         import os
+
         base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(base, "custom_components", "hoval_connect", filename)) as f:
             return f.read()
@@ -653,11 +662,13 @@ class TestCodeInvariants:
     def test_sensor_has_room_temp_actual_for_hk(self):
         """sensor.py must declare room_temp_actual limited to HK circuits."""
         import re
+
         src = self._read("sensor.py")
         assert 'key="room_temp_actual"' in src
         block = re.search(
             r'key="room_temp_actual".*?circuit_types=frozenset\(\{([^}]+)\}\)',
-            src, re.DOTALL,
+            src,
+            re.DOTALL,
         )
         assert block is not None, "room_temp_actual descriptor not found"
         assert "CIRCUIT_TYPE_HK" in block.group(1)
@@ -666,13 +677,16 @@ class TestCodeInvariants:
     def test_restore_from_store_uses_try_except(self):
         """restore_from_store must wrap int() in try/except to handle corrupt data."""
         src = self._read("coordinator.py")
-        # Both HovalCircuitHealth and HovalConnectionHealth have the fix
-        assert src.count("except (TypeError, ValueError):") >= 2
+        # Both HovalCircuitHealth and HovalConnectionHealth swallow corrupt
+        # values resiliently, using contextlib.suppress (ruff-preferred form).
+        assert src.count("contextlib.suppress(TypeError, ValueError)") >= 2
 
     def test_bl_still_in_non_selectable_types(self):
         """BL must remain in _non_selectable_types so selectable=False doesn't exclude it."""
         src = self._read("coordinator.py")
-        assert "_non_selectable_types = {CIRCUIT_TYPE_BL" in src or \
-               "_non_selectable_types = {CIRCUIT_TYPE_WW, CIRCUIT_TYPE_BL" in src or \
-               "CIRCUIT_TYPE_BL" in src
+        assert (
+            "_non_selectable_types = {CIRCUIT_TYPE_BL" in src
+            or "_non_selectable_types = {CIRCUIT_TYPE_WW, CIRCUIT_TYPE_BL" in src
+            or "CIRCUIT_TYPE_BL" in src
+        )
         assert "_non_selectable_types" in src
