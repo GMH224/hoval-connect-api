@@ -25,9 +25,8 @@ sys.modules.setdefault("homeassistant.helpers.device_registry", ha_mock)
 sys.modules.setdefault("homeassistant.helpers.dispatcher", ha_mock)
 sys.modules.setdefault("homeassistant.util", ha_mock)
 sys.modules.setdefault("homeassistant.util.dt", ha_mock)
-sys.modules.setdefault("voluptuous", ha_mock)
-
 import aiohttp  # noqa: E402
+import voluptuous as vol  # noqa: E402
 
 from custom_components.hoval_connect.api import (  # noqa: E402
     _MAX_RETRIES,
@@ -36,6 +35,7 @@ from custom_components.hoval_connect.api import (  # noqa: E402
     HovalAuthError,
     HovalConnectApi,
 )
+from custom_components.hoval_connect.const import SCAN_INTERVAL_OPTIONS  # noqa: E402
 
 
 def _make_response(status: int, json_data=None, text: str = "") -> MagicMock:
@@ -682,11 +682,36 @@ class TestCodeInvariants:
         assert src.count("contextlib.suppress(TypeError, ValueError)") >= 2
 
     def test_bl_still_in_non_selectable_types(self):
-        """BL must remain in _non_selectable_types so selectable=False doesn't exclude it."""
+        """BL must remain in the non-selectable types so selectable=False doesn't exclude it."""
         src = self._read("coordinator.py")
         assert (
-            "_non_selectable_types = {CIRCUIT_TYPE_BL" in src
-            or "_non_selectable_types = {CIRCUIT_TYPE_WW, CIRCUIT_TYPE_BL" in src
+            "_NON_SELECTABLE_TYPES = frozenset({CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WW})" in src
+            or "_NON_SELECTABLE_TYPES = frozenset({CIRCUIT_TYPE_WW, CIRCUIT_TYPE_BL})" in src
             or "CIRCUIT_TYPE_BL" in src
         )
-        assert "_non_selectable_types" in src
+        assert "_NON_SELECTABLE_TYPES" in src
+
+
+class TestScanIntervalSchema:
+    """Options dropdown submits strings; schema must coerce so the interval saves.
+
+    Regression for the v0.19.0 'poll interval not saved' bug.
+    """
+
+    @staticmethod
+    def _validator():
+        return vol.Schema(
+            {vol.Required("scan_interval"): vol.All(vol.Coerce(int), vol.In(SCAN_INTERVAL_OPTIONS))}
+        )
+
+    def test_string_from_frontend_is_coerced_and_accepted(self):
+        out = self._validator()({"scan_interval": "60"})
+        assert out["scan_interval"] == 60
+        assert isinstance(out["scan_interval"], int)
+
+    def test_int_value_accepted(self):
+        assert self._validator()({"scan_interval": 120})["scan_interval"] == 120
+
+    def test_unknown_value_rejected(self):
+        with pytest.raises(vol.Invalid):
+            self._validator()({"scan_interval": "45"})

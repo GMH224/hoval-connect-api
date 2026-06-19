@@ -25,8 +25,10 @@ from .const import (
     CIRCUIT_TYPE_WW,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    EVENTS_CACHE_TTL,
     PROGRAM_CACHE_TTL,
     SUPPORTED_CIRCUIT_TYPES,
+    WEATHER_CACHE_TTL,
 )
 
 SIGNAL_NEW_CIRCUITS = f"{DOMAIN}_new_circuits"
@@ -109,6 +111,8 @@ def _resolve_active_program_value(
 # At the fastest polling interval (30 s) this covers 90 minutes — enough to
 # compute accurate 1-hour rates even after a burst of rapid polls.
 _HEALTH_HISTORY_SIZE = 180  # ~90 min at 30 s polling / ~3 h at 60 s
+# Circuit types that are not user-selectable but still expose live values.
+_NON_SELECTABLE_TYPES = frozenset({CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WW})
 _LATENCY_HISTORY_SIZE = 60  # p95 needs enough samples to be meaningful
 
 # Exponential-moving-average decay factor: 10 % weight to each new sample.
@@ -694,6 +698,15 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         # Program cache: key=circuit_path, value=(programs_data, timestamp)
         self._program_cache: dict[str, tuple[Any, float]] = {}
         self._program_cache_ttl = PROGRAM_CACHE_TTL.total_seconds()
+        # Plant-level caches for slow-changing data. value=(parsed, timestamp).
+        # Weather and events are refreshed on their own cadence (see *_CACHE_TTL)
+        # and the last good parsed value is reused between refreshes, so they no
+        # longer cost a round-trip on every poll.
+        self._weather_cache: dict[str, tuple[Any, float]] = {}
+        self._weather_cache_ttl = WEATHER_CACHE_TTL.total_seconds()
+        # value=(latest_event, events_list, timestamp)
+        self._events_cache: dict[str, tuple[Any, list, float]] = {}
+        self._events_cache_ttl = EVENTS_CACHE_TTL.total_seconds()
         # Track known circuits for dynamic entity discovery
         self._known_circuits: set[str] = set()
         # API connection health — persists across poll cycles
@@ -936,7 +949,6 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 raise _CircuitListError(str(err)) from err
 
             # BL/WW circuits have selectable=False but still provide live values
-            _non_selectable_types = {CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WW}
 
             _LOGGER.debug(
                 "Fetched %d circuits (%d supported)",
@@ -945,7 +957,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                     1
                     for c in circuits_raw
                     if c.get("type") in SUPPORTED_CIRCUIT_TYPES
-                    and (c.get("selectable") or c.get("type") in _non_selectable_types)
+                    and (c.get("selectable") or c.get("type") in _NON_SELECTABLE_TYPES)
                 ),
             )
 
@@ -955,7 +967,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 ctype = circuit.get("type", "")
                 if ctype not in SUPPORTED_CIRCUIT_TYPES:
                     continue
-                if not circuit.get("selectable", False) and ctype not in _non_selectable_types:
+                if not circuit.get("selectable", False) and ctype not in _NON_SELECTABLE_TYPES:
                     continue
                 path = circuit.get("path")
                 if not path:
@@ -965,11 +977,12 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                         {k: v for k, v in circuit.items() if k != "name"},
                     )
                     continue
-                _LOGGER.debug(
-                    "Circuit %s raw: %s",
-                    path,
-                    {k: v for k, v in circuit.items() if k != "name"},
-                )
+                if _LOGGER.isEnabledFor(logging.DEBUG):
+                    _LOGGER.debug(
+                        "Circuit %s raw: %s",
+                        path,
+                        {k: v for k, v in circuit.items() if k != "name"},
+                    )
                 supported_circuits.append((path, ctype, circuit))
 
             # Fetch live values + programs for all circuits in parallel
@@ -1017,11 +1030,10 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
 
                 if not isinstance(results[0], BaseException):
                     lv_raw = results[0]
-                    # Normalise paginated wrapper → plain list (Hoval May 2026 change).
-                    if isinstance(lv_raw, dict):
-                        lv_raw = lv_raw.get("content", [])
-                    # Defensive: api.get_live_values() always returns a list, but
-                    # guard against any future regression that returns None / other.
+                    # api.get_live_values() already normalises the paginated
+                    # wrapper (Hoval May 2026 change) to a plain list. Keep one
+                    # lightweight guard against any future shape regression so an
+                    # unexpected non-list can't crash the comprehension below.
                     if not isinstance(lv_raw, list):
                         _LOGGER.warning(
                             "Live-values for %s returned unexpected type %s; treating as empty",
@@ -1046,8 +1058,13 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
 
                 # Propagate per-circuit reliability metrics into the data object so
                 # circuit-level sensors can read them without touching the coordinator.
-                circuit_data.circuit_failure_rate_1h = ch.failure_rate_1h
-                circuit_data.circuit_availability_1h = ch.availability_1h
+                # Compute the failure rate once and derive availability from it
+                # (availability_1h would otherwise re-scan the same deques).
+                rate = ch.failure_rate_1h
+                circuit_data.circuit_failure_rate_1h = rate
+                circuit_data.circuit_availability_1h = (
+                    None if rate is None else round(100.0 - rate, 1)
+                )
                 circuit_data.circuit_consecutive_failures = ch.consecutive_failures
 
                 programs = results[1]
@@ -1090,17 +1107,34 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
 
                 return circuit_data
 
-            # Run circuits, events, and weather all in parallel
+            # Run circuits in parallel. Plant-level events/weather are only
+            # appended when their cache is stale (they are slow-changing and
+            # plant-scoped, so fetching them every poll wastes round-trips).
             all_tasks = [
                 _fetch_circuit(path, ctype, circ) for path, ctype, circ in supported_circuits
             ]
-            # Append plant-level tasks (events + weather)
-            latest_idx = len(all_tasks)
-            all_tasks.append(self.api.get_latest_event(plant_id))
-            events_idx = len(all_tasks)
-            all_tasks.append(self.api.get_events(plant_id))
-            weather_idx = len(all_tasks)
-            all_tasks.append(self.api.get_weather(plant_id))
+            num_circuits = len(all_tasks)
+            now_mono = time.monotonic()
+
+            events_cached = self._events_cache.get(plant_id)
+            need_events = (
+                events_cached is None or now_mono - events_cached[2] > self._events_cache_ttl
+            )
+            latest_idx = events_idx = None
+            if need_events:
+                latest_idx = len(all_tasks)
+                all_tasks.append(self.api.get_latest_event(plant_id))
+                events_idx = len(all_tasks)
+                all_tasks.append(self.api.get_events(plant_id))
+
+            weather_cached = self._weather_cache.get(plant_id)
+            need_weather = (
+                weather_cached is None or now_mono - weather_cached[1] > self._weather_cache_ttl
+            )
+            weather_idx = None
+            if need_weather:
+                weather_idx = len(all_tasks)
+                all_tasks.append(self.api.get_weather(plant_id))
 
             all_results = await asyncio.gather(
                 *all_tasks,
@@ -1108,7 +1142,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
             )
 
             # Process circuit results
-            for result in all_results[:latest_idx]:
+            for result in all_results[:num_circuits]:
                 if isinstance(result, BaseException):
                     _LOGGER.debug("Circuit fetch failed: %s", result)
                     continue
@@ -1116,45 +1150,69 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                     plant_data.has_error = True
                 plant_data.circuits[result.path] = result
 
-            # Process latest event
-            latest_result = all_results[latest_idx]
-            if not isinstance(latest_result, BaseException) and latest_result:
-                plant_data.latest_event = _parse_event(latest_result)
-                if _is_problem_event(plant_data.latest_event):
-                    plant_data.has_error = True
-                _LOGGER.debug(
-                    "Latest event: type=%s active=%s desc=%s",
-                    plant_data.latest_event.event_type,
-                    plant_data.latest_event.is_active,
-                    plant_data.latest_event.description,
-                )
-            elif isinstance(latest_result, BaseException):
-                _LOGGER.debug("Events endpoint not available for %s", plant_id)
+            # --- Events (latest + list), cached together ---
+            if need_events:
+                latest_result = all_results[latest_idx]
+                events_result = all_results[events_idx]
+                parsed_latest = None
+                parsed_events: list = []
+                if not isinstance(latest_result, BaseException) and latest_result:
+                    parsed_latest = _parse_event(latest_result)
+                    _LOGGER.debug(
+                        "Latest event: type=%s active=%s desc=%s",
+                        parsed_latest.event_type,
+                        parsed_latest.is_active,
+                        parsed_latest.description,
+                    )
+                elif isinstance(latest_result, BaseException):
+                    _LOGGER.debug("Events endpoint not available for %s", plant_id)
+                if not isinstance(events_result, BaseException) and events_result:
+                    parsed_events = [_parse_event(ev) for ev in events_result[:10]]
+                elif isinstance(events_result, BaseException):
+                    _LOGGER.debug("Events list not available for %s", plant_id)
+                # Refresh the cache only when we got something; on a total miss
+                # reuse the previous cache (if any) rather than wiping good data.
+                if parsed_latest is not None or parsed_events:
+                    self._events_cache[plant_id] = (parsed_latest, parsed_events, now_mono)
+                elif events_cached is not None:
+                    parsed_latest, parsed_events, _ = events_cached
+            else:
+                parsed_latest, parsed_events, _ = events_cached
 
-            # Process events list
-            events_result = all_results[events_idx]
-            if not isinstance(events_result, BaseException) and events_result:
-                for ev in events_result[:10]:
-                    plant_data.events.append(_parse_event(ev))
-                for ev in plant_data.events:
+            plant_data.latest_event = parsed_latest
+            plant_data.events = list(parsed_events)
+            if parsed_latest is not None and _is_problem_event(parsed_latest):
+                plant_data.has_error = True
+            else:
+                for ev in parsed_events:
                     if _is_problem_event(ev):
                         plant_data.has_error = True
                         break
-            elif isinstance(events_result, BaseException):
-                _LOGGER.debug("Events list not available for %s", plant_id)
 
-            # Process weather forecast
-            weather_result = all_results[weather_idx]
-            if not isinstance(weather_result, BaseException) and weather_result:
-                if isinstance(weather_result, list) and weather_result:
+            # --- Weather forecast, cached ---
+            if need_weather:
+                weather_result = all_results[weather_idx]
+                parsed_weather = None
+                if (
+                    not isinstance(weather_result, BaseException)
+                    and isinstance(weather_result, list)
+                    and weather_result
+                ):
                     w = weather_result[0]
-                    plant_data.weather = HovalWeatherData(
+                    parsed_weather = HovalWeatherData(
                         weather_type=w.get("weatherType"),
                         outside_temperature=w.get("outsideTemperature"),
                         outside_temperature_min=w.get("outsideTemperatureMin"),
                     )
-            elif isinstance(weather_result, BaseException):
-                _LOGGER.debug("Weather not available for %s", plant_id)
+                elif isinstance(weather_result, BaseException):
+                    _LOGGER.debug("Weather not available for %s", plant_id)
+                if parsed_weather is not None:
+                    self._weather_cache[plant_id] = (parsed_weather, now_mono)
+                elif weather_cached is not None:
+                    parsed_weather = weather_cached[0]
+            else:
+                parsed_weather = weather_cached[0]
+            plant_data.weather = parsed_weather
 
             data.plants[plant_id] = plant_data
 

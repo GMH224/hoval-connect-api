@@ -131,6 +131,44 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
+### v0.19.0 — Config fix + polling/efficiency optimizations
+
+Bundles a user-reported configuration bug fix with the network/efficiency
+optimizations identified in the v0.18.0 review. No behavioural change to control
+or entity state; all 115 tests pass and `ruff` (check + format) is clean.
+
+#### Bug fix
+- **Options flow — scan interval was never saved.** `SCAN_INTERVAL_OPTIONS` uses
+  integer keys, but the HA frontend submits dropdown selections as strings, so
+  `vol.In(SCAN_INTERVAL_OPTIONS)` rejected the submitted `"60"` while the two
+  string-keyed options saved normally ("the rest works"). The field now validates
+  with `vol.All(vol.Coerce(int), vol.In(...))`, and `_get_scan_interval()` coerces
+  defensively so any entry that previously stored a string self-heals instead of
+  raising `TypeError` in `timedelta()`. The existing options-update listener means
+  the new interval applies live without a reload.
+
+#### Optimizations
+- **Weather/events TTL caching.** Plant-level weather and events are slow-changing
+  but were fetched on every (default 60 s) poll. They are now cached per plant
+  (`WEATHER_CACHE_TTL` 15 min, `EVENTS_CACHE_TTL` 3 min) and the last good parsed
+  value is reused between refreshes — cutting those round-trips ~5–15× and easing
+  rate-limit pressure. On a refresh miss the prior cached value is retained rather
+  than wiped. This also subsumes the redundant `latest`+`list` event double-call,
+  which now happens at most once per `EVENTS_CACHE_TTL` instead of every poll.
+- **Removed duplicate live-values un-pagination.** `api.get_live_values()` already
+  normalises the `{"content": […]}` wrapper; the coordinator's second unwrap (an
+  artifact of the May-2026 pagination scramble) was dead and is removed, leaving a
+  single defensive list guard.
+- **Micro-efficiency in the poll loop:** the failure-rate is computed once per
+  circuit and availability derived from it (was re-scanning the same deques);
+  `_NON_SELECTABLE_TYPES` is a module constant instead of a per-poll set
+  allocation; the per-circuit "raw" debug dict is only built when debug logging is
+  enabled.
+
+Architecture note (unchanged): still a cloud-polling integration; these changes
+reduce round-trips and churn, not the fundamental polling latency, and do not make
+it a substitute for a local control/safety path.
+
 ### v0.18.0 — Audit remediation (security, reliability, CI integrity)
 
 Follow-up to the v0.17.0 audit. No new user-facing features; all changes are

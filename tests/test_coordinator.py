@@ -599,3 +599,23 @@ class TestClampHvAirVolume:
         assert clamp_hv_air_volume(15) == 15
         assert clamp_hv_air_volume(55) == 55
         assert clamp_hv_air_volume(100) == 100
+
+
+# ---------------------------------------------------------------------------
+# v0.19.0 — plant-level cache TTL constants
+# ---------------------------------------------------------------------------
+class TestCacheTtls:
+    def test_ttls_are_sane(self):
+        from datetime import timedelta
+
+        from custom_components.hoval_connect.const import (
+            EVENTS_CACHE_TTL,
+            PROGRAM_CACHE_TTL,
+            WEATHER_CACHE_TTL,
+        )
+
+        for ttl in (EVENTS_CACHE_TTL, WEATHER_CACHE_TTL, PROGRAM_CACHE_TTL):
+            assert isinstance(ttl, timedelta)
+            assert ttl.total_seconds() > 0
+        # Weather changes most slowly, events fastest of the three plant caches.
+        assert WEATHER_CACHE_TTL >= EVENTS_CACHE_TTL

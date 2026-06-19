@@ -27,7 +27,6 @@ _HA_MODULES = [
     "homeassistant.helpers.entity_platform",
     "homeassistant.util",
     "homeassistant.util.dt",
-    "voluptuous",
 ]
 
 for _name in _HA_MODULES:

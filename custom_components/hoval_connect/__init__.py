@@ -73,8 +73,18 @@ def circuit_device_info(
 
 
 def _get_scan_interval(entry: HovalConnectConfigEntry) -> timedelta:
-    """Get the scan interval from options or use default."""
-    seconds = entry.options.get(CONF_SCAN_INTERVAL, int(DEFAULT_SCAN_INTERVAL.total_seconds()))
+    """Get the scan interval from options or use default.
+
+    The stored value is coerced to int defensively: earlier builds could persist
+    the interval as a string (the frontend submits dropdown values as strings),
+    which would otherwise raise TypeError in timedelta(). A non-numeric value
+    falls back to the default so the integration always loads.
+    """
+    default_s = int(DEFAULT_SCAN_INTERVAL.total_seconds())
+    try:
+        seconds = int(entry.options.get(CONF_SCAN_INTERVAL, default_s))
+    except (TypeError, ValueError):
+        seconds = default_s
     return timedelta(seconds=seconds)
 
 
