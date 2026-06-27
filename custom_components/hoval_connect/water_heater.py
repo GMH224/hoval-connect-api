@@ -34,7 +34,7 @@ _LOGGER = logging.getLogger(__name__)
 # The Hoval app allows 10–65 °C; we use a safe operational range.
 WW_MIN_TEMP = 10.0
 WW_MAX_TEMP = 65.0
-WW_TEMP_STEP = 1.0
+WW_TEMP_STEP = 0.5
 
 # Operation modes exposed to HA
 _OP_HEAT_PUMP = STATE_HEAT_PUMP  # "heat_pump"  — normal week-program operation
