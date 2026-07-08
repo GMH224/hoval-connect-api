@@ -4,6 +4,41 @@ All notable changes to the `hoval_connect` integration are documented here.
 This project follows a loose [Semantic Versioning](https://semver.org/) scheme
 while pre-1.0 (minor = behavioural/feature change, patch = internal fix).
 
+## [0.21.0] - 2026-07-08
+
+### Added
+- **Weather based control sliders** (`number.py`, new platform file): The
+  Hoval Connect app added a "Weather based control" screen in 2026-07 with two
+  Eco↔Comfort sliders — *by outside temperature* and *by solar radiation* —
+  that were previously only settable on the heat pump itself. These are now
+  exposed as HA `number` entities on each HK heating circuit's device:
+  - **Weather based control: outside temperature** — slider, 0–100
+  - **Weather based control: solar radiation** — slider, −10–0
+  Both are `Config` category entities (hidden from the default dashboard,
+  same visibility tier as other configuration-style entities) and use the
+  same 1.5s debounce as the existing fan-speed slider so dragging doesn't
+  spam the API.
+- New API methods `get_circuit_settings()` / `update_circuit_settings()`
+  (`GET`/`PATCH /v3/plants/{id}/circuits/{path}/settings`).
+- New coordinator method `async_set_weather_impact()` with the same
+  lock + optimistic-update + background-refresh pattern used by existing
+  control actions (fan speed, program select, etc.), so the slider reflects
+  your change immediately rather than waiting for the next poll.
+
+### Notes
+- Only enabled for HK (heating) circuits, matching the app screenshot this was
+  built from. Not yet empirically verified against a live plant — if the
+  cloud rejects the request shape, it will show up as a `HomeAssistantError`
+  when moving the slider; please open an issue with the log line so the
+  request shape/bounds can be corrected.
+- 141 tests pass (22 new for this feature); `ruff check` / `ruff format
+  --check` clean; coverage 30.70 % (gate: 30 %).
+- No configuration changes required; after updating, restart Home Assistant
+  (not just "reload integration" — see `CLAUDE.md` Live Testing section) and
+  the two new entities will appear on each HK circuit's device.
+
+---
+
 ## [0.20.0] - 2026-06-27
 
 ### Changed

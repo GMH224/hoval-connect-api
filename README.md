@@ -37,6 +37,13 @@ Plants and circuits are discovered automatically from your account.
 - Shows user-defined program names from the Hoval app
 - Current program pre-selected
 
+**Weather based control sliders** (per HK heating circuit):
+- Two Eco↔Comfort weighting sliders matching the app's "Weather based control"
+  screen: **by outside temperature** (0–100) and **by solar radiation** (−10–0)
+- Debounced slider input (1.5s), same pattern as the fan speed slider
+- Config-category entities (hidden from the main dashboard by default; find
+  them under the circuit device's entity list)
+
 **Sensor entities** (per circuit, filtered by type):
 - **HV:** Outside temperature, exhaust temperature, air volume, humidity (actual/target), program air volume
 - **HK:** Outside temperature, flow temperature (actual/target), room temperature setpoint

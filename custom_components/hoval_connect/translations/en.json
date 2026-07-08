@@ -244,6 +244,14 @@
       "program": {
         "name": "Program"
       }
+    },
+    "number": {
+      "weather_impact_outside_temperature": {
+        "name": "Weather based control: outside temperature"
+      },
+      "weather_impact_solar_radiation": {
+        "name": "Weather based control: solar radiation"
+      }
     }
   },
   "services": {

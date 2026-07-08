@@ -37,6 +37,7 @@ from custom_components.hoval_connect.coordinator import (  # noqa: E402
     _parse_event,
     _resolve_active_program_value,
     resolve_fan_speed,
+    resolve_weather_impact_update,
 )
 
 # ---------------------------------------------------------------------------
@@ -619,3 +620,143 @@ class TestCacheTtls:
             assert ttl.total_seconds() > 0
         # Weather changes most slowly, events fastest of the three plant caches.
         assert WEATHER_CACHE_TTL >= EVENTS_CACHE_TTL
+
+
+# ---------------------------------------------------------------------------
+# v0.21.0 — weather-based control (Eco <-> Comfort weighting sliders)
+# ---------------------------------------------------------------------------
+class TestClampWeatherImpact:
+    """The weather-impact sliders must never send an out-of-band value to the API."""
+
+    def test_outside_temperature_below_min_clamps_up(self):
+        from custom_components.hoval_connect.const import clamp_weather_impact_outside_temperature
+
+        assert clamp_weather_impact_outside_temperature(-5) == 0
+        assert clamp_weather_impact_outside_temperature(0) == 0
+
+    def test_outside_temperature_above_max_clamps_down(self):
+        from custom_components.hoval_connect.const import clamp_weather_impact_outside_temperature
+
+        assert clamp_weather_impact_outside_temperature(150) == 100
+
+    def test_outside_temperature_in_band_passthrough(self):
+        from custom_components.hoval_connect.const import clamp_weather_impact_outside_temperature
+
+        assert clamp_weather_impact_outside_temperature(0) == 0
+        assert clamp_weather_impact_outside_temperature(50) == 50
+        assert clamp_weather_impact_outside_temperature(100) == 100
+
+    def test_outside_temperature_returns_int(self):
+        from custom_components.hoval_connect.const import clamp_weather_impact_outside_temperature
+
+        result = clamp_weather_impact_outside_temperature(42.9)
+        assert result == 42
+        assert isinstance(result, int)
+
+    def test_solar_radiation_below_min_clamps_up(self):
+        from custom_components.hoval_connect.const import clamp_weather_impact_solar_radiation
+
+        assert clamp_weather_impact_solar_radiation(-20) == -10.0
+
+    def test_solar_radiation_above_max_clamps_down(self):
+        from custom_components.hoval_connect.const import clamp_weather_impact_solar_radiation
+
+        assert clamp_weather_impact_solar_radiation(5) == 0.0
+        assert clamp_weather_impact_solar_radiation(0.1) == 0.0
+
+    def test_solar_radiation_in_band_passthrough(self):
+        from custom_components.hoval_connect.const import clamp_weather_impact_solar_radiation
+
+        assert clamp_weather_impact_solar_radiation(-10) == -10.0
+        assert clamp_weather_impact_solar_radiation(-5) == -5.0
+        assert clamp_weather_impact_solar_radiation(0) == 0.0
+
+    def test_solar_radiation_returns_float(self):
+        from custom_components.hoval_connect.const import clamp_weather_impact_solar_radiation
+
+        result = clamp_weather_impact_solar_radiation(-3)
+        assert isinstance(result, float)
+
+
+class TestCircuitSettingsCacheTtl:
+    def test_settings_cache_ttl_is_sane(self):
+        from datetime import timedelta
+
+        from custom_components.hoval_connect.const import CIRCUIT_SETTINGS_CACHE_TTL
+
+        assert isinstance(CIRCUIT_SETTINGS_CACHE_TTL, timedelta)
+        assert CIRCUIT_SETTINGS_CACHE_TTL.total_seconds() > 0
+
+    def test_hk_supports_weather_impact(self):
+        from custom_components.hoval_connect.const import CIRCUIT_TYPE_HK, SUPPORTS_WEATHER_IMPACT
+
+        assert CIRCUIT_TYPE_HK in SUPPORTS_WEATHER_IMPACT
+
+    def test_hv_does_not_support_weather_impact(self):
+        """HV (ventilation) has no thermal/comfort weighting concept; must be excluded."""
+        from custom_components.hoval_connect.const import CIRCUIT_TYPE_HV, SUPPORTS_WEATHER_IMPACT
+
+        assert CIRCUIT_TYPE_HV not in SUPPORTS_WEATHER_IMPACT
+
+
+class TestResolveWeatherImpactUpdate:
+    """resolve_weather_impact_update() must always resolve a full pair to PATCH.
+
+    Regression coverage for the "PATCH is not confirmed to be a JSON-merge
+    patch" risk: dragging one slider must never silently clear the other's
+    current value.
+    """
+
+    def test_only_outside_temperature_changed_preserves_solar(self):
+        outside, solar = resolve_weather_impact_update(
+            30, -4.0, outside_temperature=80, solar_radiation=None
+        )
+        assert outside == 80
+        assert solar == -4.0
+
+    def test_only_solar_radiation_changed_preserves_outside(self):
+        outside, solar = resolve_weather_impact_update(
+            30, -4.0, outside_temperature=None, solar_radiation=-2.0
+        )
+        assert outside == 30
+        assert solar == -2.0
+
+    def test_neither_changed_passes_through_unmodified(self):
+        outside, solar = resolve_weather_impact_update(30, -4.0)
+        assert outside == 30
+        assert solar == -4.0
+
+    def test_no_current_value_and_no_change_is_none(self):
+        """First-ever write to a field the API has never reported (None current)."""
+        outside, solar = resolve_weather_impact_update(None, None)
+        assert outside is None
+        assert solar is None
+
+    def test_requested_outside_temperature_is_clamped(self):
+        outside, _solar = resolve_weather_impact_update(
+            None, None, outside_temperature=500, solar_radiation=None
+        )
+        assert outside == 100
+
+    def test_requested_solar_radiation_is_clamped(self):
+        _outside, solar = resolve_weather_impact_update(
+            None, None, outside_temperature=None, solar_radiation=-99
+        )
+        assert solar == -10.0
+
+    def test_both_fields_can_be_changed_at_once(self):
+        outside, solar = resolve_weather_impact_update(
+            30, -4.0, outside_temperature=10, solar_radiation=-1.0
+        )
+        assert outside == 10
+        assert solar == -1.0
+
+
+class TestHovalCircuitDataWeatherImpactDefaults:
+    """New HovalCircuitData fields must default safely for circuit types that don't use them."""
+
+    def test_defaults(self):
+        circuit = HovalCircuitData(circuit_type="HV", path="1.1.0", name="Vent")
+        assert circuit.weather_impact_supported is False
+        assert circuit.weather_impact_outside_temperature is None
+        assert circuit.weather_impact_solar_radiation is None

@@ -388,6 +388,65 @@ class HovalConnectApi:
         """Get weather forecast for plant location."""
         return await self._request("GET", f"/v2/api/weather/forecast/{plant_id}", plant_id=plant_id)
 
+    async def get_circuit_settings(self, plant_id: str, circuit_path: str) -> dict[str, Any]:
+        """Get circuit settings (currently: circuitName + weatherImpact).
+
+        GET /v3/plants/{plantExternalId}/circuits/{circuitPath}/settings
+
+        `weatherImpact` holds the "weather based control" Eco<->Comfort
+        weighting introduced in the Hoval Connect app in 2026-07:
+            {"outsideTemperature": <int 0..100>, "solarRadiation": <float -10..0>}
+        Either sub-field (or the whole `weatherImpact` object) may be null for
+        circuit types/firmware versions that don't support it.
+        """
+        return await self._request(
+            "GET",
+            f"/v3/plants/{plant_id}/circuits/{circuit_path}/settings",
+            plant_id=plant_id,
+        )
+
+    async def update_circuit_settings(
+        self,
+        plant_id: str,
+        circuit_path: str,
+        *,
+        outside_temperature: int | None = None,
+        solar_radiation: float | None = None,
+    ) -> Any:
+        """Update the weather-based control weighting for a circuit.
+
+        PATCH /v3/plants/{plantExternalId}/circuits/{circuitPath}/settings
+        Body: {"weatherImpact": {"outsideTemperature": <int|null>, "solarRadiation": <float|null>}}
+
+        The cloud's PATCH endpoint for CircuitSettingsDTO is not confirmed to
+        be a JSON-merge-patch — sending only the changed sub-field could
+        overwrite the other one with null. Callers (see
+        HovalDataCoordinator.async_set_weather_impact) MUST resolve both
+        values (current + requested change) before calling this method; this
+        method always sends both keys it was given so the request body never
+        implicitly clears a value the caller didn't intend to touch.
+        """
+        body = {
+            "weatherImpact": {
+                "outsideTemperature": outside_temperature,
+                "solarRadiation": solar_radiation,
+            }
+        }
+        _LOGGER.debug(
+            "update_circuit_settings: plant=%s circuit=%s body=%s",
+            plant_id,
+            circuit_path,
+            body,
+        )
+        result = await self._request(
+            "PATCH",
+            f"/v3/plants/{plant_id}/circuits/{circuit_path}/settings",
+            plant_id=plant_id,
+            json_data=body,
+        )
+        _LOGGER.debug("update_circuit_settings: completed successfully")
+        return result
+
     async def set_circuit_mode(self, plant_id: str, circuit_path: str, mode: str) -> Any:
         """Set circuit operation mode (standby or manual).
 

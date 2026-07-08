@@ -21,6 +21,7 @@ from homeassistant.util import dt as dt_util
 
 from .api import HovalApiError, HovalAuthError, HovalConnectApi
 from .const import (
+    CIRCUIT_SETTINGS_CACHE_TTL,
     CIRCUIT_TYPE_BL,
     CIRCUIT_TYPE_WW,
     DEFAULT_SCAN_INTERVAL,
@@ -28,7 +29,10 @@ from .const import (
     EVENTS_CACHE_TTL,
     PROGRAM_CACHE_TTL,
     SUPPORTED_CIRCUIT_TYPES,
+    SUPPORTS_WEATHER_IMPACT,
     WEATHER_CACHE_TTL,
+    clamp_weather_impact_outside_temperature,
+    clamp_weather_impact_solar_radiation,
 )
 
 SIGNAL_NEW_CIRCUITS = f"{DOMAIN}_new_circuits"
@@ -573,6 +577,15 @@ class HovalCircuitData:
     circuit_failure_rate_1h: float | None = None
     circuit_availability_1h: float | None = None
     circuit_consecutive_failures: int = 0
+    # "Weather based control" Eco<->Comfort weighting (CircuitSettingsDTO.weatherImpact).
+    # weather_impact_supported distinguishes "fetched, but the API reported this
+    # specific field as null" (supported=True, value=None) from "we never
+    # queried this circuit for settings, or the endpoint isn't available for its
+    # type/firmware" (supported=False) — number entities use this to decide
+    # availability rather than just checking the value for None.
+    weather_impact_supported: bool = False
+    weather_impact_outside_temperature: int | None = None
+    weather_impact_solar_radiation: float | None = None
 
 
 @dataclass
@@ -661,6 +674,42 @@ def resolve_fan_speed(circuit: HovalCircuitData | None) -> int:
     return DEFAULT_FAN_SPEED
 
 
+def resolve_weather_impact_update(
+    current_outside_temperature: int | None,
+    current_solar_radiation: float | None,
+    *,
+    outside_temperature: float | None = None,
+    solar_radiation: float | None = None,
+) -> tuple[int | None, float | None]:
+    """Resolve the full (outside_temperature, solar_radiation) pair to PATCH.
+
+    The cloud's PATCH .../settings endpoint is not confirmed to be a JSON-merge
+    patch (see api.update_circuit_settings docstring), so every request must
+    carry both fields. The number entity for one slider only knows the value
+    the user just dragged; the sibling field's *current* value (from cache or
+    a still-fresh optimistic override) must be threaded through unchanged so
+    it isn't silently cleared.
+
+    Exactly one of outside_temperature / solar_radiation is expected to be
+    provided by a caller — the field being changed. Values that are provided
+    are clamped into the API's valid band; the other field passes through
+    current_* unchanged.
+
+    Pure helper (no HA imports) so it is directly unit-testable.
+    """
+    resolved_outside = (
+        clamp_weather_impact_outside_temperature(outside_temperature)
+        if outside_temperature is not None
+        else current_outside_temperature
+    )
+    resolved_solar = (
+        clamp_weather_impact_solar_radiation(solar_radiation)
+        if solar_radiation is not None
+        else current_solar_radiation
+    )
+    return resolved_outside, resolved_solar
+
+
 class _CircuitListError(Exception):
     """Raised when the circuits-list endpoint fails.
 
@@ -698,6 +747,17 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         # Program cache: key=circuit_path, value=(programs_data, timestamp)
         self._program_cache: dict[str, tuple[Any, float]] = {}
         self._program_cache_ttl = PROGRAM_CACHE_TTL.total_seconds()
+        # Circuit settings cache (weather-based control weighting):
+        # key=circuit_path, value=(settings_dict, timestamp)
+        self._settings_cache: dict[str, tuple[dict[str, Any], float]] = {}
+        self._settings_cache_ttl = CIRCUIT_SETTINGS_CACHE_TTL.total_seconds()
+        # Optimistic weather-impact override per circuit, same shape/TTL
+        # semantics as _mode_override: set immediately after a successful
+        # control action so the slider UI doesn't wait for the next poll, and
+        # cleared once a successful poll confirms real data (or after
+        # _MODE_OVERRIDE_TTL_S if polls keep failing).
+        # value=({"outsideTemperature": int|None, "solarRadiation": float|None}, monotonic_ts)
+        self._weather_impact_override: dict[str, tuple[dict[str, Any], float]] = {}
         # Plant-level caches for slow-changing data. value=(parsed, timestamp).
         # Weather and events are refreshed on their own cadence (see *_CACHE_TTL)
         # and the last good parsed value is reused between refreshes, so they no
@@ -736,6 +796,104 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
             self._mode_override.pop(circuit_path, None)
             return None
         return mode
+
+    def get_weather_impact_override(self, circuit_path: str) -> dict[str, Any] | None:
+        """Get the optimistic weather-impact override for a circuit, if still fresh.
+
+        Mirrors get_mode_override(): returns None once the override exceeds
+        _MODE_OVERRIDE_TTL_S so a stale optimistic value cannot mask the real
+        device state indefinitely when polls are failing.
+        """
+        entry = self._weather_impact_override.get(circuit_path)
+        if entry is None:
+            return None
+        value, ts = entry
+        if time.monotonic() - ts > _MODE_OVERRIDE_TTL_S:
+            self._weather_impact_override.pop(circuit_path, None)
+            return None
+        return value
+
+    async def async_set_weather_impact(
+        self,
+        plant_id: str,
+        circuit_path: str,
+        *,
+        outside_temperature: float | None = None,
+        solar_radiation: float | None = None,
+    ) -> None:
+        """Set one or both weather-impact weighting values for a circuit.
+
+        Resolves the full (outsideTemperature, solarRadiation) pair before
+        calling the API — see resolve_weather_impact_update() and
+        api.update_circuit_settings() for why both fields must always be sent
+        together. "Current" values are read from (in priority order) a still
+        fresh optimistic override, then the settings cache, then the parsed
+        circuit data on the last coordinator refresh — so a rapid second slider
+        drag before the first API call's poll-refresh lands still merges
+        against the most recently known truth rather than stale data.
+        """
+        async with self.control_lock:
+            current = self.get_weather_impact_override(circuit_path)
+            cached = self._settings_cache.get(circuit_path)
+            circuit = None
+            for plant in self.data.plants.values() if self.data else ():
+                circuit = plant.circuits.get(circuit_path)
+                if circuit is not None:
+                    break
+
+            if current is not None:
+                current_outside = current.get("outsideTemperature")
+                current_solar = current.get("solarRadiation")
+            elif cached is not None:
+                weather_impact = cached[0].get("weatherImpact") or {}
+                current_outside = weather_impact.get("outsideTemperature")
+                current_solar = weather_impact.get("solarRadiation")
+            elif circuit is not None:
+                current_outside = circuit.weather_impact_outside_temperature
+                current_solar = circuit.weather_impact_solar_radiation
+            else:
+                current_outside = None
+                current_solar = None
+
+            resolved_outside, resolved_solar = resolve_weather_impact_update(
+                current_outside,
+                current_solar,
+                outside_temperature=outside_temperature,
+                solar_radiation=solar_radiation,
+            )
+
+            await self.api.update_circuit_settings(
+                plant_id,
+                circuit_path,
+                outside_temperature=resolved_outside,
+                solar_radiation=resolved_solar,
+            )
+
+            merged = {"outsideTemperature": resolved_outside, "solarRadiation": resolved_solar}
+            now_mono = time.monotonic()
+            self._weather_impact_override[circuit_path] = (merged, now_mono)
+            # Refresh the settings cache too so a concurrent second slider drag
+            # (which reads _settings_cache as a fallback above) sees the value
+            # we just wrote rather than the pre-update one.
+            self._settings_cache[circuit_path] = (
+                {"weatherImpact": merged},
+                time.time(),
+            )
+
+        # Schedule refresh as background task — do not await it here, matching
+        # async_control_and_refresh's rationale: keep the calling entity method
+        # fast and don't starve control_lock during a slow/timeout refresh.
+        async def _do_refresh() -> None:
+            await asyncio.sleep(2)
+            try:
+                await self.async_request_refresh()
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Post-control refresh failed for %s; coordinator will retry on next poll",
+                    circuit_path,
+                )
+
+        self.hass.async_create_task(_do_refresh())
 
     async def async_control_and_refresh(
         self,
@@ -1012,24 +1170,34 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                     cached_prog is None or time.time() - cached_prog[1] > self._program_cache_ttl
                 )
 
-                # Fetch live values (always) + programs (only if cache expired)
-                live_task = self.api.get_live_values(_plant_id, path, ctype)
-                if need_programs:
-                    prog_task = self.api.get_programs(_plant_id, path)
-                    results = await asyncio.gather(
-                        live_task,
-                        prog_task,
-                        return_exceptions=True,
-                    )
-                else:
-                    live_result = await asyncio.gather(
-                        live_task,
-                        return_exceptions=True,
-                    )
-                    results = [live_result[0], cached_prog[0]]
+                # Check circuit-settings (weather impact) cache. Only fetched for
+                # circuit types confirmed to support it (see SUPPORTS_WEATHER_IMPACT)
+                # so unsupported types never take an extra, likely-erroring round trip.
+                cached_settings = self._settings_cache.get(path)
+                need_settings = ctype in SUPPORTS_WEATHER_IMPACT and (
+                    cached_settings is None
+                    or time.time() - cached_settings[1] > self._settings_cache_ttl
+                )
 
-                if not isinstance(results[0], BaseException):
-                    lv_raw = results[0]
+                # Fetch live values (always) + programs/settings (only if their
+                # respective cache is stale). Tasks are gathered by name (not
+                # position) so adding/omitting any of them can't silently shift
+                # which result maps to which variable.
+                tasks: dict[str, Any] = {"live": self.api.get_live_values(_plant_id, path, ctype)}
+                if need_programs:
+                    tasks["programs"] = self.api.get_programs(_plant_id, path)
+                if need_settings:
+                    tasks["settings"] = self.api.get_circuit_settings(_plant_id, path)
+
+                gathered = await asyncio.gather(*tasks.values(), return_exceptions=True)
+                results: dict[str, Any] = dict(zip(tasks.keys(), gathered, strict=True))
+                if not need_programs:
+                    results["programs"] = cached_prog[0]
+                if not need_settings and cached_settings is not None:
+                    results["settings"] = cached_settings[0]
+
+                if not isinstance(results["live"], BaseException):
+                    lv_raw = results["live"]
                     # api.get_live_values() already normalises the paginated
                     # wrapper (Hoval May 2026 change) to a plain list. Keep one
                     # lightweight guard against any future shape regression so an
@@ -1052,9 +1220,9 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                     ch = self._connection_health.get_circuit_health(path)
                     ch.record_success(dt_util.utcnow())
                 else:
-                    _LOGGER.debug("Live values not available for %s: %s", path, results[0])
+                    _LOGGER.debug("Live values not available for %s: %s", path, results["live"])
                     ch = self._connection_health.get_circuit_health(path)
-                    ch.record_failure(dt_util.utcnow(), str(results[0]))
+                    ch.record_failure(dt_util.utcnow(), str(results["live"]))
 
                 # Propagate per-circuit reliability metrics into the data object so
                 # circuit-level sensors can read them without touching the coordinator.
@@ -1067,7 +1235,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 )
                 circuit_data.circuit_consecutive_failures = ch.consecutive_failures
 
-                programs = results[1]
+                programs = results.get("programs")
                 # Guard: only process programs when the API returned a proper dict.
                 # Non-programmable circuits (BL, operationMode=None) may return
                 # HTTP 204 → None or HTTP 200 with body [] after Hoval's May 2026
@@ -1104,6 +1272,50 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                         repr(programs),
                         type(programs).__name__,
                     )
+
+                # --- Weather-based control weighting (weatherImpact), HK only ---
+                if ctype in SUPPORTS_WEATHER_IMPACT:
+                    settings = results.get("settings")
+                    if isinstance(settings, dict):
+                        if need_settings:
+                            self._settings_cache[path] = (settings, time.time())
+                        weather_impact = settings.get("weatherImpact") or {}
+                        circuit_data.weather_impact_supported = True
+                        circuit_data.weather_impact_outside_temperature = weather_impact.get(
+                            "outsideTemperature"
+                        )
+                        circuit_data.weather_impact_solar_radiation = weather_impact.get(
+                            "solarRadiation"
+                        )
+                    elif isinstance(settings, BaseException):
+                        _LOGGER.debug("Circuit settings not available for %s: %s", path, settings)
+                        # Fall back to a still-fresh cached value (if any) rather
+                        # than flipping the number entities unavailable on a
+                        # single transient failure.
+                        if cached_settings is not None:
+                            weather_impact = cached_settings[0].get("weatherImpact") or {}
+                            circuit_data.weather_impact_supported = True
+                            circuit_data.weather_impact_outside_temperature = weather_impact.get(
+                                "outsideTemperature"
+                            )
+                            circuit_data.weather_impact_solar_radiation = weather_impact.get(
+                                "solarRadiation"
+                            )
+                    # else: settings is None (no cache and not fetched this cycle
+                    # for a type that supports it, e.g. first poll ordering edge
+                    # case) — leave weather_impact_supported at its False default.
+
+                    # An optimistic override from a very recent slider drag takes
+                    # priority over whatever the poll just fetched, so the UI
+                    # doesn't flicker back to a pre-update value while the cloud
+                    # is still settling the change.
+                    override = self.get_weather_impact_override(path)
+                    if override is not None:
+                        circuit_data.weather_impact_supported = True
+                        circuit_data.weather_impact_outside_temperature = override.get(
+                            "outsideTemperature"
+                        )
+                        circuit_data.weather_impact_solar_radiation = override.get("solarRadiation")
 
                 return circuit_data
 

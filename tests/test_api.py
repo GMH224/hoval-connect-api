@@ -593,6 +593,79 @@ class TestHovalConnectApiEndpoints:
         api = HovalConnectApi(MagicMock(), "test@example.com", "pass")
         api.invalidate_plant_token("nonexistent")  # Should not raise
 
+    @pytest.mark.asyncio
+    async def test_get_circuit_settings(self):
+        """get_circuit_settings GETs .../settings and returns the parsed body."""
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+        pat_resp = _make_response(200, {"token": "pat-123"})
+        session.get = MagicMock(return_value=pat_resp)
+
+        settings = {
+            "circuitName": "Bodenheizung",
+            "weatherImpact": {"outsideTemperature": 50, "solarRadiation": -5.0},
+        }
+        api_resp = _make_response(200, settings)
+        session.request = MagicMock(return_value=api_resp)
+
+        api = HovalConnectApi(session, "test@example.com", "pass")
+        result = await api.get_circuit_settings("plant-1", "1.1.0")
+
+        assert result == settings
+        call_args = session.request.call_args
+        assert call_args.args[0] == "GET"
+        assert call_args.args[1].endswith("/v3/plants/plant-1/circuits/1.1.0/settings")
+
+    @pytest.mark.asyncio
+    async def test_update_circuit_settings_sends_both_fields(self):
+        """update_circuit_settings PATCHes both weatherImpact keys, even if one is unchanged.
+
+        Regression guard: if only the changed key were sent, and the cloud's
+        PATCH handler is a full-object replace rather than a JSON-merge patch,
+        the untouched sibling field would be silently cleared to null.
+        """
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+        pat_resp = _make_response(200, {"token": "pat-123"})
+        session.get = MagicMock(return_value=pat_resp)
+
+        control_resp = _make_response(200, {"circuitName": "Bodenheizung"})
+        session.request = MagicMock(return_value=control_resp)
+
+        api = HovalConnectApi(session, "test@example.com", "pass")
+        await api.update_circuit_settings(
+            "plant-1", "1.1.0", outside_temperature=80, solar_radiation=-3.0
+        )
+
+        call_args = session.request.call_args
+        assert call_args.args[0] == "PATCH"
+        assert call_args.args[1].endswith("/v3/plants/plant-1/circuits/1.1.0/settings")
+        body = call_args.kwargs["json"]
+        assert body == {"weatherImpact": {"outsideTemperature": 80, "solarRadiation": -3.0}}
+
+    @pytest.mark.asyncio
+    async def test_update_circuit_settings_allows_null_field(self):
+        """A field explicitly passed as None is sent as null (caller's responsibility to resolve)."""
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+        pat_resp = _make_response(200, {"token": "pat-123"})
+        session.get = MagicMock(return_value=pat_resp)
+
+        control_resp = _make_response(204)
+        session.request = MagicMock(return_value=control_resp)
+
+        api = HovalConnectApi(session, "test@example.com", "pass")
+        result = await api.update_circuit_settings(
+            "plant-1", "1.1.0", outside_temperature=None, solar_radiation=-2.0
+        )
+
+        assert result is None  # 204 returns None
+        body = session.request.call_args.kwargs["json"]
+        assert body == {"weatherImpact": {"outsideTemperature": None, "solarRadiation": -2.0}}
+
 
 # ---------------------------------------------------------------------------
 # Retry constants

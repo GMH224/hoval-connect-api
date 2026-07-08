@@ -29,6 +29,7 @@ The integration lives in `custom_components/hoval_connect/`. User setup is email
 - `climate.py` — HK heating: target temp, HVAC modes (heat/auto/off)
 - `fan.py` — HV ventilation: speed slider 0–100%, on/off (standby ↔ temporary-change), debounced 1.5s
 - `select.py` — Program selection (week1/week2/ecoMode/standby/constant) with user-defined names; applies to HV, HK, **and WW** circuits
+- `number.py` — Weather-based control Eco↔Comfort weighting sliders for HK circuits (`weatherImpact.outsideTemperature` 0–100, `weatherImpact.solarRadiation` −10–0); debounced 1.5s like `fan.py`; reads/writes via `HovalDataCoordinator.async_set_weather_impact()`
 - `sensor.py` — Circuit-type-filtered sensors (HV/HK/BL/WW) + 6 plant-level sensors (events, weather); includes `circuit_status` diagnostic sensor for BL, HK, and WW (sourced from `HovalCircuitData.circuit_status`, populated from `CircuitV3DTO.circuitStatus` in the circuit list response)
 - `water_heater.py` — WW hot water entity (`WaterHeaterEntity`); exposes current/target temperature and operation modes heat_pump / high_demand / off; `set_temperature` posts a `midnight`-duration temporary-change override; `set_operation_mode` switches between week-program and standby; registers the `reset_ww_boost` entity service via `async_get_current_platform()` → `async_register_entity_service`, which calls `async_reset_temporary_change` (DELETEs the temporary-change endpoint without touching the week program)
 - `binary_sensor.py` — Plant online status + error/warning status
@@ -88,6 +89,7 @@ python examples/hoval_client.py <email> <password>
 - `/api/` endpoints need only the id_token (`Authorization: Bearer`)
 - `/v1/plants/`, `/v2/api/`, `/v3/` endpoints also require `X-Plant-Access-Token`
 - `/business/` endpoints require elevated (partner) access — regular users get 403
+- `/v3/plants/{id}/circuits/{path}/settings` (GET/PATCH) — `CircuitSettingsDTO`: `circuitName` + `weatherImpact: {outsideTemperature: int 0..100, solarRadiation: double -10..0}`. This is the "weather based control" Eco↔Comfort weighting added to the app in 2026-07 (see `docs/reverse-engineering-2026-05-23.md` for the app-screenshot walkthrough). The PATCH handler's merge semantics are **not confirmed** — always send both `weatherImpact` sub-fields (see `api.update_circuit_settings` and `coordinator.resolve_weather_impact_update`), never just the one being changed. Only confirmed present on HK circuits (`SUPPORTS_WEATHER_IMPACT` in `const.py`); other circuit types are not queried for it.
 
 ## Circuit Types
 
@@ -130,6 +132,100 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 - HK climate entity: `set_temperature` sends value as integer — may need adjustment for different HK circuit models (some use tenths of degree)
 
 ## Changelog
+
+### v0.21.0 — Weather based control (Eco↔Comfort weighting sliders)
+
+Adds the two "Weather based control" sliders that Hoval added to the Connect
+app in 2026-07 (by outside temperature, by solar radiation) as HA `number`
+entities. New feature; no behavioural change to existing platforms. 141 tests
+pass (22 new); `ruff check`/`ruff format --check` clean; coverage 30.70%
+(gate: 30%).
+
+#### New: `number.py` platform
+- Two `NumberEntity` entities per **HK** heating circuit (`SUPPORTS_WEATHER_IMPACT`
+  in `const.py` — not confirmed for other circuit types, so they aren't queried):
+  - `weather_impact_outside_temperature` — slider, 0–100, step 1
+  - `weather_impact_solar_radiation` — slider, −10–0, step 1
+  Both are `EntityCategory.CONFIG` (hidden from the default dashboard, like
+  the polling-interval option). The API's documented min is the app's "Eco"
+  end and max is "Comfort", for both fields — a plain min→max HA slider
+  reproduces the app control with no extra UI-side rescaling.
+- Debounced 1.5s (`DEBOUNCE_SECONDS`, same pattern/value as `fan.py`'s speed
+  slider) so dragging doesn't fire a request per intermediate value.
+- `native_value` / `available` consult a coordinator-level optimistic override
+  directly (`get_weather_impact_override()`) rather than only relying on the
+  next poll to fold it into `HovalCircuitData` — this was caught during
+  self-review before release: without it, a successful write would flicker
+  back to the pre-update value for ~2s until the background refresh landed.
+
+#### `api.py`
+- `get_circuit_settings(plant_id, circuit_path)` — `GET .../circuits/{path}/settings`.
+- `update_circuit_settings(plant_id, circuit_path, *, outside_temperature, solar_radiation)`
+  — `PATCH .../circuits/{path}/settings`. **Always sends both `weatherImpact`
+  sub-fields**, even when only one changed — the cloud's PATCH merge semantics
+  for this nested object are unconfirmed, and sending a single field risks a
+  full-object-replace clobbering the untouched sibling to `null`. Callers
+  (the coordinator) are responsible for resolving the "current" value of the
+  untouched field before calling this.
+
+#### `coordinator.py`
+- `HovalCircuitData` gains `weather_impact_supported: bool`,
+  `weather_impact_outside_temperature: int | None`,
+  `weather_impact_solar_radiation: float | None`. `weather_impact_supported`
+  is a separate flag from "value is not None" — it distinguishes "queried and
+  the API reported this field as null" from "never queried" (e.g. a non-HK
+  circuit, or the very first poll ordering edge case), which the number
+  entities use for `available` instead of guessing from a `None` value alone.
+- New settings cache (`_settings_cache`, `CIRCUIT_SETTINGS_CACHE_TTL` = 10 min
+  in `const.py`) — same rationale as the existing program cache: this is
+  configuration a user drags a slider to change, not telemetry, so re-fetching
+  it every 60s poll would be wasted round-trips.
+- `_fetch_circuit`'s live-values/programs task gathering was refactored from
+  positional list indices (`results[0]`, `results[1]`) to a name-keyed dict
+  (`results["live"]`, `results["programs"]`, `results["settings"]`) so adding
+  the new settings fetch couldn't silently shift an existing index — this
+  was a deliberate safety refactor, not just an addition.
+- New `resolve_weather_impact_update()` pure function — resolves the full
+  `(outsideTemperature, solarRadiation)` pair from "what changed" + "what's
+  currently known", clamping any provided value into its API band via the new
+  `const.py` helpers `clamp_weather_impact_outside_temperature()` /
+  `clamp_weather_impact_solar_radiation()` (same pattern as the existing
+  `clamp_hv_air_volume()`). Directly unit-tested (no HA mocks needed).
+- New `HovalDataCoordinator.async_set_weather_impact()` — mirrors
+  `async_control_and_refresh()`'s lock + optimistic-state + fire-and-forget
+  background-refresh architecture, generalized for an arbitrary field-value
+  pair rather than a single `activeProgram` mode string. Resolves "current"
+  values in priority order: fresh optimistic override → settings cache →
+  last-polled `HovalCircuitData` → `None`. New
+  `get_weather_impact_override()` mirrors `get_mode_override()`, including
+  the same `_MODE_OVERRIDE_TTL_S` staleness bound (reused, not duplicated).
+
+#### `__init__.py` / `strings.json` / `translations/en.json`
+- `Platform.NUMBER` added to `PLATFORMS`.
+- Translation entries added for both new entities (`entity.number.*`), kept in
+  sync between `strings.json` and `translations/en.json` as this project
+  requires.
+
+#### Tests
+- `tests/test_api.py` — `get_circuit_settings`, and two `update_circuit_settings`
+  cases: normal write, and the explicit-`None` passthrough (documenting that
+  resolving `None` → "send null" vs. → "send current value" is the caller's
+  job, not `api.py`'s).
+- `tests/test_coordinator.py` — `clamp_weather_impact_outside_temperature` /
+  `clamp_weather_impact_solar_radiation` (mirroring `TestClampHvAirVolume`),
+  `CIRCUIT_SETTINGS_CACHE_TTL` + `SUPPORTS_WEATHER_IMPACT` sanity checks, and
+  a dedicated `TestResolveWeatherImpactUpdate` class covering: only-outside
+  changed, only-solar changed, neither changed, both changed, no-current-value,
+  and out-of-band clamping for each field.
+
+#### Known limitation
+- Not empirically verified against a live plant yet (no test account with an
+  HK circuit was available while implementing this) — the endpoint path,
+  request/response shapes, and value bounds all come from
+  `docs/openapi-v3.json` (Hoval's own OpenAPI spec) and the app screenshot,
+  not a captured live request. If the cloud rejects the PATCH shape or uses
+  different bounds/merge semantics in practice, `api.py`'s two methods and
+  `const.py`'s bounds are the only places that should need correcting.
 
 ### v0.19.0 — Config fix + polling/efficiency optimizations
 
