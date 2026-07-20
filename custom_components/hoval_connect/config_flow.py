@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -26,6 +27,13 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Outer bound on credential validation (audit finding F3, v0.21.1). The API
+# client's per-request timeouts do not bound the get_plants() pagination loop
+# as a whole, and unlike the coordinator (90 s asyncio.timeout) the config
+# flow previously had no outer guard at all — a byte-dripping or
+# endlessly-paginating server could hang the setup dialog indefinitely.
+_VALIDATION_TIMEOUT_S = 30
 
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
@@ -54,7 +62,11 @@ class HovalConnectConfigFlow(ConfigFlow, domain=DOMAIN):
             api = HovalConnectApi(session, user_input["email"], user_input["password"])
 
             try:
-                await api.get_plants()
+                async with asyncio.timeout(_VALIDATION_TIMEOUT_S):
+                    await api.get_plants()
+            except TimeoutError:
+                _LOGGER.warning("Hoval validation timed out after %d s", _VALIDATION_TIMEOUT_S)
+                errors["base"] = "cannot_connect"
             except HovalAuthError as err:
                 _LOGGER.warning("Hoval auth failed: %s", err)
                 errors["base"] = "invalid_auth"
@@ -100,7 +112,14 @@ class HovalConnectConfigFlow(ConfigFlow, domain=DOMAIN):
                 api = HovalConnectApi(session, user_input["email"], user_input["password"])
 
                 try:
-                    await api.get_plants()
+                    async with asyncio.timeout(_VALIDATION_TIMEOUT_S):
+                        await api.get_plants()
+                except TimeoutError:
+                    _LOGGER.warning(
+                        "Hoval reauth validation timed out after %d s",
+                        _VALIDATION_TIMEOUT_S,
+                    )
+                    errors["base"] = "cannot_connect"
                 except HovalAuthError:
                     errors["base"] = "invalid_auth"
                 except HovalApiError:

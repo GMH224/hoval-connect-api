@@ -223,10 +223,27 @@ class HovalWeatherImpactNumber(CoordinatorEntity[HovalDataCoordinator], NumberEn
             self.async_write_ha_state()
 
     async def _debounced_set(self, value: float) -> None:
-        """Wait for debounce period, then send the latest value."""
+        """Wait for debounce period, then send the latest value.
+
+        Runs as a fire-and-forget task, so an exception raised here would only
+        reach the event loop's unhandled-task logger — invisible to the user
+        (audit finding F5, v0.21.1). Failed writes are logged at WARNING;
+        _send_value's finally block already rewrites state so the slider
+        visibly reverts to the last confirmed value.
+        """
         await asyncio.sleep(DEBOUNCE_SECONDS)
         _LOGGER.debug("Debounce complete, sending %s=%s", self.entity_description.key, value)
-        await self._send_value(value)
+        try:
+            await self._send_value(value)
+        except HomeAssistantError as err:
+            _LOGGER.warning(
+                "Setting %s to %s failed for circuit %s: %s — "
+                "the slider will revert to the device's actual value",
+                self.entity_description.key,
+                value,
+                self._circuit_path,
+                err,
+            )
 
     async def async_set_native_value(self, value: float) -> None:
         """Set the weighting value (debounced)."""

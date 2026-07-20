@@ -133,6 +133,48 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
+### v0.21.1 — ICS-style audit hardening (F1–F9)
+
+Hardening-only release from a full code audit; complete report in
+`docs/audit-v0.21.1.md`. Key changes for future work in this repo:
+
+- **F1**: `_resolve_active_program_value()` is now fully defensive at every
+  nested level (day config missing `id`, week entry non-dict, phase missing
+  `start`/`end`, non-numeric times → skip/degrade, never raise). The call
+  site in `_fetch_circuit` additionally wraps program processing in
+  try/except so *no* parsing exception can drop a circuit via
+  `gather(return_exceptions=True)` again. If you touch program parsing, keep
+  both layers.
+- **F2**: `get_events()`/`get_latest_event()` normalise the May-2026
+  pagination wrapper like every other list endpoint; the coordinator's
+  events block is isolation-wrapped (falls back to cached events) because it
+  runs outside per-circuit exception isolation. `_parse_event()` accepts any
+  payload type.
+- **F3**: `get_plants()` pagination is capped at `_MAX_PLANT_PAGES = 50`;
+  config-flow validation (user + reauth) runs inside
+  `asyncio.timeout(_VALIDATION_TIMEOUT_S)` — the flow previously had NO
+  outer bound (unlike the coordinator's 90 s).
+- **F4**: weather-impact overrides are TTL-only by design (never
+  poll-cleared); comments now say so. Do not "fix" this by clearing them in
+  `_fetch_all_data` — settings are cache-tiered, a poll doesn't re-fetch
+  them, and clearing would introduce a mid-poll write race.
+- **F5**: `_debounced_set` in fan.py/number.py catches `HomeAssistantError`,
+  logs WARNING, rewrites state. Background control tasks must never fail
+  silently.
+- **F9**: `HovalConnectionHealth` mutation goes through
+  `record_poll_attempt()` / `record_poll_success()` / `record_error()`
+  (public, renamed from `_record_error`). Don't touch its private deques
+  from the coordinator.
+- **Tests**: `tests/conftest.py` now installs minimal REAL stubs for
+  `DataUpdateCoordinator`, the HA exceptions, dispatcher, and `util.dt` —
+  MagicMock cannot be used for anything the integration subclasses or
+  raises. This is what makes `tests/test_coordinator_fetch.py` (28
+  behavioural tests for `_fetch_all_data`/`_async_update_data`) possible.
+  Never re-add module-level `sys.modules[...] = mock` hard assignments in
+  test files (import-order bug removed in this release); use the conftest.
+- 191 tests, coverage 44 % (coordinator 85 %, api 85 %), gate raised to 40.
+  CI test step now installs `voluptuous`.
+
 ### v0.21.0 — Weather based control (Eco↔Comfort weighting sliders)
 
 Adds the two "Weather based control" sliders that Hoval added to the Connect

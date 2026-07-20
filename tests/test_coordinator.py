@@ -1,31 +1,16 @@
 """Tests for the Hoval Connect coordinator logic (pure functions).
 
-These tests cover the pure utility functions that don't depend on Home Assistant.
-They can be run without homeassistant installed by using sys.path manipulation.
+These tests cover the pure utility functions that don't depend on Home
+Assistant. The ``homeassistant.*`` namespace is stubbed centrally in
+conftest.py — v0.21.1 removed this module's legacy per-module shim, which
+HARD-overwrote ``sys.modules`` (not setdefault) and therefore replaced the
+real exception stubs the coordinator-core tests rely on, making test results
+depend on module import order.
 """
 
 from __future__ import annotations
 
-import sys
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
-
-# Mock homeassistant modules so we can import the coordinator's pure functions
-ha_mock = MagicMock()
-sys.modules["homeassistant"] = ha_mock
-sys.modules["homeassistant.config_entries"] = ha_mock
-sys.modules["homeassistant.const"] = ha_mock
-sys.modules["homeassistant.core"] = ha_mock
-sys.modules["homeassistant.exceptions"] = ha_mock
-sys.modules["homeassistant.helpers"] = ha_mock
-sys.modules["homeassistant.helpers.update_coordinator"] = ha_mock
-sys.modules["homeassistant.helpers.aiohttp_client"] = ha_mock
-sys.modules["homeassistant.helpers.device_registry"] = ha_mock
-sys.modules["homeassistant.helpers.dispatcher"] = ha_mock
-sys.modules["homeassistant.util"] = ha_mock
-sys.modules["homeassistant.util.dt"] = ha_mock
-sys.modules["aiohttp"] = ha_mock
-sys.modules["voluptuous"] = ha_mock
 
 from custom_components.hoval_connect.coordinator import (  # noqa: E402
     _V1_PROGRAM_MAP,
@@ -447,7 +432,7 @@ class TestHovalConnectionHealth:
     def test_record_error_increments_all_counters(self):
         h = HovalConnectionHealth()
         ts = datetime.now(UTC)
-        h._record_error(ts, "timeout", "Poll timeout after 90 s")
+        h.record_error(ts, "timeout", "Poll timeout after 90 s")
         assert h.consecutive_failures == 1
         assert h.total_failures == 1
         assert h.auth_failures == 0
@@ -457,15 +442,15 @@ class TestHovalConnectionHealth:
 
     def test_record_error_auth_flag(self):
         h = HovalConnectionHealth()
-        h._record_error(datetime.now(UTC), "auth", "Bad token", is_auth=True)
+        h.record_error(datetime.now(UTC), "auth", "Bad token", is_auth=True)
         assert h.auth_failures == 1
 
     def test_error_counts_accumulate(self):
         h = HovalConnectionHealth()
         ts = datetime.now(UTC)
-        h._record_error(ts, "timeout", "t")
-        h._record_error(ts, "timeout", "t")
-        h._record_error(ts, "api", "a")
+        h.record_error(ts, "timeout", "t")
+        h.record_error(ts, "timeout", "t")
+        h.record_error(ts, "api", "a")
         assert h.error_counts == {"timeout": 2, "api": 1}
 
     def test_circuit_health_lazy_creation(self):
@@ -760,3 +745,189 @@ class TestHovalCircuitDataWeatherImpactDefaults:
         assert circuit.weather_impact_supported is False
         assert circuit.weather_impact_outside_temperature is None
         assert circuit.weather_impact_solar_radiation is None
+
+
+# ---------------------------------------------------------------------------
+# _resolve_active_program_value — schema-drift robustness (v0.21.1, audit F1)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveActiveProgramRobustness:
+    """Nested schema drift must degrade to None fields, never raise.
+
+    Each case below crashed before v0.21.1 (KeyError/AttributeError inside
+    _fetch_circuit → gather(return_exceptions=True) silently discarded the
+    whole circuit, including its already-fetched live values).
+    """
+
+    NOW = datetime(2026, 7, 20, 10, 0)  # a Monday
+
+    def test_day_config_missing_id(self):
+        programs = {
+            "dayPrograms": {"dayConfigurations": [{"name": "no-id"}]},
+            "week1": {"name": "W1", "dayProgramIds": [1]},
+        }
+        # Config unusable → week resolves, day/value do not.
+        assert _resolve_active_program_value(programs, self.NOW) == ("W1", None, None)
+
+    def test_week_entry_is_a_list(self):
+        programs = {
+            "dayPrograms": {"dayConfigurations": [{"id": 1, "name": "x", "phases": []}]},
+            "week1": ["oops"],
+        }
+        assert _resolve_active_program_value(programs, self.NOW) == (None, None, None)
+
+    def test_week_entry_missing(self):
+        programs = {
+            "dayPrograms": {"dayConfigurations": [{"id": 1, "name": "x", "phases": []}]},
+        }
+        assert _resolve_active_program_value(programs, self.NOW) == (None, None, None)
+
+    def test_day_program_ids_not_a_list(self):
+        programs = {
+            "dayPrograms": {"dayConfigurations": [{"id": 1, "name": "x", "phases": []}]},
+            "week1": {"name": "W1", "dayProgramIds": "1,2,3"},
+        }
+        assert _resolve_active_program_value(programs, self.NOW) == ("W1", None, None)
+
+    def test_phase_missing_start(self):
+        programs = {
+            "dayPrograms": {
+                "dayConfigurations": [{"id": 1, "name": "Day", "phases": [{"value": 40}]}]
+            },
+            "week1": {"name": "W1", "dayProgramIds": [1] * 7},
+        }
+        assert _resolve_active_program_value(programs, self.NOW) == ("W1", "Day", None)
+
+    def test_phase_not_a_dict(self):
+        programs = {
+            "dayPrograms": {"dayConfigurations": [{"id": 1, "name": "Day", "phases": ["oops"]}]},
+            "week1": {"name": "W1", "dayProgramIds": [1] * 7},
+        }
+        assert _resolve_active_program_value(programs, self.NOW) == ("W1", "Day", None)
+
+    def test_phases_not_a_list(self):
+        programs = {
+            "dayPrograms": {"dayConfigurations": [{"id": 1, "name": "Day", "phases": {"bad": 1}}]},
+            "week1": {"name": "W1", "dayProgramIds": [1] * 7},
+        }
+        assert _resolve_active_program_value(programs, self.NOW) == ("W1", "Day", None)
+
+    def test_phase_time_values_not_numeric(self):
+        programs = {
+            "dayPrograms": {
+                "dayConfigurations": [
+                    {
+                        "id": 1,
+                        "name": "Day",
+                        "phases": [
+                            {
+                                "start": {"hours": "x", "minutes": 0},
+                                "end": {"hours": 22, "minutes": 0},
+                                "value": 60,
+                            }
+                        ],
+                    }
+                ]
+            },
+            "week1": {"name": "W1", "dayProgramIds": [1] * 7},
+        }
+        assert _resolve_active_program_value(programs, self.NOW) == ("W1", "Day", None)
+
+    def test_day_configurations_not_a_list(self):
+        programs = {
+            "dayPrograms": {"dayConfigurations": {"bad": "shape"}},
+            "week1": {"name": "W1", "dayProgramIds": [1]},
+        }
+        assert _resolve_active_program_value(programs, self.NOW) == (None, None, None)
+
+    def test_day_config_entry_not_a_dict(self):
+        programs = {
+            "dayPrograms": {"dayConfigurations": ["oops", 42]},
+            "week1": {"name": "W1", "dayProgramIds": [1]},
+        }
+        assert _resolve_active_program_value(programs, self.NOW) == ("W1", None, None)
+
+    def test_day_programs_not_a_dict(self):
+        programs = {"dayPrograms": ["oops"], "week1": {"name": "W1"}}
+        assert _resolve_active_program_value(programs, self.NOW) == (None, None, None)
+
+    def test_mixed_valid_and_invalid_day_configs(self):
+        """Valid configs are still resolved when malformed siblings exist."""
+        programs = {
+            "dayPrograms": {
+                "dayConfigurations": [
+                    {"name": "no-id"},
+                    {
+                        "id": 1,
+                        "name": "Good",
+                        "phases": [
+                            {
+                                "start": {"hours": 6, "minutes": 0},
+                                "end": {"hours": 22, "minutes": 0},
+                                "value": 55,
+                            }
+                        ],
+                    },
+                ]
+            },
+            "week1": {"name": "W1", "dayProgramIds": [1] * 7},
+        }
+        assert _resolve_active_program_value(programs, self.NOW) == ("W1", "Good", 55)
+
+
+# ---------------------------------------------------------------------------
+# _parse_event — non-dict guard (v0.21.1, audit F2)
+# ---------------------------------------------------------------------------
+
+
+class TestParseEventGuard:
+    def test_non_dict_returns_empty_event(self):
+        for weird in ("string", 42, ["list"], None, 3.14):
+            ev = _parse_event(weird)
+            assert ev.event_type is None
+            assert ev.description is None
+            # And an empty event never flags a plant error:
+            assert _is_problem_event(ev) is False
+
+
+# ---------------------------------------------------------------------------
+# HovalConnectionHealth — public poll-recording API (v0.21.1, audit F9)
+# ---------------------------------------------------------------------------
+
+
+class TestConnectionHealthPollRecording:
+    def test_attempt_then_success(self):
+        h = HovalConnectionHealth()
+        ts = datetime.now(UTC)
+        h.record_poll_attempt(ts)
+        h.record_poll_success(ts, 123.0)
+        assert h.total_polls == 1
+        assert h.total_failures == 0
+        assert h.consecutive_failures == 0
+        assert h.poll_latency_ms == 123.0
+        assert h.ema_latency_ms == 123.0
+        assert h.failure_rate_1h == 0.0
+        assert h.availability_1h == 100.0
+        assert h.last_success == ts
+
+    def test_attempt_then_error(self):
+        h = HovalConnectionHealth()
+        ts = datetime.now(UTC)
+        h.record_poll_attempt(ts)
+        h.record_error(ts, "api", "boom")
+        assert h.total_polls == 1
+        assert h.total_failures == 1
+        assert h.consecutive_failures == 1
+        assert h.failure_rate_1h == 100.0
+
+    def test_success_resets_consecutive_failures(self):
+        h = HovalConnectionHealth()
+        ts = datetime.now(UTC)
+        h.record_poll_attempt(ts)
+        h.record_error(ts, "timeout", "t")
+        h.record_poll_attempt(ts)
+        h.record_poll_success(ts, 90.0)
+        assert h.consecutive_failures == 0
+        assert h.total_failures == 1
+        assert h.failure_rate_1h == 50.0

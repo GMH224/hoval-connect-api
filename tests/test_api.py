@@ -693,8 +693,18 @@ class TestRetryConstants:
 # ---------------------------------------------------------------------------
 
 
-class TestCodeInvariants:
-    """Text-based checks that key v0.17.0 code invariants hold."""
+class TestSourceContracts:
+    """Source-text contract checks for code that cannot be imported here.
+
+    The entity platforms (climate.py, sensor.py) import
+    homeassistant.components.*, which this HA-free suite does not stub, so
+    their field-name contracts are asserted against the source text instead.
+    These are regression tripwires, not behavioral tests — they exist only
+    where behavioral testing is impossible without a full HA test harness
+    (pytest-homeassistant-custom-component; see docs/audit-v0.21.1.md,
+    "Residual risks"). Guard-pattern greps that COULD be tested behaviorally
+    were replaced with real behavioral tests in v0.21.1 (audit item 6).
+    """
 
     def _read(self, filename: str) -> str:
         import os
@@ -702,22 +712,6 @@ class TestCodeInvariants:
         base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(base, "custom_components", "hoval_connect", filename)) as f:
             return f.read()
-
-    def test_programs_guard_uses_isinstance_dict(self):
-        """Coordinator programs block must use isinstance(programs, dict), not 'is not None'."""
-        src = self._read("coordinator.py")
-        assert "if isinstance(programs, dict):" in src
-        assert "programs is not None and not isinstance" not in src
-
-    def test_resolve_guard_uses_not_isinstance_dict(self):
-        """_resolve_active_program_value must guard against any non-dict."""
-        src = self._read("coordinator.py")
-        assert "if not isinstance(programs, dict):" in src
-
-    def test_lv_raw_type_guard_present(self):
-        """Live-values block must guard against non-list lv_raw."""
-        src = self._read("coordinator.py")
-        assert "if not isinstance(lv_raw, list):" in src
 
     def test_climate_uses_room_temp_actual_field(self):
         """climate.py must use 'roomTempActual' not the old 'actualTemperature' key."""
@@ -746,13 +740,6 @@ class TestCodeInvariants:
         assert block is not None, "room_temp_actual descriptor not found"
         assert "CIRCUIT_TYPE_HK" in block.group(1)
         assert "CIRCUIT_TYPE_BL" not in block.group(1)
-
-    def test_restore_from_store_uses_try_except(self):
-        """restore_from_store must wrap int() in try/except to handle corrupt data."""
-        src = self._read("coordinator.py")
-        # Both HovalCircuitHealth and HovalConnectionHealth swallow corrupt
-        # values resiliently, using contextlib.suppress (ruff-preferred form).
-        assert src.count("contextlib.suppress(TypeError, ValueError)") >= 2
 
     def test_bl_still_in_non_selectable_types(self):
         """BL must remain in the non-selectable types so selectable=False doesn't exclude it."""
@@ -788,3 +775,119 @@ class TestScanIntervalSchema:
     def test_unknown_value_rejected(self):
         with pytest.raises(vol.Invalid):
             self._validator()({"scan_interval": "45"})
+
+
+# ---------------------------------------------------------------------------
+# Event endpoints — shape normalisation (v0.21.1, audit finding F2)
+# ---------------------------------------------------------------------------
+
+
+class TestEventEndpointNormalisation:
+    """get_events/get_latest_event must normalise shape drift in the client.
+
+    Before v0.21.1 these were the only list-shaped endpoints without wrapper
+    handling; a paginated response reached list slicing in the coordinator's
+    plant loop (outside per-circuit exception isolation) and failed the whole
+    poll.
+    """
+
+    def _api_with_response(self, json_data) -> HovalConnectApi:
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+        pat_resp = _make_response(200, {"token": "pat-123"})
+        session.get = MagicMock(return_value=pat_resp)
+        api_resp = _make_response(200, json_data)
+        session.request = MagicMock(return_value=api_resp)
+        return HovalConnectApi(session, "test@example.com", "pass")
+
+    @pytest.mark.asyncio
+    async def test_get_events_plain_list(self):
+        events = [{"eventType": "warning"}, {"eventType": "info"}]
+        api = self._api_with_response(events)
+        assert await api.get_events("p1") == events
+
+    @pytest.mark.asyncio
+    async def test_get_events_paginated_wrapper(self):
+        events = [{"eventType": "warning"}]
+        api = self._api_with_response({"content": events, "last": True})
+        assert await api.get_events("p1") == events
+
+    @pytest.mark.asyncio
+    async def test_get_events_wrapper_with_non_list_content(self):
+        api = self._api_with_response({"content": "garbage"})
+        assert await api.get_events("p1") == []
+
+    @pytest.mark.asyncio
+    async def test_get_events_non_list_returns_empty(self):
+        api = self._api_with_response("garbage")
+        assert await api.get_events("p1") == []
+
+    @pytest.mark.asyncio
+    async def test_get_latest_event_plain_dict_passthrough(self):
+        event = {"eventType": "blocking", "description": "Fault"}
+        api = self._api_with_response(event)
+        assert await api.get_latest_event("p1") == event
+
+    @pytest.mark.asyncio
+    async def test_get_latest_event_wrapper_takes_first_element(self):
+        event = {"eventType": "warning"}
+        api = self._api_with_response({"content": [event, {"eventType": "info"}]})
+        assert await api.get_latest_event("p1") == event
+
+    @pytest.mark.asyncio
+    async def test_get_latest_event_wrapper_empty_content(self):
+        api = self._api_with_response({"content": []})
+        assert await api.get_latest_event("p1") == {}
+
+    @pytest.mark.asyncio
+    async def test_get_latest_event_non_dict_returns_empty(self):
+        api = self._api_with_response(["not", "a", "dict"])
+        assert await api.get_latest_event("p1") == {}
+
+
+# ---------------------------------------------------------------------------
+# get_plants pagination cap (v0.21.1, audit finding F3)
+# ---------------------------------------------------------------------------
+
+
+class TestGetPlantsPageCap:
+    """A server that never reports last=True must not loop forever."""
+
+    @pytest.mark.asyncio
+    async def test_endless_pagination_is_truncated(self):
+        from custom_components.hoval_connect.api import _MAX_PLANT_PAGES
+
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+
+        counter = {"n": 0}
+
+        def _endless_page(*_args, **_kwargs):
+            n = counter["n"]
+            counter["n"] += 1
+            return _make_response(200, {"content": [{"plantExternalId": f"p{n}"}], "last": False})
+
+        session.request = MagicMock(side_effect=_endless_page)
+
+        api = HovalConnectApi(session, "test@example.com", "pass")
+        result = await api.get_plants()
+
+        # One plant per page, capped at _MAX_PLANT_PAGES pages/requests.
+        assert len(result) == _MAX_PLANT_PAGES
+        assert session.request.call_count == _MAX_PLANT_PAGES
+
+    @pytest.mark.asyncio
+    async def test_cap_does_not_affect_normal_pagination(self):
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+        resp0 = _make_response(200, {"content": [{"plantExternalId": "p0"}], "last": False})
+        resp1 = _make_response(200, {"content": [{"plantExternalId": "p1"}], "last": True})
+        session.request = MagicMock(side_effect=[resp0, resp1])
+
+        api = HovalConnectApi(session, "test@example.com", "pass")
+        result = await api.get_plants()
+        assert [p["plantExternalId"] for p in result] == ["p0", "p1"]
+        assert session.request.call_count == 2

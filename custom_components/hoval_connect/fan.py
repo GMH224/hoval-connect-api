@@ -188,10 +188,28 @@ class HovalFan(CoordinatorEntity[HovalDataCoordinator], FanEntity):
             raise HomeAssistantError(f"Failed to set fan speed: {err}") from err
 
     async def _debounced_set(self, percentage: int) -> None:
-        """Wait for debounce period, then send the latest percentage."""
+        """Wait for debounce period, then send the latest percentage.
+
+        Runs as a fire-and-forget task, so an exception raised here would only
+        reach the event loop's unhandled-task logger — invisible to the user
+        (audit finding F5, v0.21.1). A failed actuation on a control path must
+        be observable: log it at WARNING and rewrite entity state so the slider
+        visibly reverts instead of silently showing a value the device never
+        accepted.
+        """
         await asyncio.sleep(DEBOUNCE_SECONDS)
         _LOGGER.debug("Debounce complete, sending %d%%", percentage)
-        await self._send_percentage(percentage)
+        try:
+            await self._send_percentage(percentage)
+        except HomeAssistantError as err:
+            _LOGGER.warning(
+                "Setting fan speed to %d%% failed for circuit %s: %s — "
+                "the slider will revert to the device's actual value",
+                percentage,
+                self._circuit_path,
+                err,
+            )
+            self.async_write_ha_state()
 
     async def async_set_percentage(self, percentage: int) -> None:
         """Set the speed percentage of the fan (debounced)."""

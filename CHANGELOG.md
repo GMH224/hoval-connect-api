@@ -4,6 +4,101 @@ All notable changes to the `hoval_connect` integration are documented here.
 This project follows a loose [Semantic Versioning](https://semver.org/) scheme
 while pre-1.0 (minor = behavioural/feature change, patch = internal fix).
 
+## [0.21.1] - 2026-07-20
+
+Hardening release from a full ICS-style code audit (findings F1–F9; the
+complete report with reproduction evidence, severity ratings, and residual
+risks is in `docs/audit-v0.21.1.md`). No new features, no config changes, no
+entity changes. Restart Home Assistant after updating.
+
+### Fixed
+- **F1 — Schema-drift crash paths in program resolution** (`coordinator.py`):
+  `_resolve_active_program_value()` raised on plausible nested API drift (a
+  day configuration missing `id`, a `week1`/`week2` entry that isn't a dict,
+  a phase missing `start`/`end`, non-numeric phase times). Because the
+  exception escaped `_fetch_circuit` inside `gather(return_exceptions=True)`,
+  the **whole circuit — including already-fetched live values — was silently
+  dropped** for that poll, with only a debug log. The resolver is now fully
+  defensive (every nested level type-checked, malformed entries skipped), and
+  the call site carries a second isolation barrier so any residual parsing
+  exception degrades program *fields* only, logged at WARNING.
+- **F2 — Events path not hardened against response-shape drift**
+  (`api.py`, `coordinator.py`): `get_events()`/`get_latest_event()` were the
+  only list-shaped endpoints without the May-2026 pagination-wrapper
+  normalisation that `get_circuits()`/`get_live_values()`/`get_plants()`
+  already had. A wrapped events response reached list slicing in the plant
+  loop — *outside* per-circuit exception isolation — and **failed the entire
+  poll** (every entity unavailable, `ERROR_TYPE_UNKNOWN`). Both endpoints now
+  normalise the wrapper in the client; `_parse_event()` tolerates non-dict
+  payloads; the coordinator's events block gained isinstance guards plus a
+  try/except that falls back to cached events; the weather block validates
+  its first forecast element.
+- **F3 — Unbounded pagination / unbounded config-flow validation**
+  (`api.py`, `config_flow.py`): `get_plants()` looped for as long as the
+  server reported `"last": false`; a misbehaving upstream could loop forever
+  with unbounded memory growth. Now capped at `_MAX_PLANT_PAGES` (50 pages =
+  600 plants) with a WARNING on truncation. The config-flow credential
+  validation (setup **and** reauth) — which unlike the coordinator had no
+  outer timeout at all — is now bounded by a 30 s `asyncio.timeout`, mapped
+  to the existing `cannot_connect` error.
+- **F5 — Silent failure of debounced slider writes** (`fan.py`,
+  `number.py`): the debounced fan-speed and weather-impact writes run as
+  fire-and-forget tasks, so their `HomeAssistantError` never reached the UI —
+  a failed actuation was only visible in the event loop's unhandled-task log.
+  Failures are now caught in `_debounced_set`, logged at **WARNING** with the
+  circuit and requested value, and entity state is rewritten so the slider
+  visibly reverts to the device's actual value.
+
+### Changed
+- **F4 — Comment/behaviour drift on optimistic weather-impact overrides**
+  (`coordinator.py`): comments and docstrings claimed the weather-impact
+  override is "cleared on the next successful poll"; the code has always been
+  TTL-only. Documentation now states the actual (and intentional) semantics —
+  TTL expiry plus the settings-cache update keep entity state consistent
+  because circuit settings are cache-tiered and not re-fetched every poll.
+- **F9 — Health tracker encapsulation** (`coordinator.py`):
+  `_async_update_data` no longer reaches into `HovalConnectionHealth`'s
+  private deques. New public recording API: `record_poll_attempt()`,
+  `record_poll_success()`, and `record_error()` (renamed from
+  `_record_error()`; counter semantics unchanged, persisted storage schema
+  unchanged).
+
+### Tests / CI
+- **Coordinator async core is now behaviourally tested** (new
+  `tests/test_coordinator_fetch.py`, 28 tests): `_fetch_all_data` and
+  `_async_update_data` run for real against a scripted fake API — happy path
+  (circuit filtering, v1 program mapping, live values, program/event/weather
+  caches, discovery signal), the F1/F2 degradation guarantees, offline-plant
+  handling, error classification, and HK weather-impact settings with
+  cache fallback. Enabled by rewriting `tests/conftest.py` to install
+  minimal **real** stub classes for `DataUpdateCoordinator`, `UpdateFailed`,
+  `ConfigEntryAuthFailed`, `HomeAssistantError`, dispatcher, and
+  `homeassistant.util.dt` (a MagicMock base class silently turns the subclass
+  into a mock, which is why this code was untestable before).
+- Removed `tests/test_coordinator.py`'s legacy module-level shim that
+  **hard-overwrote** `sys.modules` (making results import-order-dependent);
+  the suite now passes in any test-selection order.
+- Replaced four grep-the-source pseudo-tests with behavioural equivalents
+  (resolver robustness ×12, `_parse_event` guard, live-values type guard,
+  store-corruption recovery was already covered). The remaining source-text
+  checks are consolidated under `TestSourceContracts` with an explicit
+  docstring on why they can't be behavioural without a full HA test harness.
+- New API-client tests: events/latest-event shape normalisation (×8) and the
+  pagination cap (×2); new public health-API tests (×3).
+- **191 tests pass** (was 141), `ruff check` / `ruff format --check` clean.
+  Coverage **44 %** (was 31 %): `coordinator.py` 48 % → **85 %**, `api.py`
+  83 % → **85 %**. Coverage gate raised `fail_under = 30` → **40**.
+- CI: added the missing `voluptuous` dependency to the test-install step in
+  `.github/workflows/lint.yml` (test_api.py imports it directly).
+
+### Not in this release (deferred, see audit report §Residual risks)
+- Climate `HEAT` mode mapping (currently identical to `AUTO`), honouring the
+  IDP's `expires_in`, JSON-decode-error retry classification, redaction of
+  the `connection_health` diagnostics section, and 0 %-covered entity
+  platforms (requires `pytest-homeassistant-custom-component`).
+
+---
+
 ## [0.21.0] - 2026-07-08
 
 ### Added

@@ -66,22 +66,34 @@ def _resolve_active_program_value(
     """
     if not isinstance(programs, dict):
         return None, None, None
-    day_programs = programs.get("dayPrograms", {})
-    day_configs = day_programs.get("dayConfigurations", [])
-    if not day_configs:
+    day_programs = programs.get("dayPrograms")
+    if not isinstance(day_programs, dict):
+        return None, None, None
+    day_configs = day_programs.get("dayConfigurations")
+    if not isinstance(day_configs, list) or not day_configs:
         return None, None, None
 
-    # Build lookup: id -> day config
-    config_by_id: dict[int, dict] = {d["id"]: d for d in day_configs}
+    # Build lookup: id -> day config. Entries that are not dicts or lack an
+    # "id" are skipped instead of raising — audit finding F1 (v0.21.1): a
+    # KeyError here used to propagate out of _fetch_circuit and silently drop
+    # the whole circuit (including its already-fetched live values).
+    config_by_id: dict[Any, dict] = {
+        d["id"]: d for d in day_configs if isinstance(d, dict) and "id" in d
+    }
 
     # Determine which week is active based on the circuit's active_program field.
     # Defaulting to week1 was wrong for week2 users: they got the wrong day
     # program name, wrong active_week_name, and the wrong program_air_volume
     # (which feeds into the fan speed fallback chain in resolve_fan_speed).
     week_key = "week2" if active_program == "week2" else "week1"
-    week = programs.get(week_key, {})
+    week = programs.get(week_key)
+    if not isinstance(week, dict):
+        # Week entry missing or wrong shape — no week/day info resolvable.
+        return None, None, None
     week_name = week.get("name")
-    day_program_ids = week.get("dayProgramIds", [])
+    day_program_ids = week.get("dayProgramIds")
+    if not isinstance(day_program_ids, list):
+        day_program_ids = []
 
     # weekday: 0=Monday in Python, dayProgramIds[0]=Monday in Hoval
     weekday = now.weekday()
@@ -95,13 +107,24 @@ def _resolve_active_program_value(
 
     day_name = day_config.get("name")
 
-    # Find active phase based on current time
+    # Find active phase based on current time. Malformed phases (non-dict,
+    # missing/non-dict start or end, non-numeric times) are skipped, not fatal.
     current_minutes = now.hour * 60 + now.minute
-    for phase in day_config.get("phases", []):
-        start = phase["start"]
-        end = phase["end"]
-        start_min = start["hours"] * 60 + start["minutes"]
-        end_min = end["hours"] * 60 + end["minutes"]
+    phases = day_config.get("phases")
+    if not isinstance(phases, list):
+        phases = []
+    for phase in phases:
+        if not isinstance(phase, dict):
+            continue
+        start = phase.get("start")
+        end = phase.get("end")
+        if not isinstance(start, dict) or not isinstance(end, dict):
+            continue
+        try:
+            start_min = int(start["hours"]) * 60 + int(start["minutes"])
+            end_min = int(end["hours"]) * 60 + int(end["minutes"])
+        except (KeyError, TypeError, ValueError):
+            continue
         if start_min <= current_minutes < end_min:
             return week_name, day_name, phase.get("value")
 
@@ -354,10 +377,27 @@ class HovalConnectionHealth:
             )
 
     # ------------------------------------------------------------------
-    # Error recording helper
+    # Poll recording — the coordinator's ONLY write interface (audit F9)
     # ------------------------------------------------------------------
+    # These three methods are the complete public recording API. The
+    # coordinator must not touch _poll_times/_failure_times/_latency_samples
+    # directly; keeping mutation behind named methods makes the counter
+    # semantics auditable in one place.
 
-    def _record_error(
+    def record_poll_attempt(self, ts: datetime) -> None:
+        """Record the start of a coordinator poll cycle (outcome not yet known)."""
+        self.total_polls += 1
+        self._poll_times.append(ts)
+
+    def record_poll_success(self, ts: datetime, latency_ms: float) -> None:
+        """Record a successful poll: reset failure streak, update latency stats."""
+        self.last_success = ts
+        self.consecutive_failures = 0
+        self.poll_latency_ms = latency_ms
+        self._latency_samples.append(latency_ms)
+        self.update_ema(latency_ms)
+
+    def record_error(
         self,
         ts: datetime,
         error_type: str,
@@ -618,8 +658,16 @@ class HovalData:
     plants: dict[str, HovalPlantData] = field(default_factory=dict)
 
 
-def _parse_event(raw: dict) -> HovalEventData:
-    """Parse a PlantEventDTO dict into HovalEventData."""
+def _parse_event(raw: Any) -> HovalEventData:
+    """Parse a PlantEventDTO dict into HovalEventData.
+
+    Non-dict payloads (schema drift, audit finding F2) yield an empty
+    HovalEventData rather than raising: all fields None, which
+    _is_problem_event() treats as "not a problem".
+    """
+    if not isinstance(raw, dict):
+        _LOGGER.debug("Ignoring non-dict event payload of type %s", type(raw).__name__)
+        return HovalEventData()
     return HovalEventData(
         event_type=raw.get("eventType"),
         description=raw.get("description"),
@@ -751,11 +799,17 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         # key=circuit_path, value=(settings_dict, timestamp)
         self._settings_cache: dict[str, tuple[dict[str, Any], float]] = {}
         self._settings_cache_ttl = CIRCUIT_SETTINGS_CACHE_TTL.total_seconds()
-        # Optimistic weather-impact override per circuit, same shape/TTL
-        # semantics as _mode_override: set immediately after a successful
-        # control action so the slider UI doesn't wait for the next poll, and
-        # cleared once a successful poll confirms real data (or after
-        # _MODE_OVERRIDE_TTL_S if polls keep failing).
+        # Optimistic weather-impact override per circuit, same shape as
+        # _mode_override: set immediately after a successful control action so
+        # the slider UI doesn't wait for the next poll. Unlike _mode_override,
+        # it is NOT cleared at the end of a successful poll — it expires only
+        # via _MODE_OVERRIDE_TTL_S in get_weather_impact_override(). This is
+        # deliberate: circuit settings are cache-tiered (CIRCUIT_SETTINGS_
+        # CACHE_TTL), so a successful poll does not necessarily re-fetch them;
+        # the TTL plus the _settings_cache update in async_set_weather_impact
+        # keep entity state consistent in the meantime.
+        # (Audit finding F4, v0.21.1 — the previous comment claimed poll-based
+        # clearing that the code never implemented.)
         # value=({"outsideTemperature": int|None, "solarRadiation": float|None}, monotonic_ts)
         self._weather_impact_override: dict[str, tuple[dict[str, Any], float]] = {}
         # Plant-level caches for slow-changing data. value=(parsed, timestamp).
@@ -800,9 +854,11 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
     def get_weather_impact_override(self, circuit_path: str) -> dict[str, Any] | None:
         """Get the optimistic weather-impact override for a circuit, if still fresh.
 
-        Mirrors get_mode_override(): returns None once the override exceeds
+        Expiry is TTL-only: returns None once the override exceeds
         _MODE_OVERRIDE_TTL_S so a stale optimistic value cannot mask the real
-        device state indefinitely when polls are failing.
+        device state indefinitely. Unlike mode overrides, weather-impact
+        overrides are intentionally NOT cleared on successful polls (see the
+        _weather_impact_override comment in __init__ for the rationale).
         """
         entry = self._weather_impact_override.get(circuit_path)
         if entry is None:
@@ -960,20 +1016,14 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         - ERROR_TYPE_UNKNOWN   — unexpected exception (bug or API schema change)
         """
         _start = time.monotonic()
-        self._connection_health.total_polls += 1
-        _poll_ts = dt_util.utcnow()
-        self._connection_health._poll_times.append(_poll_ts)
+        self._connection_health.record_poll_attempt(dt_util.utcnow())
 
         try:
             async with asyncio.timeout(90):
                 result = await self._fetch_all_data()
 
             elapsed_ms = round((time.monotonic() - _start) * 1000, 0)
-            self._connection_health.last_success = dt_util.utcnow()
-            self._connection_health.consecutive_failures = 0
-            self._connection_health.poll_latency_ms = elapsed_ms
-            self._connection_health._latency_samples.append(elapsed_ms)
-            self._connection_health.update_ema(elapsed_ms)
+            self._connection_health.record_poll_success(dt_util.utcnow(), elapsed_ms)
             _LOGGER.debug(
                 "Poll succeeded in %.0f ms (ema=%.0f ms, total_polls=%d)",
                 elapsed_ms,
@@ -990,9 +1040,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
 
         except TimeoutError as err:
             _ts = dt_util.utcnow()
-            self._connection_health._record_error(
-                _ts, ERROR_TYPE_TIMEOUT, "Poll timeout after 90 s"
-            )
+            self._connection_health.record_error(_ts, ERROR_TYPE_TIMEOUT, "Poll timeout after 90 s")
             _LOGGER.warning(
                 "Poll timed out (consecutive=%d, total_failures=%d)",
                 self._connection_health.consecutive_failures,
@@ -1005,7 +1053,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
 
         except HovalAuthError as err:
             _ts = dt_util.utcnow()
-            self._connection_health._record_error(
+            self._connection_health.record_error(
                 _ts, ERROR_TYPE_AUTH, f"Auth error: {err}", is_auth=True
             )
             _LOGGER.warning(
@@ -1021,7 +1069,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
             # Categorised separately so error_counts distinguishes this from a
             # generic API failure on a less-critical endpoint.
             _ts = dt_util.utcnow()
-            self._connection_health._record_error(_ts, ERROR_TYPE_CIRCUIT_LIST, str(err)[:200])
+            self._connection_health.record_error(_ts, ERROR_TYPE_CIRCUIT_LIST, str(err)[:200])
             _LOGGER.warning(
                 "Circuit list fetch failed (consecutive=%d): %s",
                 self._connection_health.consecutive_failures,
@@ -1031,7 +1079,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
 
         except HovalApiError as err:
             _ts = dt_util.utcnow()
-            self._connection_health._record_error(_ts, ERROR_TYPE_API, str(err)[:200])
+            self._connection_health.record_error(_ts, ERROR_TYPE_API, str(err)[:200])
             _LOGGER.warning(
                 "API error during poll (consecutive=%d, total_failures=%d): %s",
                 self._connection_health.consecutive_failures,
@@ -1042,7 +1090,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
 
         except Exception as err:  # noqa: BLE001
             _ts = dt_util.utcnow()
-            self._connection_health._record_error(
+            self._connection_health.record_error(
                 _ts, ERROR_TYPE_UNKNOWN, f"{type(err).__name__}: {err}"
             )
             raise
@@ -1245,20 +1293,35 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 if isinstance(programs, dict):
                     if need_programs:
                         self._program_cache[path] = (programs, time.time())
-                    now = dt_util.now()
-                    week_name, day_name, phase_value = _resolve_active_program_value(
-                        programs, now, circuit_data.active_program
-                    )
-                    circuit_data.active_week_name = week_name
-                    circuit_data.active_day_program_name = day_name
-                    circuit_data.program_air_volume = phase_value
-                    # Extract user-defined program names
-                    w1 = programs.get("week1", {})
-                    w2 = programs.get("week2", {})
-                    if w1.get("name"):
-                        circuit_data.program_names["week1"] = w1["name"]
-                    if w2.get("name"):
-                        circuit_data.program_names["week2"] = w2["name"]
+                    # Isolation barrier (audit finding F1, v0.21.1): program
+                    # resolution is now internally defensive, but ANY residual
+                    # exception in this block must degrade the program *fields*
+                    # only — never propagate out of _fetch_circuit, which would
+                    # discard the whole circuit (and its already-fetched live
+                    # values) via gather(return_exceptions=True).
+                    try:
+                        now = dt_util.now()
+                        week_name, day_name, phase_value = _resolve_active_program_value(
+                            programs, now, circuit_data.active_program
+                        )
+                        circuit_data.active_week_name = week_name
+                        circuit_data.active_day_program_name = day_name
+                        circuit_data.program_air_volume = phase_value
+                        # Extract user-defined program names
+                        w1 = programs.get("week1")
+                        w2 = programs.get("week2")
+                        if isinstance(w1, dict) and w1.get("name"):
+                            circuit_data.program_names["week1"] = w1["name"]
+                        if isinstance(w2, dict) and w2.get("name"):
+                            circuit_data.program_names["week2"] = w2["name"]
+                    except Exception:  # noqa: BLE001 — see isolation note above
+                        _LOGGER.warning(
+                            "Program data for circuit %s could not be parsed; "
+                            "program sensors will be unknown this cycle "
+                            "(live values are unaffected)",
+                            path,
+                            exc_info=True,
+                        )
                 elif isinstance(programs, BaseException):
                     _LOGGER.debug("Programs not available for %s: %s", path, programs)
                 else:
@@ -1368,20 +1431,39 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 events_result = all_results[events_idx]
                 parsed_latest = None
                 parsed_events: list = []
-                if not isinstance(latest_result, BaseException) and latest_result:
-                    parsed_latest = _parse_event(latest_result)
-                    _LOGGER.debug(
-                        "Latest event: type=%s active=%s desc=%s",
-                        parsed_latest.event_type,
-                        parsed_latest.is_active,
-                        parsed_latest.description,
+                # Isolation barrier (audit finding F2, v0.21.1): this block
+                # runs OUTSIDE the per-circuit gather's exception isolation, so
+                # before v0.21.1 a shape surprise here (e.g. a pagination
+                # wrapper reaching the list slice) failed the ENTIRE poll and
+                # took every entity unavailable. The API client now normalises
+                # both event endpoints; the isinstance guards and try/except
+                # below are defence in depth for anything it hasn't seen yet.
+                try:
+                    if isinstance(latest_result, BaseException):
+                        _LOGGER.debug("Events endpoint not available for %s", plant_id)
+                    elif isinstance(latest_result, dict) and latest_result:
+                        parsed_latest = _parse_event(latest_result)
+                        _LOGGER.debug(
+                            "Latest event: type=%s active=%s desc=%s",
+                            parsed_latest.event_type,
+                            parsed_latest.is_active,
+                            parsed_latest.description,
+                        )
+                    if isinstance(events_result, BaseException):
+                        _LOGGER.debug("Events list not available for %s", plant_id)
+                    elif isinstance(events_result, list) and events_result:
+                        parsed_events = [
+                            _parse_event(ev) for ev in events_result[:10] if isinstance(ev, dict)
+                        ]
+                except Exception:  # noqa: BLE001 — events must never fail the poll
+                    _LOGGER.warning(
+                        "Event data for plant %s could not be parsed; "
+                        "reusing cached events for this cycle",
+                        plant_id,
+                        exc_info=True,
                     )
-                elif isinstance(latest_result, BaseException):
-                    _LOGGER.debug("Events endpoint not available for %s", plant_id)
-                if not isinstance(events_result, BaseException) and events_result:
-                    parsed_events = [_parse_event(ev) for ev in events_result[:10]]
-                elif isinstance(events_result, BaseException):
-                    _LOGGER.debug("Events list not available for %s", plant_id)
+                    parsed_latest = None
+                    parsed_events = []
                 # Refresh the cache only when we got something; on a total miss
                 # reuse the previous cache (if any) rather than wiping good data.
                 if parsed_latest is not None or parsed_events:
@@ -1409,6 +1491,8 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                     not isinstance(weather_result, BaseException)
                     and isinstance(weather_result, list)
                     and weather_result
+                    # First forecast element must be a dict (F2 defence in depth)
+                    and isinstance(weather_result[0], dict)
                 ):
                     w = weather_result[0]
                     parsed_weather = HovalWeatherData(
@@ -1445,10 +1529,12 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
             async_dispatcher_send(self.hass, SIGNAL_NEW_CIRCUITS)
         self._known_circuits = current_circuits
 
-        # Clear optimistic overrides only after a SUCCESSFUL fetch so that if
-        # the refresh fails (API timeout, transient error), entities continue to
-        # show their optimistic state rather than snapping back to stale data
+        # Clear optimistic MODE overrides only after a SUCCESSFUL fetch so that
+        # if the refresh fails (API timeout, transient error), entities continue
+        # to show their optimistic state rather than snapping back to stale data
         # mid-cycle.  Fresh coordinator data takes over on the next good refresh.
+        # Weather-impact overrides are deliberately not cleared here — they
+        # expire via TTL only (see __init__ comment on _weather_impact_override).
         self._mode_override.clear()
 
         return data

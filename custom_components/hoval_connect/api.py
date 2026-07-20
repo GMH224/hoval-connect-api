@@ -40,6 +40,15 @@ _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 _CONNECT_TIMEOUT = 8  # seconds to establish the TCP connection
 _READ_TIMEOUT = 20  # seconds to receive the full response body
 
+# Hard upper bound on my-plants pagination (audit finding F3, v0.21.1).
+# 50 pages x 12 plants/page = 600 plants — far beyond any real account.
+# Without a cap, a misbehaving (or tampered-with) server that keeps answering
+# `"last": false` with non-empty content would loop get_plants() forever and
+# grow the result list without bound. The coordinator's 90 s outer timeout
+# would contain that, but the config-flow validation path has no outer guard,
+# so the cap must live here in the client.
+_MAX_PLANT_PAGES = 50
+
 
 class HovalAuthError(Exception):
     """Authentication error."""
@@ -320,6 +329,15 @@ class HovalConnectApi:
             if result.get("last", True) or not content:
                 break
             page += 1
+            if page >= _MAX_PLANT_PAGES:
+                _LOGGER.warning(
+                    "get_plants pagination exceeded %d pages (%d plants so far); "
+                    "truncating — the cloud keeps reporting more pages, which is "
+                    "almost certainly an upstream fault",
+                    _MAX_PLANT_PAGES,
+                    len(all_plants),
+                )
+                break
         return all_plants
 
     async def get_plant_settings(self, plant_id: str) -> dict[str, Any]:
@@ -377,12 +395,45 @@ class HovalConnectApi:
         return result if isinstance(result, list) else []
 
     async def get_events(self, plant_id: str) -> list[dict[str, Any]]:
-        """Get plant error events."""
-        return await self._request("GET", f"/v1/plant-events/{plant_id}", plant_id=plant_id)
+        """Get plant error events.
+
+        Normalised to a plain list, mirroring get_circuits()/get_live_values():
+        Hoval's May 2026 pagination enforcement wrapped several list endpoints
+        in {"content": [...], ...}. The events endpoints were not observed to
+        change, but before v0.21.1 this method was the only list endpoint NOT
+        hardened against the wrapper — and a wrapped response reached list
+        slicing in the coordinator and failed the entire poll (audit finding
+        F2). Any non-list, non-wrapper shape degrades to [].
+        """
+        result = await self._request("GET", f"/v1/plant-events/{plant_id}", plant_id=plant_id)
+        if isinstance(result, dict):
+            _LOGGER.debug(
+                "get_events returned paginated wrapper for plant %s; extracting 'content'",
+                plant_id,
+            )
+            content = result.get("content", [])
+            return content if isinstance(content, list) else []
+        return result if isinstance(result, list) else []
 
     async def get_latest_event(self, plant_id: str) -> dict[str, Any]:
-        """Get latest plant event."""
-        return await self._request("GET", f"/v1/plant-events/latest/{plant_id}", plant_id=plant_id)
+        """Get latest plant event.
+
+        Always returns a dict; {} means "no event available". If the cloud ever
+        wraps this endpoint in the May 2026 pagination shape, the first content
+        element is returned so callers keep receiving a single PlantEventDTO
+        (audit finding F2 — shape drift must not propagate to the coordinator).
+        """
+        result = await self._request(
+            "GET", f"/v1/plant-events/latest/{plant_id}", plant_id=plant_id
+        )
+        if isinstance(result, dict) and isinstance(result.get("content"), list):
+            _LOGGER.debug(
+                "get_latest_event returned paginated wrapper for plant %s; taking first element",
+                plant_id,
+            )
+            content = result["content"]
+            return content[0] if content and isinstance(content[0], dict) else {}
+        return result if isinstance(result, dict) else {}
 
     async def get_weather(self, plant_id: str) -> list[dict[str, Any]]:
         """Get weather forecast for plant location."""
