@@ -15,7 +15,10 @@ from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity_platform import AddEntitiesCallback, async_get_current_platform
+from homeassistant.helpers.entity_platform import (
+    AddConfigEntryEntitiesCallback,
+    async_get_current_platform,
+)
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import HovalConnectConfigEntry, circuit_device_info
@@ -45,21 +48,25 @@ _OP_OFF = STATE_OFF  # "off"         — circuit in standby
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: HovalConnectConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up Hoval water heater entities for WW circuits."""
     coordinator = entry.runtime_data.coordinator
+    plant_devices = entry.runtime_data.plant_devices
     known: set[str] = set()
 
     def _add_new() -> None:
         entities: list[HovalWaterHeater] = []
         for plant_id, plant_data in coordinator.data.plants.items():
+            plant_device_id = plant_devices.async_get_device_id(plant_id, plant_data)
             for path, circuit in plant_data.circuits.items():
                 uid = f"{plant_id}_{path}_water_heater"
                 if circuit.circuit_type != CIRCUIT_TYPE_WW or uid in known:
                     continue
                 known.add(uid)
-                entities.append(HovalWaterHeater(coordinator, entry, plant_id, path, circuit))
+                entities.append(
+                    HovalWaterHeater(coordinator, entry, plant_id, plant_device_id, path, circuit)
+                )
         if entities:
             async_add_entities(entities)
 
@@ -108,6 +115,7 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
         coordinator: HovalDataCoordinator,
         entry: HovalConnectConfigEntry,
         plant_id: str,
+        plant_device_id: str,
         circuit_path: str,
         circuit_data: HovalCircuitData,
     ) -> None:
@@ -117,7 +125,7 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
         self._plant_id = plant_id
         self._circuit_path = circuit_path
         self._attr_unique_id = f"{plant_id}_{circuit_path}_water_heater"
-        self._attr_device_info = circuit_device_info(plant_id, circuit_data)
+        self._attr_device_info = circuit_device_info(plant_id, plant_device_id, circuit_data)
 
     @property
     def _circuit(self) -> HovalCircuitData | None:

@@ -14,15 +14,15 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.const import (
-    PERCENTAGE,
     EntityCategory,
     UnitOfEnergy,
+    UnitOfRatio,
     UnitOfTemperature,
     UnitOfTime,
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
@@ -86,7 +86,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
     HovalSensorEntityDescription(
         key="air_volume",
         translation_key="air_volume",
-        native_unit_of_measurement=PERCENTAGE,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:fan",
         circuit_types=frozenset({CIRCUIT_TYPE_HV}),
@@ -96,7 +96,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         key="humidity_actual",
         translation_key="humidity_actual",
         device_class=SensorDeviceClass.HUMIDITY,
-        native_unit_of_measurement=PERCENTAGE,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         circuit_types=frozenset({CIRCUIT_TYPE_HV}),
         value_fn=lambda c: c.live_values.get("humidityActual"),
@@ -105,7 +105,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
         key="humidity_target",
         translation_key="humidity_target",
         device_class=SensorDeviceClass.HUMIDITY,
-        native_unit_of_measurement=PERCENTAGE,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         circuit_types=frozenset({CIRCUIT_TYPE_HV}),
         value_fn=lambda c: c.live_values.get("humidityTarget"),
@@ -134,7 +134,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
     HovalSensorEntityDescription(
         key="program_air_volume",
         translation_key="program_air_volume",
-        native_unit_of_measurement=PERCENTAGE,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:fan-clock",
         entity_category=EntityCategory.DIAGNOSTIC,
@@ -352,7 +352,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
     HovalSensorEntityDescription(
         key="circuit_failure_rate_1h",
         translation_key="circuit_failure_rate_1h",
-        native_unit_of_measurement=PERCENTAGE,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         icon="mdi:wifi-alert",
@@ -363,7 +363,7 @@ CIRCUIT_SENSOR_DESCRIPTIONS: tuple[HovalSensorEntityDescription, ...] = (
     HovalSensorEntityDescription(
         key="circuit_availability_1h",
         translation_key="circuit_availability_1h",
-        native_unit_of_measurement=PERCENTAGE,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         icon="mdi:wifi-check",
@@ -553,7 +553,7 @@ CONNECTION_SENSOR_DESCRIPTIONS: tuple[HovalConnectionSensorDescription, ...] = (
     HovalConnectionSensorDescription(
         key="api_failure_rate_1h",
         translation_key="api_failure_rate_1h",
-        native_unit_of_measurement=PERCENTAGE,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         icon="mdi:cloud-percent-outline",
@@ -563,7 +563,7 @@ CONNECTION_SENSOR_DESCRIPTIONS: tuple[HovalConnectionSensorDescription, ...] = (
     HovalConnectionSensorDescription(
         key="api_auth_failure_rate_1h",
         translation_key="api_auth_failure_rate_1h",
-        native_unit_of_measurement=PERCENTAGE,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         icon="mdi:lock-percent-outline",
@@ -572,7 +572,7 @@ CONNECTION_SENSOR_DESCRIPTIONS: tuple[HovalConnectionSensorDescription, ...] = (
     HovalConnectionSensorDescription(
         key="api_availability_1h",
         translation_key="api_availability_1h",
-        native_unit_of_measurement=PERCENTAGE,
+        native_unit_of_measurement=UnitOfRatio.PERCENTAGE,
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         icon="mdi:cloud-check-variant-outline",
@@ -584,15 +584,17 @@ CONNECTION_SENSOR_DESCRIPTIONS: tuple[HovalConnectionSensorDescription, ...] = (
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: HovalConnectConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up Hoval sensor entities."""
     coordinator = entry.runtime_data.coordinator
+    plant_devices = entry.runtime_data.plant_devices
     known: set[str] = set()
 
     def _add_new() -> None:
         entities: list[SensorEntity] = []
         for plant_id, plant_data in coordinator.data.plants.items():
+            plant_device_id = plant_devices.async_get_device_id(plant_id, plant_data)
             # Circuit-level sensors
             for path, circuit in plant_data.circuits.items():
                 for description in CIRCUIT_SENSOR_DESCRIPTIONS:
@@ -606,7 +608,14 @@ async def async_setup_entry(
                         continue
                     known.add(uid)
                     entities.append(
-                        HovalCircuitSensor(coordinator, plant_id, path, circuit, description)
+                        HovalCircuitSensor(
+                            coordinator,
+                            plant_id,
+                            plant_device_id,
+                            path,
+                            circuit,
+                            description,
+                        )
                     )
 
             # Plant-level sensors
@@ -649,6 +658,7 @@ class HovalCircuitSensor(CoordinatorEntity[HovalDataCoordinator], SensorEntity):
         self,
         coordinator: HovalDataCoordinator,
         plant_id: str,
+        plant_device_id: str,
         circuit_path: str,
         circuit_data: HovalCircuitData,
         description: HovalSensorEntityDescription,
@@ -659,7 +669,7 @@ class HovalCircuitSensor(CoordinatorEntity[HovalDataCoordinator], SensorEntity):
         self._plant_id = plant_id
         self._circuit_path = circuit_path
         self._attr_unique_id = f"{plant_id}_{circuit_path}_{description.key}"
-        self._attr_device_info = circuit_device_info(plant_id, circuit_data)
+        self._attr_device_info = circuit_device_info(plant_id, plant_device_id, circuit_data)
 
     @property
     def _circuit(self) -> HovalCircuitData | None:

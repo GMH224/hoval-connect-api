@@ -31,6 +31,8 @@ import types
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
+from . import ha_stubs
+
 # ---------------------------------------------------------------------------
 # Real stubs
 # ---------------------------------------------------------------------------
@@ -71,6 +73,10 @@ class StubHomeAssistantError(Exception):
     """Real exception stand-in for homeassistant.exceptions.HomeAssistantError."""
 
 
+class StubConfigEntryError(Exception):
+    """Real exception stand-in for homeassistant.exceptions.ConfigEntryError."""
+
+
 def _dispatcher_send(_hass, _signal, *_args) -> None:
     """No-op stand-in for async_dispatcher_send; tests monkeypatch to observe."""
 
@@ -98,13 +104,16 @@ def _register(name: str, module: types.ModuleType | MagicMock) -> None:
 _uc = types.ModuleType("homeassistant.helpers.update_coordinator")
 _uc.DataUpdateCoordinator = StubDataUpdateCoordinator
 _uc.UpdateFailed = StubUpdateFailed
-_uc.CoordinatorEntity = MagicMock()  # entity platforms are not imported in tests
+# v2.2.0: the compatibility suite imports the entity platforms, which subclass
+# CoordinatorEntity, so this must be a real class rather than a MagicMock.
+_uc.CoordinatorEntity = ha_stubs.StubCoordinatorEntity
 _register("homeassistant.helpers.update_coordinator", _uc)
 
 # --- homeassistant.exceptions (real exception classes)
 _exc = types.ModuleType("homeassistant.exceptions")
 _exc.ConfigEntryAuthFailed = StubConfigEntryAuthFailed
 _exc.HomeAssistantError = StubHomeAssistantError
+_exc.ConfigEntryError = StubConfigEntryError
 _register("homeassistant.exceptions", _exc)
 
 # --- homeassistant.helpers.dispatcher (real no-op functions)
@@ -124,18 +133,121 @@ _util = types.ModuleType("homeassistant.util")
 _util.dt = _dt
 _register("homeassistant.util", _util)
 
-# --- everything else the package pulls in at import time: MagicMock is fine
-_HA_MOCK_MODULES = [
-    "homeassistant",
-    "homeassistant.config_entries",
-    "homeassistant.const",
+# --- everything else the package pulls in at import time.
+#
+# v2.2.0: the modules the migration touches (device registry, config entries,
+# constants, entity platforms) now get realistic stubs from ha_stubs rather than
+# a bare MagicMock, so the compatibility suite can import the entity platforms
+# and config flow and assert on real behaviour. Everything else still resolves
+# to MagicMock via _LenientModule.__getattr__.
+_core = ha_stubs.make_module(
     "homeassistant.core",
-    "homeassistant.helpers",
-    "homeassistant.helpers.storage",
-    "homeassistant.helpers.aiohttp_client",
-    "homeassistant.helpers.device_registry",
-    "homeassistant.helpers.entity_platform",
-]
+    # Must be a real identity decorator: @callback wrapping a MagicMock would
+    # replace the decorated function with a mock.
+    callback=lambda func: func,
+    HomeAssistant=MagicMock(),
+)
 
-for _name in _HA_MOCK_MODULES:
-    _register(_name, MagicMock())
+_dr_mod = ha_stubs.make_module(
+    "homeassistant.helpers.device_registry",
+    DeviceInfo=ha_stubs.DeviceInfo,
+    DeviceEntry=ha_stubs.StubDeviceEntry,
+    async_get=MagicMock(),
+)
+
+_ce_mod = ha_stubs.make_module(
+    "homeassistant.config_entries",
+    ConfigFlow=ha_stubs.StubConfigFlow,
+    OptionsFlow=ha_stubs.StubOptionsFlow,
+    OptionsFlowWithReload=ha_stubs.StubOptionsFlowWithReload,
+    ConfigFlowResult=dict,
+)
+
+_const_mod = ha_stubs.make_module(
+    "homeassistant.const",
+    PERCENTAGE=ha_stubs.PERCENTAGE,
+    UnitOfRatio=ha_stubs.UnitOfRatio,
+    UnitOfTemperature=ha_stubs.UnitOfTemperature,
+    UnitOfEnergy=ha_stubs.UnitOfEnergy,
+    UnitOfTime=ha_stubs.UnitOfTime,
+    EntityCategory=ha_stubs.EntityCategory,
+    Platform=ha_stubs.Platform,
+    # Mirrors the running HA version; the v2.2.0 floor check reads these.
+    MAJOR_VERSION=2026,
+    MINOR_VERSION=9,
+)
+
+_helpers_mod = ha_stubs.make_module("homeassistant.helpers")
+_components_mod = ha_stubs.make_module("homeassistant.components")
+_ha_mod = ha_stubs.make_module("homeassistant")
+
+_LENIENT_MODULES: dict[str, types.ModuleType] = {
+    "homeassistant": _ha_mod,
+    "homeassistant.core": _core,
+    "homeassistant.const": _const_mod,
+    "homeassistant.config_entries": _ce_mod,
+    "homeassistant.helpers": _helpers_mod,
+    "homeassistant.helpers.device_registry": _dr_mod,
+    "homeassistant.helpers.storage": ha_stubs.make_module("homeassistant.helpers.storage"),
+    "homeassistant.helpers.aiohttp_client": ha_stubs.make_module(
+        "homeassistant.helpers.aiohttp_client"
+    ),
+    "homeassistant.helpers.entity_platform": ha_stubs.make_module(
+        "homeassistant.helpers.entity_platform"
+    ),
+    "homeassistant.components": _components_mod,
+    "homeassistant.components.sensor": ha_stubs.make_module(
+        "homeassistant.components.sensor",
+        SensorEntityDescription=ha_stubs.SensorEntityDescription,
+        SensorEntity=ha_stubs.make_entity_base("SensorEntity"),
+    ),
+    "homeassistant.components.number": ha_stubs.make_module(
+        "homeassistant.components.number",
+        NumberEntityDescription=ha_stubs.NumberEntityDescription,
+        NumberEntity=ha_stubs.make_entity_base("NumberEntity"),
+    ),
+    "homeassistant.components.binary_sensor": ha_stubs.make_module(
+        "homeassistant.components.binary_sensor",
+        BinarySensorEntityDescription=ha_stubs.BinarySensorEntityDescription,
+        BinarySensorEntity=ha_stubs.make_entity_base("BinarySensorEntity"),
+    ),
+    "homeassistant.components.diagnostics": ha_stubs.make_module(
+        "homeassistant.components.diagnostics"
+    ),
+    "homeassistant.components.climate": ha_stubs.make_module(
+        "homeassistant.components.climate",
+        ClimateEntity=ha_stubs.make_entity_base("ClimateEntity"),
+    ),
+    "homeassistant.components.fan": ha_stubs.make_module(
+        "homeassistant.components.fan",
+        FanEntity=ha_stubs.make_entity_base("FanEntity"),
+    ),
+    "homeassistant.components.select": ha_stubs.make_module(
+        "homeassistant.components.select",
+        SelectEntity=ha_stubs.make_entity_base("SelectEntity"),
+    ),
+    "homeassistant.components.water_heater": ha_stubs.make_module(
+        "homeassistant.components.water_heater",
+        WaterHeaterEntity=ha_stubs.make_entity_base("WaterHeaterEntity"),
+    ),
+}
+
+for _name, _module in _LENIENT_MODULES.items():
+    _register(_name, _module)
+
+# `from homeassistant.helpers import device_registry as dr` resolves the
+# attribute on the parent package before falling back to the import system, so
+# the parent must point at the same stub object the submodule is registered as.
+for _dotted in list(_LENIENT_MODULES) + [
+    "homeassistant.helpers.update_coordinator",
+    "homeassistant.helpers.dispatcher",
+    "homeassistant.util",
+    "homeassistant.exceptions",
+]:
+    if "." not in _dotted:
+        continue
+    _parent_name, _, _child = _dotted.rpartition(".")
+    _parent = sys.modules.get(_parent_name)
+    _child_mod = sys.modules.get(_dotted)
+    if _parent is not None and _child_mod is not None:
+        setattr(_parent, _child, _child_mod)

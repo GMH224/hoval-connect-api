@@ -4,7 +4,76 @@ All notable changes to the `hoval_connect` integration are documented here.
 This project follows a loose [Semantic Versioning](https://semver.org/) scheme
 while pre-1.0 (minor = behavioural/feature change, patch = internal fix).
 
-## [0.21.1] - 2026-07-20
+## [2.2.0] - 2026-09-04
+
+Home Assistant forward-compatibility release, targeting HA **2026.8 → 2026.12**.
+The full audit — including the claims that did *not* survive verification against
+the Home Assistant source — is in `docs/audit-v2.2.0.md`.
+
+No entity IDs, unique IDs, device identifiers, units or API semantics change.
+Long-term statistics are preserved.
+
+### ⚠️ Breaking — minimum Home Assistant version is now 2026.8.0
+
+Previously 2024.1.0. `via_device_id`, used to link circuit devices to their
+plant, was introduced in HA 2026.8; on 2026.7 and earlier the device-registry
+call raises `TypeError` and **no circuit entity is created**. `hacs.json` now
+declares the 2026.8.0 floor, and `async_setup_entry` re-checks it at runtime so
+a manual install fails with an explanatory message rather than an opaque error.
+
+**Users on HA older than 2026.8 should stay on v0.21.1**, which remains
+functional until HA 2027.8.
+
+### Changed
+- **Options flow now reloads the config entry** (`config_flow.py`,
+  `__init__.py`): `HovalConnectOptionsFlow` derives from `OptionsFlowWithReload`,
+  and the config-entry update listener plus `_async_options_updated()` are gone.
+  Home Assistant raises `ValueError` when an entry carries update listeners while
+  such a flow saves options — this is already enforced, not a future change.
+  Removing the listener also clears the separate 2026.12 deprecation on
+  `async_update_reload_and_abort()` in the reauth flow. Saving options now costs
+  a brief reload; the polling interval, turn-on mode and override duration are
+  all re-read from `async_setup_entry()`.
+- **Circuit devices link to their plant by device ID** (`__init__.py` and all six
+  circuit platforms): `via_device=(DOMAIN, plant_id)` became
+  `via_device_id=<plant DeviceEntry.id>`. `via_device` was removed from HA's
+  `DeviceInfo` in 2026.9 and drops out of the device registry in 2027.8.
+  A new `HovalPlantDevices` resolver registers plants and caches their device
+  IDs, resolving on demand so a plant discovered after setup still gets a parent
+  device — an unresolvable `via_device_id` raises `DeviceInfoError` and the
+  entity is dropped, where the old `via_device` only logged.
+  **Circuit identifiers are deliberately unchanged** (`<plant_id>_<path>`), so
+  existing devices are matched rather than duplicated.
+- **Percentage sensors use `UnitOfRatio.PERCENTAGE`** (`sensor.py`, 9
+  descriptions). Style alignment with the file's existing `UnitOfTemperature` /
+  `UnitOfEnergy` / `UnitOfTime` usage, **not** a deprecation fix: `PERCENTAGE` is
+  still a supported HA constant, defined as `UnitOfRatio.PERCENTAGE.value`. The
+  emitted unit is `%` either way.
+- **Coordinator receives its config entry explicitly** (`coordinator.py`,
+  `__init__.py`): `HovalDataCoordinator(hass, entry, api, health_store)` instead
+  of relying on Home Assistant's `current_entry` ContextVar.
+- **Entity platforms type their callback as `AddConfigEntryEntitiesCallback`**
+  (all seven platforms), the correct type for config-entry platforms.
+
+### Removed
+- `_enable_turn_on_off_backwards_compat` (`climate.py`) — the attribute no longer
+  exists in Home Assistant's climate platform and had no effect.
+
+### Testing
+- Suite grows from **191 to 284 tests**; coverage **44% → 61%**. The migrated
+  files previously had **0%** coverage.
+- New `tests/test_ha_compat.py` covers the options-flow lifecycle, the device
+  parent link, device/entity identity stability, the plant-device resolver
+  (caching, late plants, registration ordering), unit equivalence, the version
+  floor, and static guards against reintroducing any API Home Assistant removes
+  on or before 2026.12.
+- `tests/ha_stubs.py` adds realistic Home Assistant stand-ins so the entity
+  platforms and config flow are genuinely imported and exercised rather than
+  grepped.
+- Every guard is mutation-tested: 13 deliberate reversions of this migration were
+  each confirmed to turn the suite red.
+
+
 
 Hardening release from a full ICS-style code audit (findings F1–F9; the
 complete report with reproduction evidence, severity ratings, and residual

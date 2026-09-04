@@ -7,7 +7,11 @@ import logging
 from typing import Any
 
 import voluptuous as vol
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow
+from homeassistant.config_entries import (
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlowWithReload,
+)
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import HovalApiError, HovalAuthError, HovalConnectApi
@@ -140,8 +144,14 @@ class HovalConnectConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
 
-class HovalConnectOptionsFlow(OptionsFlow):
-    """Handle options for Hoval Connect."""
+class HovalConnectOptionsFlow(OptionsFlowWithReload):
+    """Handle options for Hoval Connect.
+
+    OptionsFlowWithReload reloads the config entry whenever saved options differ
+    from the stored ones, so async_setup_entry re-reads the scan interval, turn-on
+    mode and override duration. This replaces the former config-entry update
+    listener, which HA now rejects outright alongside a reloading options flow.
+    """
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Manage the options."""

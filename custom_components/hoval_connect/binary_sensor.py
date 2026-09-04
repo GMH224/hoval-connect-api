@@ -8,7 +8,7 @@ from homeassistant.components.binary_sensor import (
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import HovalConnectConfigEntry, plant_device_info
@@ -18,7 +18,7 @@ from .coordinator import SIGNAL_NEW_CIRCUITS, HovalDataCoordinator, HovalPlantDa
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: HovalConnectConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up Hoval binary sensor entities."""
     coordinator = entry.runtime_data.coordinator

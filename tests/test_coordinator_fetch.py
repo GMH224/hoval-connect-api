@@ -157,7 +157,9 @@ class FakeApi:
 
 def _make_coordinator(api: FakeApi | None = None) -> tuple[HovalDataCoordinator, FakeApi]:
     api = api or FakeApi()
-    coordinator = HovalDataCoordinator(MagicMock(), api, MagicMock())
+    # v2.2.0: the coordinator takes the config entry explicitly instead of
+    # relying on HA's current_entry ContextVar.
+    coordinator = HovalDataCoordinator(MagicMock(), MagicMock(), api, MagicMock())
     return coordinator, api
 
 

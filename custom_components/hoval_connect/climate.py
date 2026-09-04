@@ -14,7 +14,7 @@ from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import HovalConnectConfigEntry, circuit_device_info
@@ -34,21 +34,25 @@ _LOGGER = logging.getLogger(__name__)
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: HovalConnectConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up Hoval climate entities for heating circuits."""
     coordinator = entry.runtime_data.coordinator
+    plant_devices = entry.runtime_data.plant_devices
     known: set[str] = set()
 
     def _add_new() -> None:
         entities: list[HovalClimate] = []
         for plant_id, plant_data in coordinator.data.plants.items():
+            plant_device_id = plant_devices.async_get_device_id(plant_id, plant_data)
             for path, circuit in plant_data.circuits.items():
                 uid = f"{plant_id}_{path}_climate"
                 if circuit.circuit_type != CIRCUIT_TYPE_HK or uid in known:
                     continue
                 known.add(uid)
-                entities.append(HovalClimate(coordinator, entry, plant_id, path, circuit))
+                entities.append(
+                    HovalClimate(coordinator, entry, plant_id, plant_device_id, path, circuit)
+                )
         if entities:
             async_add_entities(entities)
 
@@ -72,13 +76,13 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
     _attr_max_temp = 30.0
     _attr_hvac_modes = [HVACMode.HEAT, HVACMode.OFF, HVACMode.AUTO]
     _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
-    _enable_turn_on_off_backwards_compat = False
 
     def __init__(
         self,
         coordinator: HovalDataCoordinator,
         entry: HovalConnectConfigEntry,
         plant_id: str,
+        plant_device_id: str,
         circuit_path: str,
         circuit_data: HovalCircuitData,
     ) -> None:
@@ -88,7 +92,7 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
         self._plant_id = plant_id
         self._circuit_path = circuit_path
         self._attr_unique_id = f"{plant_id}_{circuit_path}_climate"
-        self._attr_device_info = circuit_device_info(plant_id, circuit_data)
+        self._attr_device_info = circuit_device_info(plant_id, plant_device_id, circuit_data)
 
     @property
     def _circuit(self) -> HovalCircuitData | None:

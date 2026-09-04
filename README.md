@@ -68,6 +68,11 @@ Plants and circuits are discovered automatically from your account.
 - Temporary override duration: 4 hours / until midnight
 - Polling interval (default: 60s)
 
+Since **v2.2.0**, saving options reloads the integration (a few seconds of
+entity unavailability) instead of adjusting the poll timer in place. This is
+the lifecycle Home Assistant now requires; it also means every option takes
+effect immediately and identically.
+
 **Under the hood:**
 - 2-step token management (ID token + Plant Access Token) with TTL caching and auto-refresh
 - Skips API calls when plant is offline, invalidates token cache on reconnect
@@ -94,7 +99,14 @@ Plants and circuits are discovered automatically from your account.
 ### Requirements
 
 - A Hoval Connect account (same credentials as the Hoval Connect mobile app)
-- Home Assistant 2024.1.0 or newer
+- **Home Assistant 2026.8.0 or newer** (see below)
+
+> **v2.2.0 raised the minimum Home Assistant version from 2024.1 to 2026.8.**
+> The integration now uses `via_device_id` to link circuit devices to their
+> plant, which Home Assistant only added in 2026.8 — on older releases the
+> call fails and no circuit entity is created. If you cannot upgrade Home
+> Assistant yet, stay on **v0.21.1**, which supports 2024.1+ and remains
+> functional until Home Assistant 2027.8.
 
 ---
 

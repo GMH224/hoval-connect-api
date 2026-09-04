@@ -775,6 +775,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
     def __init__(
         self,
         hass: HomeAssistant,
+        config_entry: ConfigEntry,
         api: HovalConnectApi,
         health_store: Store,
     ) -> None:
@@ -782,6 +783,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=config_entry,
             name=DOMAIN,
             update_interval=DEFAULT_SCAN_INTERVAL,
         )

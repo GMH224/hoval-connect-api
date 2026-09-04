@@ -8,7 +8,7 @@ from homeassistant.components.select import SelectEntity
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import HovalConnectConfigEntry, circuit_device_info
@@ -41,15 +41,17 @@ DEFAULT_NAMES: dict[str, str] = {
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: HovalConnectConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up Hoval select entities."""
     coordinator = entry.runtime_data.coordinator
+    plant_devices = entry.runtime_data.plant_devices
     known: set[str] = set()
 
     def _add_new() -> None:
         entities: list[HovalProgramSelect] = []
         for plant_id, plant_data in coordinator.data.plants.items():
+            plant_device_id = plant_devices.async_get_device_id(plant_id, plant_data)
             for path, circuit in plant_data.circuits.items():
                 uid = f"{plant_id}_{path}_program"
                 if (
@@ -58,7 +60,9 @@ async def async_setup_entry(
                 ):
                     continue
                 known.add(uid)
-                entities.append(HovalProgramSelect(coordinator, plant_id, path, circuit))
+                entities.append(
+                    HovalProgramSelect(coordinator, plant_id, plant_device_id, path, circuit)
+                )
         if entities:
             async_add_entities(entities)
 
@@ -82,6 +86,7 @@ class HovalProgramSelect(CoordinatorEntity[HovalDataCoordinator], SelectEntity):
         self,
         coordinator: HovalDataCoordinator,
         plant_id: str,
+        plant_device_id: str,
         circuit_path: str,
         circuit_data: HovalCircuitData,
     ) -> None:
@@ -90,7 +95,7 @@ class HovalProgramSelect(CoordinatorEntity[HovalDataCoordinator], SelectEntity):
         self._plant_id = plant_id
         self._circuit_path = circuit_path
         self._attr_unique_id = f"{plant_id}_{circuit_path}_program"
-        self._attr_device_info = circuit_device_info(plant_id, circuit_data)
+        self._attr_device_info = circuit_device_info(plant_id, plant_device_id, circuit_data)
 
     @property
     def _circuit(self) -> HovalCircuitData | None:
