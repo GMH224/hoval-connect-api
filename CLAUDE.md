@@ -133,6 +133,46 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
+### v0.24.0 — Transport rewrite: aiohttp -> requests-in-executor
+
+**This is the important one if you're reading this file to understand why
+the code looks unusual.** `api.py` does not use `aiohttp`, which is
+atypical for a Home Assistant integration. This was not a style choice —
+v0.23.0's `User-Agent` fix shipped without live confirmation and did not
+actually fix the 403 it was aimed at. Full story, including two disproven
+intermediate hypotheses (account-flag block, hidden app-only credential),
+in `docs/audit-v0.24.0.md`. Short version:
+
+- **Two independent causes, found by live single-variable testing against
+  the production API** (not static analysis — a series of small scripts,
+  each changing one thing from the last, run interactively against Hoval's
+  real backend):
+  1. `aiohttp`'s TLS connection fingerprint is blocked outright by Hoval's
+     Azure Application Gateway, regardless of headers — confirmed across
+     four configurations including one with its cipher suite list rebuilt
+     to exactly match `requests`/`urllib3`'s. **If you're tempted to
+     "simplify" this back to `aiohttp`, don't, without re-running that
+     test against the live API first.**
+  2. `requests`' own default User-Agent string (`"python-requests/X.Y.Z"`)
+     is separately blocked — a WAF signature rule, almost certainly. Fixed
+     by always sending a custom one (see `USER_AGENT` in `const.py`).
+- **Fix**: `api.py` now routes every call through `requests.Session()`
+  wrapped in `hass.async_add_executor_job()`, with the exact validated
+  `USER_AGENT` string. `HovalConnectApi.__init__` takes `hass`, not an
+  aiohttp session — `__init__.py`/`config_flow.py` updated to match, plus
+  a new `aclose()` for cleanup.
+- **Gotcha for later:** only ONE custom User-Agent string has actually been
+  proven to work (the one in `const.py`). If you change it for branding/
+  cosmetic reasons, that is an unvalidated change, not a safe refactor —
+  re-test against the live API, don't assume any non-default string works.
+- `manifest.json` gained a real dependency (`requests>=2.28.0`) for the
+  first time — a `test_no_legacy_serial_dependency` test that used to
+  assert `requirements == []` outright now checks for the thing it
+  actually cared about (no CAN-bus/serial hardware deps) instead.
+- `tests/test_api.py` fully rewritten (mocks `requests.Session` now, not
+  `aiohttp.ClientSession`'s async-context-manager protocol) — 303 tests
+  pass, ruff clean, 86% coverage on `api.py`.
+
 ### v0.23.0 — User-Agent 403 fix + config-flow polling-interval bug
 
 **Note on versioning:** this release corrects a version-numbering error

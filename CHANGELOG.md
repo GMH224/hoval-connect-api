@@ -4,7 +4,88 @@ All notable changes to the `hoval_connect` integration are documented here.
 This project follows a loose [Semantic Versioning](https://semver.org/) scheme
 while pre-1.0 (minor = behavioural/feature change, patch = internal fix).
 
-## [0.23.0] - 2026-09-09
+## [0.24.0] - 2026-09-10
+
+Transport rewrite: replaces `aiohttp` with `requests` (run via
+`hass.async_add_executor_job`, Home Assistant's sanctioned mechanism for
+calling blocking code from an async integration) for every cloud-API call.
+This is an unusual thing for a Home Assistant integration to do and is not a
+style preference — it is the direct, empirically-forced conclusion of
+re-investigating the v0.23.0 fix after it turned out not to work. Full
+investigation in `docs/audit-v0.24.0.md`; summary below.
+
+### Why this was necessary
+
+v0.23.0 shipped a `User-Agent` fix for a blanket HTTP 403 on every endpoint,
+without live confirmation that it worked. It didn't — the 403 persisted
+after release. Re-diagnosing this properly required testing one variable at
+a time directly against the live API (with the user's hands-on help running
+a series of increasingly narrow scripts) and found **two independent causes
+stacked on top of each other**:
+
+1. **`aiohttp`'s TLS connection fingerprint is blocked outright**, regardless
+   of any header content. Confirmed across four separate configurations, all
+   against the real API, all HTTP 403: `aiohttp` default; `aiohttp` + a
+   custom `User-Agent`; `aiohttp` + `Accept`/`Accept-Encoding`/`Connection`
+   headers matching what `requests` sends by default; `aiohttp` with its TLS
+   context rebuilt from `urllib3`'s own cipher list. That last one matches
+   `requests`' cipher suite exactly and still failed — this is not fixable
+   by header or cipher tuning from within `aiohttp`.
+2. **`requests`' own default `User-Agent` string, `"python-requests/X.Y.Z"`,
+   is separately blocked** — almost certainly a WAF signature rule against
+   well-known scripting-tool identities. Confirmed by isolating this one
+   variable on an otherwise byte-identical script: HTTP 403 with the default
+   UA, HTTP 200 with a custom one, nothing else changed.
+
+Two intermediate hypotheses were tested and ruled out along the way, in the
+interest of an honest record: an account/IP-level anti-abuse block (ruled
+out — the official app kept working throughout on the same account and
+network, which a blanket account block could not explain) and a hidden
+app-only credential absent from the public OAuth2 flow (ruled out — a
+`requests`-based crawl with no special credential succeeded repeatedly,
+including on the same day the 403s were otherwise constant).
+
+### Changed
+
+- **`api.py` no longer uses `aiohttp`.** Every network call now goes through
+  a `requests.Session()`, created once and reused for the client's lifetime,
+  with each individual call wrapped in `hass.async_add_executor_job()`. This
+  keeps the integration non-blocking from Home Assistant's point of view
+  even though the underlying HTTP client is synchronous. Every public
+  method's signature and behavior is unchanged — retries, timeouts (now a
+  `(connect, read)` tuple, `requests`' native equivalent of `aiohttp`'s split
+  `ClientTimeout`), 401 token-refresh-and-retry, the distinct 403 log line
+  added in v0.23.0, and all response-shape normalisation are all preserved
+  exactly.
+- **`HovalConnectApi.__init__` now takes `hass`, not an `aiohttp.ClientSession`.**
+  `__init__.py` and `config_flow.py` updated accordingly. `HovalConnectApi`
+  gained an `aclose()` method (closes the `requests.Session`'s connection
+  pool); called on integration unload and after each config-flow validation
+  attempt.
+- **`USER_AGENT` (`const.py`) changed to the exact string empirically proven
+  to work** — not the v0.23.0 string, which was never validated against a
+  real 403 and turned out to be aimed at the wrong problem (`aiohttp`'s TLS
+  fingerprint, not header content). See the comment on `USER_AGENT` for why
+  this exact value must not be swapped for something "nicer" without
+  re-validating against the live API first.
+- **`manifest.json`**: `requests>=2.28.0` added as a declared dependency
+  (previously an empty `requirements` list); version bumped to `0.24.0`.
+
+### Testing
+
+`tests/test_api.py` rewritten in full for the new transport — every mock now
+targets `requests.Session` instead of simulating `aiohttp`'s async
+context-manager response protocol. New tests specifically guard this
+release: the transport really is `requests` (`isinstance(api._session,
+requests.Session)`), `aiohttp` is not imported anywhere in the package,
+`manifest.json` declares the dependency, `USER_AGENT` matches the validated
+string exactly (a tripwire against an unvalidated "cleanup"), `aclose()`
+actually closes the session, and concurrent `_request()` calls against one
+shared session (matching the coordinator's fan-out-per-circuit pattern)
+resolve to the correct results. 303 tests pass; ruff clean; 86% coverage on
+`api.py`.
+
+
 
 Cloud-API compatibility release, fixing a blanket HTTP 403 reported against
 every endpoint, plus a config UI bug. Full investigation and verification

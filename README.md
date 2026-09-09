@@ -80,6 +80,7 @@ effect immediately and identically.
 - Program cache (5min TTL) reduces API calls
 - Dynamic entity discovery — new circuits added without restart
 - All circuit reads/writes use the `/v3` API (Hoval removed `/v1` circuit endpoints in April 2026); legacy v1 enum values still get normalized to v3 keys as a fallback
+- Cloud API calls go through `requests` (not Home Assistant's usual `aiohttp`), run via HA's background executor — a deliberate choice made in v0.24.0 after the cloud API started blocking `aiohttp` clients outright; see `docs/audit-v0.24.0.md` if you're curious why
 
 ### Troubleshooting
 

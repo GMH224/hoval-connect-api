@@ -12,7 +12,6 @@ from homeassistant.config_entries import (
     ConfigFlowResult,
     OptionsFlowWithReload,
 )
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import HovalApiError, HovalAuthError, HovalConnectApi
 from .const import (
@@ -62,8 +61,12 @@ class HovalConnectConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            session = async_get_clientsession(self.hass)
-            api = HovalConnectApi(session, user_input["email"], user_input["password"])
+            # v0.24.0: HovalConnectApi takes hass, not an aiohttp session —
+            # see api.py's module docstring. api.aclose() releases this
+            # short-lived validation client's connection pool once done;
+            # the real long-lived client created in async_setup_entry is
+            # closed separately, in async_unload_entry.
+            api = HovalConnectApi(self.hass, user_input["email"], user_input["password"])
 
             try:
                 async with asyncio.timeout(_VALIDATION_TIMEOUT_S):
@@ -88,6 +91,8 @@ class HovalConnectConfigFlow(ConfigFlow, domain=DOMAIN):
                         "password": user_input["password"],
                     },
                 )
+            finally:
+                await api.aclose()
 
         return self.async_show_form(
             step_id="user",
@@ -112,8 +117,7 @@ class HovalConnectConfigFlow(ConfigFlow, domain=DOMAIN):
             if user_input["email"].lower() != (reauth_entry.unique_id or "").lower():
                 errors["base"] = "wrong_account"
             else:
-                session = async_get_clientsession(self.hass)
-                api = HovalConnectApi(session, user_input["email"], user_input["password"])
+                api = HovalConnectApi(self.hass, user_input["email"], user_input["password"])
 
                 try:
                     async with asyncio.timeout(_VALIDATION_TIMEOUT_S):
@@ -136,6 +140,8 @@ class HovalConnectConfigFlow(ConfigFlow, domain=DOMAIN):
                             "password": user_input["password"],
                         },
                     )
+                finally:
+                    await api.aclose()
 
         return self.async_show_form(
             step_id="reauth_confirm",

@@ -1,15 +1,21 @@
-"""Tests for the Hoval Connect API client."""
+"""Tests for the Hoval Connect API client.
+
+v0.24.0: the transport changed from aiohttp to requests-in-executor (see
+api.py's module docstring and docs/audit-v0.24.0.md for why). Every mock in
+this file was rewritten accordingly: aiohttp's async-context-manager response
+protocol (`async with session.request(...) as resp`) is gone, replaced by
+plain synchronous `requests.Response`-like mocks and a `FakeHass` whose
+`async_add_executor_job` just calls the target function immediately. This
+is a faithful stand-in for a real executor round-trip from the test's point
+of view: same inputs, same outputs, same exceptions propagate the same way.
+"""
 
 from __future__ import annotations
 
-import asyncio
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-# Preserve the real asyncio module
-_real_asyncio = asyncio
 
 # Mock homeassistant modules so we can import without HA installed
 ha_mock = MagicMock()
@@ -20,12 +26,11 @@ sys.modules.setdefault("homeassistant.core", ha_mock)
 sys.modules.setdefault("homeassistant.exceptions", ha_mock)
 sys.modules.setdefault("homeassistant.helpers", ha_mock)
 sys.modules.setdefault("homeassistant.helpers.update_coordinator", ha_mock)
-sys.modules.setdefault("homeassistant.helpers.aiohttp_client", ha_mock)
 sys.modules.setdefault("homeassistant.helpers.device_registry", ha_mock)
 sys.modules.setdefault("homeassistant.helpers.dispatcher", ha_mock)
 sys.modules.setdefault("homeassistant.util", ha_mock)
 sys.modules.setdefault("homeassistant.util.dt", ha_mock)
-import aiohttp  # noqa: E402
+import requests  # noqa: E402
 import voluptuous as vol  # noqa: E402
 
 from custom_components.hoval_connect.api import (  # noqa: E402
@@ -41,30 +46,59 @@ from custom_components.hoval_connect.const import (  # noqa: E402
 )
 
 
-def _make_response(status: int, json_data=None, text: str = "") -> MagicMock:
-    """Create a mock aiohttp response."""
-    resp = AsyncMock()
-    resp.status = status
-    resp.content_length = 0 if status == 204 else 128
-    resp.json = AsyncMock(return_value=json_data if json_data is not None else {})
-    resp.text = AsyncMock(return_value=text)
+class FakeHass:
+    """Minimal stand-in for HomeAssistant — only what api.py actually uses.
+
+    HovalConnectApi runs its (blocking) requests calls via
+    `hass.async_add_executor_job()`. Running the target callable immediately
+    and returning/raising its result is equivalent, for test purposes, to a
+    real round-trip through HA's executor thread pool — same inputs, same
+    outputs, same exceptions.
+    """
+
+    async def async_add_executor_job(self, func, *args):
+        return func(*args)
+
+
+def _make_response(status_code: int, json_data=None, text: str = "") -> MagicMock:
+    """Create a mock requests.Response."""
+    resp = MagicMock(spec=requests.Response)
+    resp.status_code = status_code
+    resp.text = text
+    # Falsy for 204 (matches `not resp.content` in api.py), truthy otherwise —
+    # the actual byte content doesn't matter for any test here.
+    resp.content = b"" if status_code == 204 else b"x"
+    resp.json = MagicMock(return_value=json_data if json_data is not None else {})
     resp.raise_for_status = MagicMock()
-    if status >= 400:
-        resp.raise_for_status.side_effect = aiohttp.ClientResponseError(
-            request_info=MagicMock(),
-            history=(),
-            status=status,
+    if status_code >= 400:
+        resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            f"{status_code} error", response=resp
         )
-    # Make it work as async context manager
-    resp.__aenter__ = AsyncMock(return_value=resp)
-    resp.__aexit__ = AsyncMock(return_value=False)
     return resp
 
 
 def _make_session() -> MagicMock:
-    """Create a mock aiohttp session."""
-    session = MagicMock(spec=aiohttp.ClientSession)
-    return session
+    """Create a mock requests.Session."""
+    return MagicMock(spec=requests.Session)
+
+
+def _make_api(
+    session: MagicMock, email: str = "test@example.com", password: str = "pass"
+) -> HovalConnectApi:
+    """Build a HovalConnectApi wired to a FakeHass and the given mock session.
+
+    HovalConnectApi.__init__ always constructs its own real requests.Session()
+    (harmless — no I/O happens at construction time); this swaps it for the
+    mock immediately afterwards so tests can control and assert on it.
+    """
+    api = HovalConnectApi(FakeHass(), email, password)
+    api._session = session
+    return api
+
+
+def _mock_auth_ok(session: MagicMock, token: str = "token") -> None:
+    """Wire session.post (the IDP call) to succeed with the given id_token."""
+    session.post = MagicMock(return_value=_make_response(200, {"id_token": token}))
 
 
 # ---------------------------------------------------------------------------
@@ -78,10 +112,9 @@ class TestHovalConnectApiAuth:
     @pytest.mark.asyncio
     async def test_get_id_token_success(self):
         session = _make_session()
-        resp = _make_response(200, {"id_token": "test-token-123"})
-        session.post = MagicMock(return_value=resp)
+        _mock_auth_ok(session, "test-token-123")
 
-        api = HovalConnectApi(session, "test@example.com", "password123")
+        api = _make_api(session)
         token = await api._get_id_token()
 
         assert token == "test-token-123"
@@ -89,18 +122,17 @@ class TestHovalConnectApiAuth:
 
     @pytest.mark.asyncio
     async def test_get_id_token_sends_user_agent(self):
-        """Regression — v0.23.0 fix for a blanket HTTP 403.
+        """Regression — v0.23.0/v0.24.0 fix for a blanket HTTP 403.
 
-        No outbound request set a User-Agent at all before this fix; every
-        request inherited whatever Home Assistant's shared aiohttp session
-        applies by default. See USER_AGENT in const.py and
-        docs/audit-v0.23.0.md for the full diagnosis.
+        See USER_AGENT in const.py and docs/audit-v0.24.0.md for the full
+        diagnosis: this specific string is empirically required, not
+        decoration, and the v0.23.0 attempt at this fix (a different string,
+        under aiohttp) did not actually work.
         """
         session = _make_session()
-        resp = _make_response(200, {"id_token": "test-token-123"})
-        session.post = MagicMock(return_value=resp)
+        _mock_auth_ok(session, "test-token-123")
 
-        api = HovalConnectApi(session, "test@example.com", "password123")
+        api = _make_api(session)
         await api._get_id_token()
 
         headers = session.post.call_args.kwargs["headers"]
@@ -109,10 +141,9 @@ class TestHovalConnectApiAuth:
     @pytest.mark.asyncio
     async def test_get_id_token_caches(self):
         session = _make_session()
-        resp = _make_response(200, {"id_token": "test-token-123"})
-        session.post = MagicMock(return_value=resp)
+        _mock_auth_ok(session, "test-token-123")
 
-        api = HovalConnectApi(session, "test@example.com", "password123")
+        api = _make_api(session)
         token1 = await api._get_id_token()
         token2 = await api._get_id_token()
 
@@ -123,48 +154,46 @@ class TestHovalConnectApiAuth:
     async def test_get_id_token_invalid_credentials(self):
         session = _make_session()
         for status in (400, 401, 403):
-            resp = _make_response(status)
-            session.post = MagicMock(return_value=resp)
-
-            api = HovalConnectApi(session, "test@example.com", "wrong")
+            session.post = MagicMock(return_value=_make_response(status))
+            api = _make_api(session, password="wrong")
             with pytest.raises(HovalAuthError, match="Invalid credentials"):
                 await api._get_id_token()
 
     @pytest.mark.asyncio
     async def test_get_id_token_missing_token_in_response(self):
         session = _make_session()
-        resp = _make_response(200, {"access_token": "wrong-field"})
-        session.post = MagicMock(return_value=resp)
+        session.post = MagicMock(return_value=_make_response(200, {"access_token": "wrong-field"}))
 
-        api = HovalConnectApi(session, "test@example.com", "password123")
+        api = _make_api(session)
         with pytest.raises(HovalApiError, match="missing id_token"):
             await api._get_id_token()
 
     @pytest.mark.asyncio
     async def test_get_id_token_connection_error(self):
         session = _make_session()
-        session.post = MagicMock(side_effect=aiohttp.ClientError("connection failed"))
+        session.post = MagicMock(
+            side_effect=requests.exceptions.ConnectionError("connection failed")
+        )
 
-        api = HovalConnectApi(session, "test@example.com", "password123")
+        api = _make_api(session)
         with pytest.raises(HovalApiError, match="Connection error"):
             await api._get_id_token()
 
     @pytest.mark.asyncio
     async def test_get_id_token_timeout(self):
         session = _make_session()
-        session.post = MagicMock(side_effect=_real_asyncio.TimeoutError())
+        session.post = MagicMock(side_effect=requests.exceptions.Timeout())
 
-        api = HovalConnectApi(session, "test@example.com", "password123")
+        api = _make_api(session)
         with pytest.raises(HovalApiError, match="Connection error"):
             await api._get_id_token()
 
     @pytest.mark.asyncio
     async def test_invalidate_tokens(self):
         session = _make_session()
-        resp = _make_response(200, {"id_token": "token-1"})
-        session.post = MagicMock(return_value=resp)
+        _mock_auth_ok(session, "token-1")
 
-        api = HovalConnectApi(session, "test@example.com", "password123")
+        api = _make_api(session)
         await api._get_id_token()
         assert api._id_token == "token-1"
 
@@ -185,28 +214,22 @@ class TestHovalConnectApiRequest:
     @pytest.mark.asyncio
     async def test_request_success(self):
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
+        _mock_auth_ok(session)
+        session.request = MagicMock(return_value=_make_response(200, {"data": "test"}))
 
-        api_resp = _make_response(200, {"data": "test"})
-        session.request = MagicMock(return_value=api_resp)
-
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         result = await api._request("GET", "/api/test")
 
         assert result == {"data": "test"}
 
     @pytest.mark.asyncio
     async def test_request_sends_user_agent(self):
-        """Regression — v0.23.0 fix for a blanket HTTP 403 (see const.USER_AGENT)."""
+        """Regression — v0.23.0/v0.24.0 fix for a blanket HTTP 403 (see const.USER_AGENT)."""
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
+        _mock_auth_ok(session)
+        session.request = MagicMock(return_value=_make_response(200, {"data": "test"}))
 
-        api_resp = _make_response(200, {"data": "test"})
-        session.request = MagicMock(return_value=api_resp)
-
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         await api._request("GET", "/api/test")
 
         headers = session.request.call_args.kwargs["headers"]
@@ -214,19 +237,17 @@ class TestHovalConnectApiRequest:
 
     @pytest.mark.asyncio
     async def test_get_plant_access_token_sends_user_agent(self):
-        """Regression — v0.23.0 fix for a blanket HTTP 403 (see const.USER_AGENT).
+        """Regression — v0.23.0/v0.24.0 fix for a blanket HTTP 403 (see const.USER_AGENT).
 
         This call builds its headers by hand rather than via _headers(), so it
         needs its own coverage — a fix to _headers() alone would not catch a
         regression here.
         """
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-        pat_resp = _make_response(200, {"token": "pat-123"})
-        session.get = MagicMock(return_value=pat_resp)
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         await api._get_plant_access_token("plant-1")
 
         headers = session.get.call_args.kwargs["headers"]
@@ -236,17 +257,17 @@ class TestHovalConnectApiRequest:
     async def test_request_403_raises_api_error_without_retry(self):
         """
         403 is deliberately NOT retried like 401: refreshing the token has not
-        been observed to fix a 403 (see docs/audit-v0.23.0.md — the leading
-        hypothesis is a gateway/WAF-level block, not a token problem).
+        been observed to fix a 403. See docs/audit-v0.24.0.md — the actual
+        causes (aiohttp's TLS fingerprint + requests' default User-Agent
+        string) are both handled by this transport, but a 403 is still not
+        treated as automatically retryable, since neither cause is a
+        transient token problem.
         """
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
+        _mock_auth_ok(session)
+        session.request = MagicMock(return_value=_make_response(403, text="Forbidden by gateway"))
 
-        resp_403 = _make_response(403, text="Forbidden by gateway")
-        session.request = MagicMock(return_value=resp_403)
-
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         with pytest.raises(HovalApiError, match="HTTP 403"):
             await api._request("GET", "/api/test")
 
@@ -255,13 +276,10 @@ class TestHovalConnectApiRequest:
     @pytest.mark.asyncio
     async def test_request_204_returns_none(self):
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
+        _mock_auth_ok(session)
+        session.request = MagicMock(return_value=_make_response(204))
 
-        api_resp = _make_response(204)
-        session.request = MagicMock(return_value=api_resp)
-
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         result = await api._request("POST", "/api/test")
 
         assert result is None
@@ -269,14 +287,12 @@ class TestHovalConnectApiRequest:
     @pytest.mark.asyncio
     async def test_request_401_retries_with_fresh_token(self):
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-
+        _mock_auth_ok(session)
         resp_401 = _make_response(401)
         resp_ok = _make_response(200, {"data": "ok"})
         session.request = MagicMock(side_effect=[resp_401, resp_ok])
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         await api._get_id_token()
         result = await api._request("GET", "/api/test")
 
@@ -285,40 +301,32 @@ class TestHovalConnectApiRequest:
     @pytest.mark.asyncio
     async def test_request_401_twice_raises_auth_error(self):
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
+        _mock_auth_ok(session)
+        session.request = MagicMock(return_value=_make_response(401))
 
-        resp_401 = _make_response(401)
-        session.request = MagicMock(return_value=resp_401)
-
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         with pytest.raises(HovalAuthError, match="Authentication failed"):
             await api._request("GET", "/api/test")
 
     @pytest.mark.asyncio
     async def test_request_4xx_raises_api_error(self):
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
+        _mock_auth_ok(session)
+        session.request = MagicMock(return_value=_make_response(404, text="not found"))
 
-        resp_404 = _make_response(404, text="not found")
-        session.request = MagicMock(return_value=resp_404)
-
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         with pytest.raises(HovalApiError, match="HTTP 404"):
             await api._request("GET", "/api/test")
 
     @pytest.mark.asyncio
     async def test_request_retries_on_transient_errors(self):
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-
+        _mock_auth_ok(session)
         resp_503 = _make_response(503)
         resp_ok = _make_response(200, {"data": "recovered"})
         session.request = MagicMock(side_effect=[resp_503, resp_ok])
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         with patch("custom_components.hoval_connect.api.asyncio.sleep", new_callable=AsyncMock):
             result = await api._request("GET", "/api/test")
 
@@ -327,13 +335,10 @@ class TestHovalConnectApiRequest:
     @pytest.mark.asyncio
     async def test_request_retries_exhausted_raises(self):
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
+        _mock_auth_ok(session)
+        session.request = MagicMock(return_value=_make_response(503))
 
-        resp_503 = _make_response(503)
-        session.request = MagicMock(return_value=resp_503)
-
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         with (
             patch("custom_components.hoval_connect.api.asyncio.sleep", new_callable=AsyncMock),
             pytest.raises(HovalApiError, match="HTTP 503"),
@@ -343,9 +348,7 @@ class TestHovalConnectApiRequest:
     @pytest.mark.asyncio
     async def test_request_timeout_retries(self):
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-
+        _mock_auth_ok(session)
         resp_ok = _make_response(200, {"data": "ok"})
         call_count = 0
 
@@ -353,12 +356,12 @@ class TestHovalConnectApiRequest:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                raise _real_asyncio.TimeoutError()
+                raise requests.exceptions.Timeout()
             return resp_ok
 
         session.request = MagicMock(side_effect=_side_effect)
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         with patch("custom_components.hoval_connect.api.asyncio.sleep", new_callable=AsyncMock):
             result = await api._request("GET", "/api/test")
 
@@ -367,12 +370,10 @@ class TestHovalConnectApiRequest:
     @pytest.mark.asyncio
     async def test_request_timeout_all_retries_raises(self):
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
+        _mock_auth_ok(session)
+        session.request = MagicMock(side_effect=requests.exceptions.Timeout())
 
-        session.request = MagicMock(side_effect=_real_asyncio.TimeoutError())
-
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         with (
             patch("custom_components.hoval_connect.api.asyncio.sleep", new_callable=AsyncMock),
             pytest.raises(HovalApiError, match="timeout"),
@@ -382,9 +383,7 @@ class TestHovalConnectApiRequest:
     @pytest.mark.asyncio
     async def test_request_connection_error_retries(self):
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-
+        _mock_auth_ok(session)
         resp_ok = _make_response(200, {"data": "ok"})
         call_count = 0
 
@@ -392,12 +391,12 @@ class TestHovalConnectApiRequest:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                raise aiohttp.ClientError("conn refused")
+                raise requests.exceptions.ConnectionError("conn refused")
             return resp_ok
 
         session.request = MagicMock(side_effect=_side_effect)
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         with patch("custom_components.hoval_connect.api.asyncio.sleep", new_callable=AsyncMock):
             result = await api._request("GET", "/api/test")
 
@@ -415,14 +414,11 @@ class TestHovalConnectApiEndpoints:
     @pytest.mark.asyncio
     async def test_get_plants(self):
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-
+        _mock_auth_ok(session)
         plants_data = [{"plantExternalId": "p1", "description": "My Plant"}]
-        api_resp = _make_response(200, plants_data)
-        session.request = MagicMock(return_value=api_resp)
+        session.request = MagicMock(return_value=_make_response(200, plants_data))
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         result = await api.get_plants()
 
         assert result == plants_data
@@ -431,14 +427,15 @@ class TestHovalConnectApiEndpoints:
     async def test_get_plants_paginated_single_page(self):
         """get_plants handles Spring Page wrapper {"content": [...], "last": True}."""
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-
+        _mock_auth_ok(session)
         plants_data = [{"plantExternalId": "p1"}, {"plantExternalId": "p2"}]
-        page_resp = _make_response(200, {"content": plants_data, "last": True, "totalPages": 1})
-        session.request = MagicMock(return_value=page_resp)
+        session.request = MagicMock(
+            return_value=_make_response(
+                200, {"content": plants_data, "last": True, "totalPages": 1}
+            )
+        )
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         result = await api.get_plants()
 
         assert result == plants_data
@@ -448,16 +445,14 @@ class TestHovalConnectApiEndpoints:
     async def test_get_plants_paginated_multiple_pages(self):
         """get_plants fetches all pages and returns a flat list."""
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-
+        _mock_auth_ok(session)
         page0 = [{"plantExternalId": f"p{i}"} for i in range(12)]
         page1 = [{"plantExternalId": "p12"}]
         resp_page0 = _make_response(200, {"content": page0, "last": False, "totalPages": 2})
         resp_page1 = _make_response(200, {"content": page1, "last": True, "totalPages": 2})
         session.request = MagicMock(side_effect=[resp_page0, resp_page1])
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         result = await api.get_plants()
 
         assert len(result) == 13
@@ -469,16 +464,13 @@ class TestHovalConnectApiEndpoints:
     async def test_get_circuits_plain_list(self):
         """get_circuits returns a plain list unchanged."""
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-        pat_resp = _make_response(200, {"token": "pat-123"})
-        session.get = MagicMock(return_value=pat_resp)
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
 
         circuits = [{"type": "HK", "path": "1.1.0"}, {"type": "BL", "path": "1.10.1"}]
-        api_resp = _make_response(200, circuits)
-        session.request = MagicMock(return_value=api_resp)
+        session.request = MagicMock(return_value=_make_response(200, circuits))
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         result = await api.get_circuits("plant-1")
 
         assert result == circuits
@@ -487,17 +479,14 @@ class TestHovalConnectApiEndpoints:
     async def test_get_circuits_paginated_wrapper(self):
         """get_circuits extracts 'content' when API returns a paginated wrapper."""
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-        pat_resp = _make_response(200, {"token": "pat-123"})
-        session.get = MagicMock(return_value=pat_resp)
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
 
         circuits = [{"type": "HK", "path": "1.1.0"}, {"type": "BL", "path": "1.10.1"}]
         paginated = {"content": circuits, "totalElements": 2, "totalPages": 1, "last": True}
-        api_resp = _make_response(200, paginated)
-        session.request = MagicMock(return_value=api_resp)
+        session.request = MagicMock(return_value=_make_response(200, paginated))
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         result = await api.get_circuits("plant-1")
 
         assert result == circuits
@@ -506,16 +495,13 @@ class TestHovalConnectApiEndpoints:
     async def test_get_live_values_plain_list(self):
         """get_live_values returns a plain list unchanged."""
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-        pat_resp = _make_response(200, {"token": "pat-123"})
-        session.get = MagicMock(return_value=pat_resp)
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
 
         lv = [{"key": "tempActual", "value": "24.5"}, {"key": "operatingHours", "value": "13751"}]
-        api_resp = _make_response(200, lv)
-        session.request = MagicMock(return_value=api_resp)
+        session.request = MagicMock(return_value=_make_response(200, lv))
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         result = await api.get_live_values("plant-1", "1.10.1", "BL")
 
         assert result == lv
@@ -530,17 +516,14 @@ class TestHovalConnectApiEndpoints:
         causing BL to be silently dropped from plant_data.circuits.
         """
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-        pat_resp = _make_response(200, {"token": "pat-123"})
-        session.get = MagicMock(return_value=pat_resp)
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
 
         lv = [{"key": "tempActual", "value": "24.5"}, {"key": "operatingHours", "value": "13751"}]
         paginated = {"content": lv, "totalElements": 2, "size": 12, "last": True}
-        api_resp = _make_response(200, paginated)
-        session.request = MagicMock(return_value=api_resp)
+        session.request = MagicMock(return_value=_make_response(200, paginated))
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         result = await api.get_live_values("plant-1", "1.10.1", "BL")
 
         assert result == lv
@@ -553,17 +536,13 @@ class TestHovalConnectApiEndpoints:
         'for v in lv_raw' would raise TypeError and crash _fetch_circuit.
         """
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-
-        pat_resp = _make_response(200, {"token": "pat-123"})
-        session.get = MagicMock(return_value=pat_resp)
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
 
         # Simulate a 204 response (_request returns None)
-        api_resp = _make_response(204)
-        session.request = MagicMock(return_value=api_resp)
+        session.request = MagicMock(return_value=_make_response(204))
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         result = await api.get_live_values("plant-1", "1.10.1", "BL")
 
         assert result == []
@@ -572,19 +551,16 @@ class TestHovalConnectApiEndpoints:
     async def test_get_programs_returns_dict_for_programmable_circuit(self):
         """Normal HK/WW circuits return a dict from the programs endpoint."""
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-        pat_resp = _make_response(200, {"token": "pat-123"})
-        session.get = MagicMock(return_value=pat_resp)
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
 
         programs = {
             "week1": {"name": "Woche 1", "dayProgramIds": [1, 1, 1, 1, 1, 2, 2]},
             "dayPrograms": {"dayConfigurations": []},
         }
-        api_resp = _make_response(200, programs)
-        session.request = MagicMock(return_value=api_resp)
+        session.request = MagicMock(return_value=_make_response(200, programs))
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         result = await api.get_programs("plant-1", "1.1.0")
 
         assert isinstance(result, dict)
@@ -606,16 +582,13 @@ class TestHovalConnectApiEndpoints:
         — silently dropping BL from plant_data.circuits on every poll.
         """
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-        pat_resp = _make_response(200, {"token": "pat-123"})
-        session.get = MagicMock(return_value=pat_resp)
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
 
         # Hoval now returns [] for non-programmable circuits
-        api_resp = _make_response(200, [])
-        session.request = MagicMock(return_value=api_resp)
+        session.request = MagicMock(return_value=_make_response(200, []))
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         result = await api.get_programs("plant-1", "1.10.1")
 
         # API returns the raw [] — coordinator handles non-dict gracefully
@@ -636,15 +609,12 @@ class TestHovalConnectApiEndpoints:
         programmable.
         """
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-        pat_resp = _make_response(200, {"token": "pat-123"})
-        session.get = MagicMock(return_value=pat_resp)
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
 
-        api_resp = _make_response(417, text="")
-        session.request = MagicMock(return_value=api_resp)
+        session.request = MagicMock(return_value=_make_response(417, text=""))
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         with pytest.raises(HovalApiError, match="HTTP 417"):
             await api.get_programs("plant-1", "1.10.1")
 
@@ -652,16 +622,14 @@ class TestHovalConnectApiEndpoints:
     async def test_get_plant_settings_uses_request(self):
         """Verify get_plant_settings goes through _request (not raw session.get)."""
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
 
-        pat_resp = _make_response(200, {"token": "pat-123"})
-        session.get = MagicMock(return_value=pat_resp)
+        session.request = MagicMock(
+            return_value=_make_response(200, {"token": "pat-123", "setting1": "val"})
+        )
 
-        settings_resp = _make_response(200, {"token": "pat-123", "setting1": "val"})
-        session.request = MagicMock(return_value=settings_resp)
-
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         result = await api.get_plant_settings("plant-1")
 
         assert result["setting1"] == "val"
@@ -670,23 +638,19 @@ class TestHovalConnectApiEndpoints:
     @pytest.mark.asyncio
     async def test_set_temporary_change(self):
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
 
-        pat_resp = _make_response(200, {"token": "pat-123"})
-        session.get = MagicMock(return_value=pat_resp)
+        session.request = MagicMock(return_value=_make_response(204))
 
-        control_resp = _make_response(204)
-        session.request = MagicMock(return_value=control_resp)
-
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         result = await api.set_temporary_change("plant-1", "1.2.3", 65, "FOUR")
 
         assert result is None  # 204 returns None
 
     @pytest.mark.asyncio
     async def test_invalidate_plant_token(self):
-        api = HovalConnectApi(MagicMock(), "test@example.com", "pass")
+        api = _make_api(_make_session())
         api._pat_cache["plant-1"] = ("token", 9999999999)
 
         api.invalidate_plant_token("plant-1")
@@ -695,26 +659,23 @@ class TestHovalConnectApiEndpoints:
     @pytest.mark.asyncio
     async def test_invalidate_nonexistent_plant_token(self):
         """Should not raise when invalidating non-cached plant."""
-        api = HovalConnectApi(MagicMock(), "test@example.com", "pass")
+        api = _make_api(_make_session())
         api.invalidate_plant_token("nonexistent")  # Should not raise
 
     @pytest.mark.asyncio
     async def test_get_circuit_settings(self):
         """get_circuit_settings GETs .../settings and returns the parsed body."""
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-        pat_resp = _make_response(200, {"token": "pat-123"})
-        session.get = MagicMock(return_value=pat_resp)
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
 
         settings = {
             "circuitName": "Bodenheizung",
             "weatherImpact": {"outsideTemperature": 50, "solarRadiation": -5.0},
         }
-        api_resp = _make_response(200, settings)
-        session.request = MagicMock(return_value=api_resp)
+        session.request = MagicMock(return_value=_make_response(200, settings))
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         result = await api.get_circuit_settings("plant-1", "1.1.0")
 
         assert result == settings
@@ -731,15 +692,14 @@ class TestHovalConnectApiEndpoints:
         the untouched sibling field would be silently cleared to null.
         """
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-        pat_resp = _make_response(200, {"token": "pat-123"})
-        session.get = MagicMock(return_value=pat_resp)
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
 
-        control_resp = _make_response(200, {"circuitName": "Bodenheizung"})
-        session.request = MagicMock(return_value=control_resp)
+        session.request = MagicMock(
+            return_value=_make_response(200, {"circuitName": "Bodenheizung"})
+        )
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         await api.update_circuit_settings(
             "plant-1", "1.1.0", outside_temperature=80, solar_radiation=-3.0
         )
@@ -754,15 +714,12 @@ class TestHovalConnectApiEndpoints:
     async def test_update_circuit_settings_allows_null_field(self):
         """A field explicitly passed as None is sent as null (caller's responsibility to resolve)."""
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-        pat_resp = _make_response(200, {"token": "pat-123"})
-        session.get = MagicMock(return_value=pat_resp)
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
 
-        control_resp = _make_response(204)
-        session.request = MagicMock(return_value=control_resp)
+        session.request = MagicMock(return_value=_make_response(204))
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         result = await api.update_circuit_settings(
             "plant-1", "1.1.0", outside_temperature=None, solar_radiation=-2.0
         )
@@ -770,6 +727,115 @@ class TestHovalConnectApiEndpoints:
         assert result is None  # 204 returns None
         body = session.request.call_args.kwargs["json"]
         assert body == {"weatherImpact": {"outsideTemperature": None, "solarRadiation": -2.0}}
+
+
+# ---------------------------------------------------------------------------
+# v0.24.0 — transport itself (requests-in-executor, not aiohttp)
+# ---------------------------------------------------------------------------
+
+
+class TestRequestsTransport:
+    """Behavioral guards for the aiohttp -> requests transport change.
+
+    See api.py's module docstring and docs/audit-v0.24.0.md for the full
+    root-cause investigation. These tests exist so that a future change that
+    silently reverts to aiohttp, or "cleans up" the USER_AGENT string, fails
+    loudly instead of shipping a regression that only shows up as a live
+    403 against the real API.
+    """
+
+    def test_api_uses_real_requests_session(self):
+        """HovalConnectApi.__init__ must construct a real requests.Session,
+        not an aiohttp.ClientSession, and must not require one to be passed in."""
+        api = HovalConnectApi(FakeHass(), "test@example.com", "pass")
+        assert isinstance(api._session, requests.Session)
+
+    def test_source_does_not_import_aiohttp(self):
+        """Regression tripwire: api.py, __init__.py and config_flow.py must
+        not import aiohttp. A reintroduction would very likely resurrect the
+        TLS-fingerprint block documented in docs/audit-v0.24.0.md.
+        """
+        import os
+
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        component_dir = os.path.join(base, "custom_components", "hoval_connect")
+        for filename in ("api.py", "__init__.py", "config_flow.py"):
+            with open(os.path.join(component_dir, filename)) as f:
+                src = f.read()
+            # "aiohttp" may still appear in comments/docstrings explaining the
+            # history — that's fine and expected. An actual `import aiohttp`
+            # statement is what must never come back.
+            assert "import aiohttp" not in src, filename
+
+    def test_manifest_declares_requests_dependency(self):
+        """requests is a real runtime dependency now; HA needs it declared
+        in manifest.json to install it automatically."""
+        import json
+        import os
+
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        manifest_path = os.path.join(base, "custom_components", "hoval_connect", "manifest.json")
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        assert any(req.startswith("requests") for req in manifest["requirements"])
+
+    def test_user_agent_is_the_empirically_validated_string(self):
+        """Guard against USER_AGENT being changed to something unvalidated.
+
+        The exact string matters (see const.py's comment for the full story):
+        this is the one that was proven, via a live isolation test, to get
+        past Hoval's gateway. A "nicer-looking" replacement must be
+        re-validated against the live API before replacing this value —
+        this test only catches an accidental/casual change, not a
+        deliberate, validated one (which would update both the constant and
+        this assertion together).
+        """
+        assert (
+            USER_AGENT
+            == "hoval-connect-forensic-crawler/1.0 (+https://github.com/; diagnostic tool)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_aclose_closes_the_session_via_executor(self):
+        session = _make_session()
+        session.close = MagicMock()
+        api = _make_api(session)
+
+        await api.aclose()
+
+        session.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_requests_share_one_session_safely(self):
+        """Coordinator fans out one task per circuit via asyncio.gather();
+        under the new transport that means concurrent executor jobs all
+        calling the same shared requests.Session. This doesn't prove
+        thread-safety under real contention (that's requests/urllib3's own
+        documented guarantee), but it does prove the plumbing — concurrent
+        awaits on _request() — resolves each call to the right response and
+        doesn't deadlock or cross-wire results.
+        """
+        import asyncio
+
+        session = _make_session()
+        _mock_auth_ok(session)
+        session.request = MagicMock(
+            side_effect=[
+                _make_response(200, {"which": "first"}),
+                _make_response(200, {"which": "second"}),
+                _make_response(200, {"which": "third"}),
+            ]
+        )
+
+        api = _make_api(session)
+        results = await asyncio.gather(
+            api._request("GET", "/a"),
+            api._request("GET", "/b"),
+            api._request("GET", "/c"),
+        )
+
+        assert {r["which"] for r in results} == {"first", "second", "third"}
+        assert session.request.call_count == 3
 
 
 # ---------------------------------------------------------------------------
@@ -911,13 +977,10 @@ class TestEventEndpointNormalisation:
 
     def _api_with_response(self, json_data) -> HovalConnectApi:
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
-        pat_resp = _make_response(200, {"token": "pat-123"})
-        session.get = MagicMock(return_value=pat_resp)
-        api_resp = _make_response(200, json_data)
-        session.request = MagicMock(return_value=api_resp)
-        return HovalConnectApi(session, "test@example.com", "pass")
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
+        session.request = MagicMock(return_value=_make_response(200, json_data))
+        return _make_api(session)
 
     @pytest.mark.asyncio
     async def test_get_events_plain_list(self):
@@ -977,8 +1040,7 @@ class TestGetPlantsPageCap:
         from custom_components.hoval_connect.api import _MAX_PLANT_PAGES
 
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
+        _mock_auth_ok(session)
 
         counter = {"n": 0}
 
@@ -989,7 +1051,7 @@ class TestGetPlantsPageCap:
 
         session.request = MagicMock(side_effect=_endless_page)
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         result = await api.get_plants()
 
         # One plant per page, capped at _MAX_PLANT_PAGES pages/requests.
@@ -999,13 +1061,12 @@ class TestGetPlantsPageCap:
     @pytest.mark.asyncio
     async def test_cap_does_not_affect_normal_pagination(self):
         session = _make_session()
-        auth_resp = _make_response(200, {"id_token": "token"})
-        session.post = MagicMock(return_value=auth_resp)
+        _mock_auth_ok(session)
         resp0 = _make_response(200, {"content": [{"plantExternalId": "p0"}], "last": False})
         resp1 = _make_response(200, {"content": [{"plantExternalId": "p1"}], "last": True})
         session.request = MagicMock(side_effect=[resp0, resp1])
 
-        api = HovalConnectApi(session, "test@example.com", "pass")
+        api = _make_api(session)
         result = await api.get_plants()
         assert [p["plantExternalId"] for p in result] == ["p0", "p1"]
         assert session.request.call_count == 2

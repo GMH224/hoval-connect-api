@@ -1,13 +1,58 @@
-"""Async API client for Hoval Connect."""
+"""API client for Hoval Connect.
+
+TRANSPORT: requests-in-executor, not aiohttp (v0.24.0)
+--------------------------------------------------------
+This client deliberately does NOT use aiohttp, which is unusual for a Home
+Assistant integration and should not be "cleaned up" back to aiohttp without
+re-reading this note and docs/audit-v0.24.0.md in full.
+
+Root cause (v0.23.0 -> v0.24.0): Hoval's Azure Application Gateway started
+blocking this integration with a blanket HTTP 403 on every endpoint. Two
+independent, empirically-isolated causes were found by testing single
+variables at a time against the live API:
+
+1. aiohttp's TLS connection fingerprint is blocked outright, regardless of
+   headers. Confirmed across FOUR separate configurations, all against the
+   real API, all HTTP 403: aiohttp's default connector; aiohttp + an
+   explicit User-Agent; aiohttp + Accept/Accept-Encoding/Connection headers
+   matching what `requests` sends by default; aiohttp with its TLS context
+   rebuilt from urllib3's own cipher list (urllib3.util.ssl_.create_urllib3_context()).
+   That last one matches requests' cipher suite exactly and STILL failed, so
+   this is not fixable by cipher/header tuning from within aiohttp — it's
+   some other property of aiohttp's TLS handshake or connection handling.
+2. `requests`' own DEFAULT User-Agent ("python-requests/X.Y.Z") is
+   independently blocked — almost certainly a WAF signature rule against
+   well-known scripting-tool default identities, extremely common on API
+   gateways. Confirmed by isolating this one variable: an otherwise
+   byte-identical plain `requests` script got HTTP 403 with the default
+   User-Agent and HTTP 200 with a custom one, with nothing else changed.
+
+Combined, the ONLY configuration empirically proven to work end-to-end
+against the live API is: the `requests` library, with an explicit non-default
+User-Agent. That is what this file does. See USER_AGENT in const.py for the
+specific string in use and why it must not be changed casually.
+
+Since `requests` is a blocking library, every call is wrapped in
+`hass.async_add_executor_job()` — Home Assistant's sanctioned mechanism for
+running blocking code from async integrations — so the integration remains
+non-blocking from HA's perspective even though the actual HTTP client
+underneath is synchronous. A single `requests.Session()` is created once and
+reused for the lifetime of this client (matching the coordinator's existing
+"fan out one task per circuit" concurrency pattern); this is safe because
+requests/urllib3's connection pool is explicitly designed for concurrent use
+from multiple threads.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import time
 from typing import Any
 
-import aiohttp
+import requests
+from homeassistant.core import HomeAssistant
 
 from .const import (
     BASE_URL,
@@ -36,10 +81,12 @@ _RETRY_BASE_DELAY = 0.5  # seconds, doubled before each subsequent attempt
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 # Split timeouts: fail fast on dead connections, allow longer for slow reads.
+# requests accepts this as a (connect, read) tuple directly.
 # Total worst-case per attempt: _CONNECT_TIMEOUT + _READ_TIMEOUT = 28 s.
 # With 2 retries: ~28 + 0.5 + 28 = ~57 s max for a single endpoint.
 _CONNECT_TIMEOUT = 8  # seconds to establish the TCP connection
 _READ_TIMEOUT = 20  # seconds to receive the full response body
+_TIMEOUT = (_CONNECT_TIMEOUT, _READ_TIMEOUT)
 
 # Hard upper bound on my-plants pagination (audit finding F3, v0.21.1).
 # 50 pages x 12 plants/page = 600 plants — far beyond any real account.
@@ -60,16 +107,30 @@ class HovalApiError(Exception):
 
 
 class HovalConnectApi:
-    """Async client for the Hoval Connect cloud API."""
+    """Client for the Hoval Connect cloud API.
+
+    Not "async" in the traditional sense internally (see module docstring for
+    why) but every public method is a coroutine, matching the previous
+    aiohttp-based client's interface exactly — no caller outside this file
+    (coordinator.py, config_flow.py) needed to change how it calls this class.
+    """
 
     def __init__(
         self,
-        session: aiohttp.ClientSession,
+        hass: HomeAssistant,
         email: str,
         password: str,
     ) -> None:
-        """Initialize the API client."""
-        self._session = session
+        """Initialize the API client.
+
+        Takes `hass` (to schedule blocking requests calls via
+        `hass.async_add_executor_job`) instead of an aiohttp session — see
+        module docstring. Creating a plain `requests.Session()` here is safe
+        to do synchronously: it allocates local objects only and performs no
+        I/O of its own.
+        """
+        self._hass = hass
+        self._session = requests.Session()
         self._email = email
         self._password = password
         self._id_token: str | None = None
@@ -83,6 +144,60 @@ class HovalConnectApi:
         # _get_plant_access_token() calls _get_id_token() while holding its own.
         self._id_token_lock = asyncio.Lock()
         self._pat_lock = asyncio.Lock()
+
+    def _sync_post(
+        self, url: str, *, data: dict[str, str], headers: dict[str, str]
+    ) -> requests.Response:
+        """Blocking POST — used only for the IDP auth call.
+
+        MUST only ever be invoked via `hass.async_add_executor_job()`. See
+        `_sync_request`'s docstring for why reading the returned Response
+        afterwards on the event loop thread is safe.
+        """
+        return self._session.post(url, data=data, headers=headers, timeout=_TIMEOUT)
+
+    def _sync_get(self, url: str, *, headers: dict[str, str]) -> requests.Response:
+        """Blocking GET — used only for the plant-access-token fetch.
+
+        MUST only ever be invoked via `hass.async_add_executor_job()`.
+        """
+        return self._session.get(url, headers=headers, timeout=_TIMEOUT)
+
+    def _sync_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, str] | None = None,
+        json_data: Any = None,
+    ) -> requests.Response:
+        """Blocking generic request — used by every method via _request().
+
+        MUST only ever be invoked via `hass.async_add_executor_job()`. Never
+        call this directly from a coroutine running on the event loop — it
+        blocks the calling thread for the full duration of the request.
+
+        Returns the raw `requests.Response`. Reading `.status_code`, `.text`,
+        `.headers`, and calling `.json()` on it afterwards from the event
+        loop thread is safe and does not touch the network again: by the
+        time `session.request()` returns, the full response body is already
+        buffered in memory (this client never passes `stream=True`), so
+        those are pure in-memory operations.
+        """
+        return self._session.request(
+            method, url, headers=headers, params=params, json=json_data, timeout=_TIMEOUT
+        )
+
+    async def aclose(self) -> None:
+        """Close the underlying requests session's connection pool.
+
+        Called from async_unload_entry(). session.close() is typically fast
+        but is still blocking socket-cleanup work, so it runs on the executor
+        for consistency with every other call in this class rather than
+        assuming it's always instantaneous.
+        """
+        await self._hass.async_add_executor_job(self._session.close)
 
     async def _get_id_token(self) -> str:
         """Get or refresh the ID token via OAuth2 password grant.
@@ -101,31 +216,31 @@ class HovalConnectApi:
                 return self._id_token
 
             try:
-                async with self._session.post(
-                    IDP_URL,
-                    data={
-                        "grant_type": "password",
-                        "client_id": CLIENT_ID,
-                        "username": self._email,
-                        "password": self._password,
-                        "scope": "openid",
-                    },
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "User-Agent": USER_AGENT,
-                    },
-                    timeout=aiohttp.ClientTimeout(
-                        connect=_CONNECT_TIMEOUT, sock_read=_READ_TIMEOUT
-                    ),
-                ) as resp:
-                    if resp.status in (400, 401, 403):
-                        _LOGGER.warning("IDP auth failed (HTTP %s)", resp.status)
-                        raise HovalAuthError(f"Invalid credentials (HTTP {resp.status})")
-                    resp.raise_for_status()
-                    data = await resp.json()
+                resp = await self._hass.async_add_executor_job(
+                    functools.partial(
+                        self._sync_post,
+                        IDP_URL,
+                        data={
+                            "grant_type": "password",
+                            "client_id": CLIENT_ID,
+                            "username": self._email,
+                            "password": self._password,
+                            "scope": "openid",
+                        },
+                        headers={
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "User-Agent": USER_AGENT,
+                        },
+                    )
+                )
+                if resp.status_code in (400, 401, 403):
+                    _LOGGER.warning("IDP auth failed (HTTP %s)", resp.status_code)
+                    raise HovalAuthError(f"Invalid credentials (HTTP {resp.status_code})")
+                resp.raise_for_status()
+                data = resp.json()
             except HovalAuthError:
                 raise
-            except (aiohttp.ClientError, TimeoutError) as err:
+            except (requests.exceptions.RequestException, TimeoutError) as err:
                 raise HovalApiError(f"Connection error during authentication: {err}") from err
 
             if not isinstance(data, dict) or "id_token" not in data:
@@ -151,24 +266,24 @@ class HovalConnectApi:
 
             id_token = await self._get_id_token()
             try:
-                async with self._session.get(
-                    f"{BASE_URL}/v1/plants/{plant_id}/settings",
-                    headers={
-                        "Authorization": f"Bearer {id_token}",
-                        "User-Agent": USER_AGENT,
-                    },
-                    timeout=aiohttp.ClientTimeout(
-                        connect=_CONNECT_TIMEOUT, sock_read=_READ_TIMEOUT
-                    ),
-                ) as resp:
-                    if resp.status == 401:
-                        self._id_token = None
-                        raise HovalAuthError("ID token rejected")
-                    resp.raise_for_status()
-                    data = await resp.json()
+                resp = await self._hass.async_add_executor_job(
+                    functools.partial(
+                        self._sync_get,
+                        f"{BASE_URL}/v1/plants/{plant_id}/settings",
+                        headers={
+                            "Authorization": f"Bearer {id_token}",
+                            "User-Agent": USER_AGENT,
+                        },
+                    )
+                )
+                if resp.status_code == 401:
+                    self._id_token = None
+                    raise HovalAuthError("ID token rejected")
+                resp.raise_for_status()
+                data = resp.json()
             except (HovalAuthError, HovalApiError):
                 raise
-            except (aiohttp.ClientError, TimeoutError) as err:
+            except (requests.exceptions.RequestException, TimeoutError) as err:
                 raise HovalApiError(f"Connection error fetching plant token: {err}") from err
 
             if not isinstance(data, dict) or "token" not in data:
@@ -183,11 +298,10 @@ class HovalConnectApi:
     async def _headers(self, plant_id: str | None = None) -> dict[str, str]:
         """Build request headers with auth tokens.
 
-        Includes an explicit User-Agent on every request (see USER_AGENT in
-        const.py for why: the previously-absent header, defaulting to Home
-        Assistant's own aiohttp session identity, is the prime suspect for a
-        blanket HTTP 403 across all endpoints, most likely enforced by the
-        Azure Application Gateway in front of this API).
+        Includes an explicit User-Agent on every request. See the module
+        docstring and USER_AGENT in const.py: this is not optional decoration
+        — it is one of the two empirically-confirmed requirements for this
+        API to respond at all.
         """
         id_token = await self._get_id_token()
         headers = {"Authorization": f"Bearer {id_token}", "User-Agent": USER_AGENT}
@@ -207,9 +321,6 @@ class HovalConnectApi:
     ) -> Any:
         """Make an authenticated API request with token retry and transient error backoff."""
         url = f"{BASE_URL}{path}"
-        # Use separate connect and read timeouts so a dead server is detected
-        # quickly (connect) while still allowing slow-but-alive responses (read).
-        timeout = aiohttp.ClientTimeout(connect=_CONNECT_TIMEOUT, sock_read=_READ_TIMEOUT)
 
         for attempt in range(_MAX_RETRIES):
             # Rebuild headers on every attempt so a token that expires mid-retry
@@ -217,71 +328,74 @@ class HovalConnectApi:
             # token that will be rejected with 401.
             headers = await self._headers(plant_id)
             try:
-                async with self._session.request(
-                    method,
-                    url,
-                    headers=headers,
-                    params=params,
-                    json=json_data,
-                    timeout=timeout,
-                ) as resp:
-                    _LOGGER.debug("API %s %s → HTTP %s", method, path, resp.status)
-                    if resp.status == 401:
-                        self._id_token = None
-                        if plant_id:
-                            self._pat_cache.pop(plant_id, None)
-                        if _retry:
-                            _LOGGER.debug("Token expired, refreshing and retrying")
-                            return await self._request(
-                                method,
-                                path,
-                                plant_id,
-                                params,
-                                json_data,
-                                _retry=False,
-                            )
-                        raise HovalAuthError("Authentication failed")
-                    if resp.status == 403:
-                        # Not retried: unlike 401 (expired token), a 403 has not
-                        # been observed to be fixed by refreshing tokens — see
-                        # USER_AGENT in const.py for the diagnosis this pointed
-                        # to. Logged distinctly (rather than falling straight
-                        # into the generic >=400 branch below) so the next
-                        # occurrence is easy to find in the log and its body
-                        # can be compared against that diagnosis.
-                        body = await resp.text()
-                        _LOGGER.warning(
-                            "API %s %s -> HTTP 403 (Forbidden). If this persists "
-                            "after upgrading, please capture this log line and "
-                            "the response body and report it: %s",
+                resp = await self._hass.async_add_executor_job(
+                    functools.partial(
+                        self._sync_request,
+                        method,
+                        url,
+                        headers=headers,
+                        params=params,
+                        json_data=json_data,
+                    )
+                )
+                _LOGGER.debug("API %s %s → HTTP %s", method, path, resp.status_code)
+                if resp.status_code == 401:
+                    self._id_token = None
+                    if plant_id:
+                        self._pat_cache.pop(plant_id, None)
+                    if _retry:
+                        _LOGGER.debug("Token expired, refreshing and retrying")
+                        return await self._request(
                             method,
                             path,
-                            body[:500],
+                            plant_id,
+                            params,
+                            json_data,
+                            _retry=False,
                         )
-                        raise HovalApiError(f"API request failed: HTTP 403: {body[:500]}")
-                    if resp.status in _RETRYABLE_STATUS_CODES and attempt < _MAX_RETRIES - 1:
-                        delay = _RETRY_BASE_DELAY * (2**attempt)
-                        _LOGGER.warning(
-                            "Transient error HTTP %s on %s %s, retrying in %.1fs (%d/%d)",
-                            resp.status,
-                            method,
-                            path,
-                            delay,
-                            attempt + 1,
-                            _MAX_RETRIES,
-                        )
-                        await asyncio.sleep(delay)
-                        continue
-                    if resp.status >= 400:
-                        body = await resp.text()
-                        _LOGGER.debug("API error body: %s", body[:500])
-                        raise HovalApiError(f"API request failed: HTTP {resp.status}")
-                    if resp.status == 204 or resp.content_length == 0:
-                        return None
-                    return await resp.json()
+                    raise HovalAuthError("Authentication failed")
+                if resp.status_code == 403:
+                    # Not retried: unlike 401 (expired token), a 403 has not
+                    # been observed to be fixed by refreshing tokens — see the
+                    # module docstring for the two confirmed causes this
+                    # pointed to (now both addressed by this transport). If
+                    # this fires again, both diagnosed causes have been ruled
+                    # out, so start over from docs/audit-v0.24.0.md rather
+                    # than assuming it's a third variant of the same headers
+                    # issue.
+                    body = resp.text
+                    _LOGGER.warning(
+                        "API %s %s -> HTTP 403 (Forbidden). If this persists "
+                        "after upgrading, please capture this log line and "
+                        "the response body and report it: %s",
+                        method,
+                        path,
+                        body[:500],
+                    )
+                    raise HovalApiError(f"API request failed: HTTP 403: {body[:500]}")
+                if resp.status_code in _RETRYABLE_STATUS_CODES and attempt < _MAX_RETRIES - 1:
+                    delay = _RETRY_BASE_DELAY * (2**attempt)
+                    _LOGGER.warning(
+                        "Transient error HTTP %s on %s %s, retrying in %.1fs (%d/%d)",
+                        resp.status_code,
+                        method,
+                        path,
+                        delay,
+                        attempt + 1,
+                        _MAX_RETRIES,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                if resp.status_code >= 400:
+                    body = resp.text
+                    _LOGGER.debug("API error body: %s", body[:500])
+                    raise HovalApiError(f"API request failed: HTTP {resp.status_code}")
+                if resp.status_code == 204 or not resp.content:
+                    return None
+                return resp.json()
             except (HovalAuthError, HovalApiError):
                 raise
-            except TimeoutError as err:
+            except requests.exceptions.Timeout as err:
                 if attempt < _MAX_RETRIES - 1:
                     delay = _RETRY_BASE_DELAY * (2**attempt)
                     _LOGGER.warning(
@@ -300,7 +414,7 @@ class HovalConnectApi:
                 raise HovalApiError(
                     f"Request timeout after {_MAX_RETRIES} attempts: {err}"
                 ) from err
-            except aiohttp.ClientError as err:
+            except requests.exceptions.RequestException as err:
                 if attempt < _MAX_RETRIES - 1:
                     delay = _RETRY_BASE_DELAY * (2**attempt)
                     _LOGGER.warning(
@@ -480,7 +594,9 @@ class HovalConnectApi:
         weighting introduced in the Hoval Connect app in 2026-07:
             {"outsideTemperature": <int 0..100>, "solarRadiation": <float -10..0>}
         Either sub-field (or the whole `weatherImpact` object) may be null for
-        circuit types/firmware versions that don't support it.
+        circuit types/firmware versions that don't support it. As of the
+        v0.23.0 forensic crawl this key can also be absent entirely — see
+        coordinator.py's "weatherImpact" in settings check.
         """
         return await self._request(
             "GET",

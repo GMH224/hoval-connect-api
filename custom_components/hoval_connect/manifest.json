@@ -9,6 +9,8 @@
   "integration_type": "hub",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/hoval-connect/hoval-connect-api/issues",
-  "requirements": [],
-  "version": "0.23.0"
+  "requirements": [
+    "requests>=2.28.0"
+  ],
+  "version": "0.24.0"
 }

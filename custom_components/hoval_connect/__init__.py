@@ -11,7 +11,6 @@ from homeassistant.const import MAJOR_VERSION, MINOR_VERSION, Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.storage import Store
 
@@ -164,8 +163,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: HovalConnectConfigEntry)
     """Set up Hoval Connect from a config entry."""
     _check_ha_version()
 
-    session = async_get_clientsession(hass)
-    api = HovalConnectApi(session, entry.data["email"], entry.data["password"])
+    # v0.24.0: HovalConnectApi takes hass (to run its requests-in-executor
+    # calls), not an aiohttp session — see api.py's module docstring for why
+    # this integration deliberately does not use Home Assistant's shared
+    # aiohttp session.
+    api = HovalConnectApi(hass, entry.data["email"], entry.data["password"])
 
     health_store = Store(hass, HEALTH_STORAGE_VERSION, HEALTH_STORAGE_KEY)
 
@@ -216,4 +218,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: HovalConnectConfigEntry
     # Force an immediate save so counters are not lost on a clean shutdown even
     # if the debounced save (triggered after each successful poll) hasn't fired.
     await coordinator.async_save_health()
+    # v0.24.0: release the requests.Session()'s connection pool. Harmless to
+    # skip (Python would eventually garbage-collect it), but tidy shutdown is
+    # cheap and consistent with how an aiohttp session would have been
+    # managed by HA itself before this integration switched transports.
+    await entry.runtime_data.api.aclose()
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

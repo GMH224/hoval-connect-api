@@ -12,31 +12,40 @@ IDP_URL = "https://akwc5scsc.accounts.ondemand.com/oauth2/token"
 CLIENT_ID = "991b54b2-7e67-47ef-81fe-572e21c59899"
 
 # Custom User-Agent sent on every outbound request (IDP token calls and all
-# BASE_URL calls). Added in 0.23.0 as the fix for a blanket HTTP 403 reported
-# against every endpoint (see docs/audit-v0.23.0.md for the full write-up).
+# BASE_URL calls).
 #
-# Root-cause evidence: a one-off forensic crawl (2026-09-09) performed a fresh
-# password-grant login and then exercised every endpoint this integration
-# calls, using a distinctive custom User-Agent — every call succeeded (HTTP
-# 200/expected), including auth against the unchanged CLIENT_ID/IDP_URL above.
-# Nothing in this integration's code sets a User-Agent at all, so it was
-# sending whatever default Home Assistant's shared aiohttp session applies.
-# The API sits behind an Azure Application Gateway (visible in the 502 error
-# pages the crawl got from unrelated metadata paths), which is a common place
-# to enforce User-Agent allow/deny rules. Setting an explicit, stable
-# User-Agent removes the one variable that differed between "crawl: works"
-# and "integration: blanket 403".
+# ⚠️ DO NOT CHANGE THIS STRING WITHOUT RE-VALIDATING AGAINST THE LIVE API. ⚠️
+# This exact value is empirically proven (not guessed) to get past Hoval's
+# Azure Application Gateway. See docs/audit-v0.24.0.md for the full
+# investigation; summary below.
 #
-# Caveat, recorded for the next person: this was not confirmed against an
-# actual captured 403 response body/headers from a live installation (none
-# was available at diagnosis time), so if 403s persist after this change,
-# that is the next thing to capture (enable debug logging for
-# custom_components.hoval_connect and inspect the "API error body" log line).
+# History: v0.23.0 first added a User-Agent here (a different string,
+# "HovalConnectHomeAssistant/1.0 ...") as a fix for a blanket HTTP 403 on
+# every endpoint. That release shipped without live confirmation it worked —
+# it didn't. The 403 persisted. Root-causing it properly (v0.24.0) required
+# isolating one variable at a time directly against the live API and found
+# TWO independent causes stacked on top of each other:
 #
-# Deliberately NOT tied to the integration's own release version (the "/1.0"
-# below is a UA-scheme version, not this package's version) so it doesn't
-# need bumping on every release.
-USER_AGENT = "HovalConnectHomeAssistant/1.0 (+https://github.com/hoval-connect/hoval-connect-api)"
+#   1. aiohttp's TLS connection fingerprint is blocked outright, regardless
+#      of any header content — confirmed across default aiohttp, aiohttp +
+#      this same custom User-Agent, aiohttp + more headers, and aiohttp with
+#      its cipher suite list rebuilt to exactly match urllib3's. All HTTP 403.
+#      This is why v0.23.0's User-Agent fix alone did not work: it was aimed
+#      at aiohttp, which was blocked for an unrelated, lower-level reason.
+#   2. `requests`' own DEFAULT User-Agent string, "python-requests/X.Y.Z", is
+#      SEPARATELY blocked — almost certainly a WAF rule against well-known
+#      scripting-tool identities. Confirmed by changing only this one string,
+#      nothing else, on an otherwise byte-identical plain-requests script:
+#      HTTP 403 with the default UA, HTTP 200 with a custom one.
+#
+# v0.24.0 therefore does two things together: switches the transport from
+# aiohttp to requests-in-executor (api.py), AND keeps sending an explicit,
+# non-default User-Agent, because #2 above still applies to requests too.
+# The specific string below is the exact one used in the successful test —
+# not a stylistic choice. If you want a different, more "branded" string,
+# it must be validated against the live API first (see docs/audit-v0.24.0.md
+# for the minimal test-script pattern used) before it replaces this one.
+USER_AGENT = "hoval-connect-forensic-crawler/1.0 (+https://github.com/; diagnostic tool)"
 
 # Token TTLs (with safety margins)
 ID_TOKEN_TTL = timedelta(minutes=25)

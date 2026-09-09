@@ -482,10 +482,24 @@ class TestDeprecationGuards:
         assert not offenders, f"{symbol} ({self.BANNED[symbol]}) found in {offenders}"
 
     def test_no_legacy_serial_dependency(self) -> None:
+        """No dependency on the old CAN-bus/serial hardware stack.
+
+        This integration's predecessor (Hoval-GatewayV2-CANBUS-MQTT) required
+        a physical CAN adapter and pyserial-family packages; the whole point
+        of hoval_connect is that none of that hardware is needed anymore.
+        `requirements == []` was a fine proxy for that invariant until
+        v0.24.0 added a real, justified cloud-API dependency (`requests` —
+        see docs/audit-v0.24.0.md for why). Check what this test actually
+        cares about directly instead, so a legitimate future dependency
+        doesn't fail it again for an unrelated reason.
+        """
         import json
 
         manifest = json.loads((COMPONENT_DIR / "manifest.json").read_text())
-        assert manifest["requirements"] == []
+        banned_substrings = ("serial", "can-", "pycan", "canbus")
+        for requirement in manifest["requirements"]:
+            lowered = requirement.lower()
+            assert not any(b in lowered for b in banned_substrings), requirement
 
     def test_all_platforms_use_config_entry_add_entities_callback(self) -> None:
         """AddConfigEntryEntitiesCallback is the correct type for config entries."""
@@ -605,14 +619,15 @@ class TestManifestAndMetadata:
         (see the "Housekeeping note" in CHANGELOG.md's [0.23.0] entry, and
         the version-numbering note in docs/audit-v0.23.0.md) — a first pass
         at fixing this test asserted "2.23.0", continuing the typo instead of
-        catching it. Now asserts the correct "0.23.0", continuing properly
-        from 0.21.1. Bump this string (and manifest.json) together on
-        release.
+        catching it. Corrected to "0.23.0" in that release, continuing
+        properly from 0.21.1. Now bumped again to "0.24.0" for the
+        requests-transport rewrite (see docs/audit-v0.24.0.md). Bump this
+        string (and manifest.json) together on release.
         """
         import json
 
         manifest = json.loads((COMPONENT_DIR / "manifest.json").read_text())
-        assert manifest["version"] == "0.23.0"
+        assert manifest["version"] == "0.24.0"
 
     def test_hacs_minimum_ha_covers_via_device_id(self) -> None:
         """via_device_id landed in HA 2026.8; earlier versions raise TypeError.
