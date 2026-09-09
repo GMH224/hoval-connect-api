@@ -19,6 +19,7 @@ Verified against the real Home Assistant 2026.9.0 wheel:
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -145,8 +146,6 @@ class TestOptionsFlowLifecycle:
 
         result = flow.async_step_init.__wrapped__(flow, submitted) if False else None
         # async_step_init is a coroutine; drive it directly.
-        import asyncio
-
         result = asyncio.run(flow.async_step_init(submitted))
 
         assert result["type"] == "create_entry"
@@ -167,6 +166,61 @@ class TestOptionsFlowLifecycle:
         entry = MagicMock()
         entry.options = {"scan_interval": "not-a-number"}
         assert hoval._get_scan_interval(entry) == hoval.DEFAULT_SCAN_INTERVAL
+
+    def test_scan_interval_options_form_prefills_stored_ten_minute_value(self) -> None:
+        """
+        Regression — v0.23.0 fix for "Polling interval field renders empty".
+
+        Before the fix, SCAN_INTERVAL_OPTIONS had no 600-second entry, so a
+        config entry with scan_interval=600 stored produced a schema whose
+        `default=600` for this field did not match any of the dropdown's own
+        valid keys. That mismatch is exactly what leaves an HA select control
+        rendered with nothing selected, even though every *other* field on
+        the same form — whose stored value did have a matching option —
+        rendered normally. This drives the real async_step_init(None)
+        "show form" path (not previously covered by any test), builds the
+        real schema config_flow.py generates, and asserts the default is
+        both present and independently valid against the dropdown's own
+        validator — the second assertion is the one that would have failed
+        before the fix.
+        """
+        flow = HovalConnectOptionsFlow()
+        flow.config_entry = MagicMock(
+            options={
+                "scan_interval": 600,
+                "turn_on_mode": "resume",
+                "override_duration": "FOUR",
+            }
+        )
+
+        result = asyncio.run(flow.async_step_init(None))
+
+        assert result["type"] == "form"
+        schema_dict = result["data_schema"].schema
+        scan_marker = next(k for k in schema_dict if k == "scan_interval")
+        assert scan_marker.default() == 600
+
+        scan_validator = schema_dict[scan_marker]
+        assert scan_validator(600) == 600
+        # Also the shape the real frontend actually submits.
+        assert scan_validator("600") == 600
+
+    def test_scan_interval_options_form_prefills_five_minute_value(self) -> None:
+        """Sibling case: 300 already had a matching option before this fix."""
+        flow = HovalConnectOptionsFlow()
+        flow.config_entry = MagicMock(
+            options={
+                "scan_interval": 300,
+                "turn_on_mode": "resume",
+                "override_duration": "FOUR",
+            }
+        )
+
+        result = asyncio.run(flow.async_step_init(None))
+
+        schema_dict = result["data_schema"].schema
+        scan_marker = next(k for k in schema_dict if k == "scan_interval")
+        assert scan_marker.default() == 300
 
 
 # ---------------------------------------------------------------------------
@@ -542,10 +596,23 @@ class TestManifestAndMetadata:
     """Version and minimum-HA metadata must match the APIs actually used."""
 
     def test_version_is_bumped(self) -> None:
+        """
+        Pre-existing drift found while working on this release: this
+        assertion hardcoded "2.2.0" while the shipped manifest.json already
+        said "2.22.0" — one version number ahead — so this test was already
+        silently wrong before this release touched anything. Both numbers
+        were themselves a typo for the "0.x" line this project actually uses
+        (see the "Housekeeping note" in CHANGELOG.md's [0.23.0] entry, and
+        the version-numbering note in docs/audit-v0.23.0.md) — a first pass
+        at fixing this test asserted "2.23.0", continuing the typo instead of
+        catching it. Now asserts the correct "0.23.0", continuing properly
+        from 0.21.1. Bump this string (and manifest.json) together on
+        release.
+        """
         import json
 
         manifest = json.loads((COMPONENT_DIR / "manifest.json").read_text())
-        assert manifest["version"] == "2.2.0"
+        assert manifest["version"] == "0.23.0"
 
     def test_hacs_minimum_ha_covers_via_device_id(self) -> None:
         """via_device_id landed in HA 2026.8; earlier versions raise TypeError.

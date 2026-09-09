@@ -133,6 +133,62 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
+### v0.23.0 — User-Agent 403 fix + config-flow polling-interval bug
+
+**Note on versioning:** this release corrects a version-numbering error
+rather than continuing it. Between v0.21.1 (the previous entry in this
+file) and this release, `manifest.json`/`CHANGELOG.md` had drifted to
+`2.2.0` → `2.22.0` — almost certainly a typo for `0.22.0` (dropped leading
+`0.`), not a deliberate jump past 1.0, since this repo's own stated policy
+is to stay pre-1.0. An earlier pass at *this* release propagated
+that typo forward to `2.23.0` before it was caught; the correct number is
+**0.23.0**, continuing properly from `0.21.1`. The HA-compat release itself
+(the actual work done under the `2.2.0`/`2.22.0` labels) is real and
+undisturbed — see `docs/audit-v2.2.0.md` — only its version *string* was
+wrong, and is not retroactively changed. Full report for *this* release:
+`docs/audit-v0.23.0.md`.
+
+Fixes a blanket HTTP 403 on every endpoint plus a config-flow display bug,
+found via a user-supplied forensic crawl (`crawl.py`/`hoval_output.txt`, not
+part of this repo) run against the live cloud API with real credentials.
+
+- **403 root cause (leading hypothesis, not confirmed):** `api.py` set no
+  `User-Agent` at all, inheriting Home Assistant's shared aiohttp session
+  default. The crawl, using a custom `User-Agent`, succeeded on every
+  endpoint with a fresh login against the *unchanged* `CLIENT_ID`/`IDP_URL`
+  — ruling out a moved endpoint or revoked OAuth client as the cause. New
+  `USER_AGENT` constant in `const.py`, applied everywhere `api.py` makes a
+  request. If you see 403s after this release, that's the signal this
+  hypothesis was wrong or incomplete — check the new `WARNING`-level "API
+  {method} {path} -> HTTP 403" log line (added in `_request()`) for the
+  actual response body before assuming it's fixed elsewhere.
+- **`get_circuit_settings` dropped `weatherImpact` entirely** for every
+  circuit in the crawl (now returns only `circuitName`). `coordinator.py`
+  now checks `"weatherImpact" in settings` (key presence) rather than
+  `isinstance(settings, dict)` before setting `weather_impact_supported =
+  True`, so those circuits' number entities correctly go unavailable instead
+  of showing dead sliders. **If you find where Hoval relocated this field,
+  update both branches in `coordinator.py`** (fresh-fetch and
+  cached-fallback) — search for `"weatherImpact" in`.
+- **`get_programs` now skipped for BL (boiler) circuits.** New
+  `SUPPORTS_PROGRAMS` constant (`const.py`), same pattern as
+  `SUPPORTS_WEATHER_IMPACT`. BL returns HTTP 417 on every call per the
+  crawl — never a crash (isolated by `gather(return_exceptions=True)`), just
+  a guaranteed-to-fail round trip every `PROGRAM_CACHE_TTL`.
+  **Gotcha if you touch this again:** gating `need_programs` on circuit type
+  means `cached_prog` can now be `None` even when `need_programs` is
+  `False` (a BL circuit never populates that cache). The
+  `results["programs"] = cached_prog[0]` fallback line MUST stay guarded
+  with `and cached_prog is not None` — the un-guarded version passed review
+  once already before the missing case was caught in testing for this
+  release.
+- **Options-flow "Polling interval" field rendered empty.**
+  `SCAN_INTERVAL_OPTIONS` had no `600` ("10 minutes") entry, so a stored
+  value of 600 couldn't match any dropdown option — while sibling fields on
+  the same form loaded fine. Fixed by adding the missing entry; no
+  `config_flow.py` change needed (the v0.19.0 `vol.Coerce(int)` fix already
+  covers the save path once the option itself exists).
+
 ### v0.21.1 — ICS-style audit hardening (F1–F9)
 
 Hardening-only release from a full code audit; complete report in

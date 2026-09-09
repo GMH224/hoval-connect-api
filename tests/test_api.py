@@ -35,7 +35,10 @@ from custom_components.hoval_connect.api import (  # noqa: E402
     HovalAuthError,
     HovalConnectApi,
 )
-from custom_components.hoval_connect.const import SCAN_INTERVAL_OPTIONS  # noqa: E402
+from custom_components.hoval_connect.const import (  # noqa: E402
+    SCAN_INTERVAL_OPTIONS,
+    USER_AGENT,
+)
 
 
 def _make_response(status: int, json_data=None, text: str = "") -> MagicMock:
@@ -83,6 +86,25 @@ class TestHovalConnectApiAuth:
 
         assert token == "test-token-123"
         session.post.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_get_id_token_sends_user_agent(self):
+        """Regression — v0.23.0 fix for a blanket HTTP 403.
+
+        No outbound request set a User-Agent at all before this fix; every
+        request inherited whatever Home Assistant's shared aiohttp session
+        applies by default. See USER_AGENT in const.py and
+        docs/audit-v0.23.0.md for the full diagnosis.
+        """
+        session = _make_session()
+        resp = _make_response(200, {"id_token": "test-token-123"})
+        session.post = MagicMock(return_value=resp)
+
+        api = HovalConnectApi(session, "test@example.com", "password123")
+        await api._get_id_token()
+
+        headers = session.post.call_args.kwargs["headers"]
+        assert headers["User-Agent"] == USER_AGENT
 
     @pytest.mark.asyncio
     async def test_get_id_token_caches(self):
@@ -173,6 +195,62 @@ class TestHovalConnectApiRequest:
         result = await api._request("GET", "/api/test")
 
         assert result == {"data": "test"}
+
+    @pytest.mark.asyncio
+    async def test_request_sends_user_agent(self):
+        """Regression — v0.23.0 fix for a blanket HTTP 403 (see const.USER_AGENT)."""
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+
+        api_resp = _make_response(200, {"data": "test"})
+        session.request = MagicMock(return_value=api_resp)
+
+        api = HovalConnectApi(session, "test@example.com", "pass")
+        await api._request("GET", "/api/test")
+
+        headers = session.request.call_args.kwargs["headers"]
+        assert headers["User-Agent"] == USER_AGENT
+
+    @pytest.mark.asyncio
+    async def test_get_plant_access_token_sends_user_agent(self):
+        """Regression — v0.23.0 fix for a blanket HTTP 403 (see const.USER_AGENT).
+
+        This call builds its headers by hand rather than via _headers(), so it
+        needs its own coverage — a fix to _headers() alone would not catch a
+        regression here.
+        """
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+        pat_resp = _make_response(200, {"token": "pat-123"})
+        session.get = MagicMock(return_value=pat_resp)
+
+        api = HovalConnectApi(session, "test@example.com", "pass")
+        await api._get_plant_access_token("plant-1")
+
+        headers = session.get.call_args.kwargs["headers"]
+        assert headers["User-Agent"] == USER_AGENT
+
+    @pytest.mark.asyncio
+    async def test_request_403_raises_api_error_without_retry(self):
+        """
+        403 is deliberately NOT retried like 401: refreshing the token has not
+        been observed to fix a 403 (see docs/audit-v0.23.0.md — the leading
+        hypothesis is a gateway/WAF-level block, not a token problem).
+        """
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+
+        resp_403 = _make_response(403, text="Forbidden by gateway")
+        session.request = MagicMock(return_value=resp_403)
+
+        api = HovalConnectApi(session, "test@example.com", "pass")
+        with pytest.raises(HovalApiError, match="HTTP 403"):
+            await api._request("GET", "/api/test")
+
+        assert session.request.call_count == 1
 
     @pytest.mark.asyncio
     async def test_request_204_returns_none(self):
@@ -544,6 +622,33 @@ class TestHovalConnectApiEndpoints:
         assert result == []
 
     @pytest.mark.asyncio
+    async def test_get_programs_raises_for_417_non_programmable_circuit(self):
+        """
+        2026-09 finding (forensic crawl, see docs/audit-v0.23.0.md): the
+        programs endpoint for BL (boiler) now returns HTTP 417, not HTTP 200
+        with body [] as in test_get_programs_returns_empty_list_for_bl_circuit
+        above — Hoval's response for non-programmable circuits changed again.
+
+        The API layer still just passes the failure through as a generic
+        HovalApiError; it's the coordinator's job (SUPPORTS_PROGRAMS gate,
+        see tests/test_coordinator_fetch.py) to avoid calling this for BL at
+        all, not this method's job to know which circuit types are
+        programmable.
+        """
+        session = _make_session()
+        auth_resp = _make_response(200, {"id_token": "token"})
+        session.post = MagicMock(return_value=auth_resp)
+        pat_resp = _make_response(200, {"token": "pat-123"})
+        session.get = MagicMock(return_value=pat_resp)
+
+        api_resp = _make_response(417, text="")
+        session.request = MagicMock(return_value=api_resp)
+
+        api = HovalConnectApi(session, "test@example.com", "pass")
+        with pytest.raises(HovalApiError, match="HTTP 417"):
+            await api.get_programs("plant-1", "1.10.1")
+
+    @pytest.mark.asyncio
     async def test_get_plant_settings_uses_request(self):
         """Verify get_plant_settings goes through _request (not raw session.get)."""
         session = _make_session()
@@ -775,6 +880,19 @@ class TestScanIntervalSchema:
     def test_unknown_value_rejected(self):
         with pytest.raises(vol.Invalid):
             self._validator()({"scan_interval": "45"})
+
+    def test_ten_minutes_option_present(self):
+        """
+        Regression — v0.23.0 fix for the 'Polling interval field renders
+        empty' bug. 600 (10 minutes) was documented/expected as a choice
+        alongside 300 (5 minutes) but had no entry in SCAN_INTERVAL_OPTIONS,
+        so a stored value of 600 could not be matched by the options-flow
+        dropdown and rendered blank. See docs/audit-v0.23.0.md.
+        """
+        assert 600 in SCAN_INTERVAL_OPTIONS
+        assert self._validator()({"scan_interval": 600})["scan_interval"] == 600
+        # Frontend submits dropdown selections as strings (v0.19.0 fix).
+        assert self._validator()({"scan_interval": "600"})["scan_interval"] == 600
 
 
 # ---------------------------------------------------------------------------

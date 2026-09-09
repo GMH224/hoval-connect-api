@@ -4,6 +4,85 @@ All notable changes to the `hoval_connect` integration are documented here.
 This project follows a loose [Semantic Versioning](https://semver.org/) scheme
 while pre-1.0 (minor = behavioural/feature change, patch = internal fix).
 
+## [0.23.0] - 2026-09-09
+
+Cloud-API compatibility release, fixing a blanket HTTP 403 reported against
+every endpoint, plus a config UI bug. Full investigation and verification
+method in `docs/audit-v0.23.0.md`.
+
+**Housekeeping note — version-number correction:** this repository's own
+stated policy (top of this file) is a loose semver scheme that stays
+pre-1.0. Every release through v0.21.1 (see below) followed that. The entry
+immediately below this one is headed `[2.2.0]`, and the `manifest.json` this
+release replaces said `"version": "2.22.0"` — both almost certainly a typo
+for `0.22.0` (the leading `0.` dropped) rather than a deliberate jump past
+1.0. An earlier pass at this release incorrectly treated `2.22.0` as
+authoritative and bumped it to `2.23.0`, carrying the typo forward instead
+of catching it. This entry corrects course: **0.23.0 continues from
+0.21.1**, matching the project's actual policy and its own version history.
+The `[2.2.0]` entry below is left as-is rather than retroactively renumbered
+— it documents a real release, just under a mislabeled version string.
+
+**Practical note for anyone updating a live installation:** if a Home
+Assistant instance currently has `2.22.0` installed via HACS, `0.23.0` will
+look like a *downgrade* to a naive string/semver comparison, and HACS may
+not offer it as an update. A manual reinstall (or forcing the version) may
+be needed on any instance that picked up the mislabeled `2.x` manifest.
+
+### Fixed
+- **Blanket HTTP 403 on every endpoint.** Root-caused via a one-off forensic
+  crawl (`crawl.py` in the user's report, not shipped with the integration):
+  a fresh password-grant login and every endpoint this integration calls
+  succeeded, using a distinctive custom `User-Agent`. Nothing in `api.py` set
+  a `User-Agent` at all — every request went out with Home Assistant's shared
+  aiohttp session default. The API sits behind an Azure Application Gateway
+  (visible in unrelated 502 error pages during discovery), a common place to
+  enforce User-Agent allow/deny rules. `api.py` now sends an explicit,
+  stable `USER_AGENT` (new constant in `const.py`) on every outbound request
+  — the IDP token call, the plant-access-token fetch, and the shared
+  `_headers()` builder used by all other endpoints. A distinct warning-level
+  log line was also added for any future HTTP 403, so a recurrence is easy to
+  spot and its response body is captured automatically instead of only
+  reaching debug-level logging.
+  **Not independently confirmed** against a captured 403 response
+  body/headers from a live installation (none was available at diagnosis
+  time) — see `docs/audit-v0.23.0.md` for what to capture if 403s recur.
+- **Options flow — Polling interval field rendered empty.** `SCAN_INTERVAL_OPTIONS`
+  (`const.py`) had no entry for 600 seconds ("10 minutes"), even though that is
+  a documented, expected choice alongside "5 minutes". A config entry with a
+  stored `scan_interval` of 600 had no matching key for the options dialog's
+  dropdown to pre-select against, so — while every other field on the same
+  form loaded its saved value correctly — the Polling interval field alone
+  rendered blank. Added `600: "10 minutes"` to `SCAN_INTERVAL_OPTIONS`; both
+  new entries and any config entry that already had `scan_interval: 600`
+  stored now display and save correctly. No change to `config_flow.py`'s
+  validation logic was needed (the `vol.Coerce(int)` fix from v0.19.0 already
+  handles the save path correctly) — only the option set itself was missing a
+  value.
+
+### Changed (cloud API drift, not user-facing bugs on their own)
+- **`get_circuit_settings` no longer returns `weatherImpact`.** The forensic
+  crawl found the cloud now returns only `{"circuitName": ...}` for every
+  circuit tested, where it previously also returned the `weatherImpact`
+  sub-object. `coordinator.py` now checks for the *key's presence*
+  (`"weatherImpact" in settings`) rather than treating any dict response as
+  proof the feature is supported. Circuits where the cloud has dropped the
+  key now correctly report their weather-impact number entities as
+  unavailable instead of showing non-functional sliders with an unknown
+  value. This is a graceful degradation, not a recovery of the feature — if
+  Hoval relocated `weatherImpact` to a different endpoint, that endpoint has
+  not yet been identified (the crawl's OpenAPI dump was captured but not
+  fully diffed for a replacement path; see `docs/audit-v0.23.0.md` §
+  "Known limitations").
+- **`get_programs` is no longer called for BL (boiler) circuits.** The crawl
+  confirmed the cloud returns HTTP 417 for this circuit type on every call,
+  never 200 — it has no time-program of its own. New `SUPPORTS_PROGRAMS`
+  constant (`const.py`) gates the coordinator's program fetch the same way
+  `SUPPORTS_WEATHER_IMPACT` already gates the settings fetch. This was never
+  a crash (the existing `asyncio.gather(..., return_exceptions=True)`
+  isolation already absorbed the failure), only a wasted, guaranteed-to-fail
+  round trip on every `PROGRAM_CACHE_TTL` refresh plus a debug-log line.
+
 ## [2.2.0] - 2026-09-04
 
 Home Assistant forward-compatibility release, targeting HA **2026.8 → 2026.12**.

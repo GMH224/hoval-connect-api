@@ -11,6 +11,33 @@ IDP_URL = "https://akwc5scsc.accounts.ondemand.com/oauth2/token"
 # Extracted from the official Android/iOS app; required by the SAP IAS identity provider.
 CLIENT_ID = "991b54b2-7e67-47ef-81fe-572e21c59899"
 
+# Custom User-Agent sent on every outbound request (IDP token calls and all
+# BASE_URL calls). Added in 0.23.0 as the fix for a blanket HTTP 403 reported
+# against every endpoint (see docs/audit-v0.23.0.md for the full write-up).
+#
+# Root-cause evidence: a one-off forensic crawl (2026-09-09) performed a fresh
+# password-grant login and then exercised every endpoint this integration
+# calls, using a distinctive custom User-Agent — every call succeeded (HTTP
+# 200/expected), including auth against the unchanged CLIENT_ID/IDP_URL above.
+# Nothing in this integration's code sets a User-Agent at all, so it was
+# sending whatever default Home Assistant's shared aiohttp session applies.
+# The API sits behind an Azure Application Gateway (visible in the 502 error
+# pages the crawl got from unrelated metadata paths), which is a common place
+# to enforce User-Agent allow/deny rules. Setting an explicit, stable
+# User-Agent removes the one variable that differed between "crawl: works"
+# and "integration: blanket 403".
+#
+# Caveat, recorded for the next person: this was not confirmed against an
+# actual captured 403 response body/headers from a live installation (none
+# was available at diagnosis time), so if 403s persist after this change,
+# that is the next thing to capture (enable debug logging for
+# custom_components.hoval_connect and inspect the "API error body" log line).
+#
+# Deliberately NOT tied to the integration's own release version (the "/1.0"
+# below is a UA-scheme version, not this package's version) so it doesn't
+# need bumping on every release.
+USER_AGENT = "HovalConnectHomeAssistant/1.0 (+https://github.com/hoval-connect/hoval-connect-api)"
+
 # Token TTLs (with safety margins)
 ID_TOKEN_TTL = timedelta(minutes=25)
 PLANT_TOKEN_TTL = timedelta(minutes=12)
@@ -18,7 +45,21 @@ PLANT_TOKEN_TTL = timedelta(minutes=12)
 # Polling interval
 DEFAULT_SCAN_INTERVAL = timedelta(seconds=60)
 CONF_SCAN_INTERVAL = "scan_interval"
-SCAN_INTERVAL_OPTIONS = {30: "30 seconds", 60: "60 seconds", 120: "2 minutes", 300: "5 minutes"}
+# 600 ("10 minutes") was missing entirely (bug fixed in 0.23.0, see
+# docs/audit-v0.23.0.md and CLAUDE.md). Any config entry with a stored
+# scan_interval of 600 (from documentation/user expectation of a "5 or 10
+# minutes" choice, or a manually-edited options value) had no matching key in
+# this dict. The options-flow dropdown's `default=` fell back to that
+# unmatched value, which the frontend cannot pre-select against — so the
+# Polling interval field rendered *empty* in the options dialog while every
+# other field (which did have a matching stored value) rendered normally.
+SCAN_INTERVAL_OPTIONS = {
+    30: "30 seconds",
+    60: "60 seconds",
+    120: "2 minutes",
+    300: "5 minutes",
+    600: "10 minutes",
+}
 
 # Program cache TTL — programs change rarely, no need to fetch every poll
 PROGRAM_CACHE_TTL = timedelta(minutes=5)
@@ -57,6 +98,17 @@ SUPPORTED_CIRCUIT_TYPES = {CIRCUIT_TYPE_HV, CIRCUIT_TYPE_HK, CIRCUIT_TYPE_BL, CI
 # to avoid firing an unnecessary (and possibly erroring) request against an
 # endpoint the circuit type doesn't implement.
 SUPPORTS_WEATHER_IMPACT = frozenset({CIRCUIT_TYPE_HK})
+
+# Circuit types whose cloud endpoint actually has a time-program to fetch.
+# BL (boiler/heat source) is a supported, always-polled circuit type (see
+# _NON_SELECTABLE_TYPES in coordinator.py) but has no schedule of its own —
+# confirmed via forensic crawl (2026-09): GET .../circuits/{path}/programs
+# returns HTTP 417 for BL every time, never 200. Excluding it from
+# SUPPORTS_PROGRAMS stops the coordinator from making a call that is
+# guaranteed to fail on every cache-refresh cycle; the existing exception
+# handling around get_programs() means this was never a crash, only wasted
+# round-trips and noise in the debug log.
+SUPPORTS_PROGRAMS = frozenset({CIRCUIT_TYPE_HV, CIRCUIT_TYPE_HK, CIRCUIT_TYPE_WW})
 
 # Human-readable names for circuit types
 CIRCUIT_TYPE_NAMES = {

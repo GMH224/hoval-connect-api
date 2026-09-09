@@ -15,6 +15,7 @@ from .const import (
     ID_TOKEN_TTL,
     IDP_URL,
     PLANT_TOKEN_TTL,
+    USER_AGENT,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -109,7 +110,10 @@ class HovalConnectApi:
                         "password": self._password,
                         "scope": "openid",
                     },
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "User-Agent": USER_AGENT,
+                    },
                     timeout=aiohttp.ClientTimeout(
                         connect=_CONNECT_TIMEOUT, sock_read=_READ_TIMEOUT
                     ),
@@ -149,7 +153,10 @@ class HovalConnectApi:
             try:
                 async with self._session.get(
                     f"{BASE_URL}/v1/plants/{plant_id}/settings",
-                    headers={"Authorization": f"Bearer {id_token}"},
+                    headers={
+                        "Authorization": f"Bearer {id_token}",
+                        "User-Agent": USER_AGENT,
+                    },
                     timeout=aiohttp.ClientTimeout(
                         connect=_CONNECT_TIMEOUT, sock_read=_READ_TIMEOUT
                     ),
@@ -174,9 +181,16 @@ class HovalConnectApi:
             return token
 
     async def _headers(self, plant_id: str | None = None) -> dict[str, str]:
-        """Build request headers with auth tokens."""
+        """Build request headers with auth tokens.
+
+        Includes an explicit User-Agent on every request (see USER_AGENT in
+        const.py for why: the previously-absent header, defaulting to Home
+        Assistant's own aiohttp session identity, is the prime suspect for a
+        blanket HTTP 403 across all endpoints, most likely enforced by the
+        Azure Application Gateway in front of this API).
+        """
         id_token = await self._get_id_token()
-        headers = {"Authorization": f"Bearer {id_token}"}
+        headers = {"Authorization": f"Bearer {id_token}", "User-Agent": USER_AGENT}
         if plant_id:
             pat = await self._get_plant_access_token(plant_id)
             headers["X-Plant-Access-Token"] = pat
@@ -227,6 +241,24 @@ class HovalConnectApi:
                                 _retry=False,
                             )
                         raise HovalAuthError("Authentication failed")
+                    if resp.status == 403:
+                        # Not retried: unlike 401 (expired token), a 403 has not
+                        # been observed to be fixed by refreshing tokens — see
+                        # USER_AGENT in const.py for the diagnosis this pointed
+                        # to. Logged distinctly (rather than falling straight
+                        # into the generic >=400 branch below) so the next
+                        # occurrence is easy to find in the log and its body
+                        # can be compared against that diagnosis.
+                        body = await resp.text()
+                        _LOGGER.warning(
+                            "API %s %s -> HTTP 403 (Forbidden). If this persists "
+                            "after upgrading, please capture this log line and "
+                            "the response body and report it: %s",
+                            method,
+                            path,
+                            body[:500],
+                        )
+                        raise HovalApiError(f"API request failed: HTTP 403: {body[:500]}")
                     if resp.status in _RETRYABLE_STATUS_CODES and attempt < _MAX_RETRIES - 1:
                         delay = _RETRY_BASE_DELAY * (2**attempt)
                         _LOGGER.warning(

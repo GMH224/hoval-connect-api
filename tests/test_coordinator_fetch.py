@@ -487,3 +487,113 @@ class TestFetchWeatherImpact:
         hk = data.plants["p1"].circuits["hk-1"]
         assert hk.weather_impact_supported is True  # stale cache reused
         assert hk.weather_impact_outside_temperature == 70
+
+    @pytest.mark.asyncio
+    async def test_missing_weather_impact_key_reports_unsupported(self):
+        """
+        Regression — v0.23.0 fix. A forensic crawl (2026-09) found the cloud
+        now returns settings responses with NO 'weatherImpact' key at all for
+        every circuit tested (only 'circuitName'), where it previously always
+        included the key (with real values, or null sub-fields). Before the
+        fix, `isinstance(settings, dict)` alone was enough to mark the
+        feature supported, so this shape would have kept the number entities
+        "available" showing an unknown value forever, and any control action
+        would try to PATCH a field the cloud no longer has.
+        """
+        api = self._hk_api()
+        api.settings_response = {"circuitName": "Heating"}  # no weatherImpact key
+        coordinator, api = _make_coordinator(api)
+        data = await coordinator._fetch_all_data()
+        hk = data.plants["p1"].circuits["hk-1"]
+        assert hk.weather_impact_supported is False
+        assert hk.weather_impact_outside_temperature is None
+        assert hk.weather_impact_solar_radiation is None
+
+    @pytest.mark.asyncio
+    async def test_weather_impact_key_present_but_null_still_supported(self):
+        """
+        Sibling case to the one above: the key being present with null
+        sub-fields (a circuit that legitimately has neither weighting set
+        yet) must be treated differently from the key being absent entirely
+        — this is exactly why the fix checks for key presence rather than
+        just truthiness of the fetched value.
+        """
+        api = self._hk_api()
+        api.settings_response = {
+            "circuitName": "Heating",
+            "weatherImpact": {"outsideTemperature": None, "solarRadiation": None},
+        }
+        coordinator, api = _make_coordinator(api)
+        data = await coordinator._fetch_all_data()
+        hk = data.plants["p1"].circuits["hk-1"]
+        assert hk.weather_impact_supported is True
+        assert hk.weather_impact_outside_temperature is None
+        assert hk.weather_impact_solar_radiation is None
+
+    @pytest.mark.asyncio
+    async def test_cached_settings_missing_weather_impact_key_falls_back_unsupported(self):
+        """Same key-presence check applies to the cached-fallback branch."""
+        api = self._hk_api()
+        coordinator, api = _make_coordinator(api)
+        await coordinator._fetch_all_data()
+
+        # Expire the cache so the next poll re-fetches, then fail that
+        # re-fetch — forcing the cached-fallback branch to run. Poison the
+        # cached value itself to simulate a cache populated before this fix
+        # against an old-shape response (or simply to match the new no-key
+        # server response for this sibling test).
+        coordinator._settings_cache["hk-1"] = ({"circuitName": "Heating"}, 0.0)
+        api.settings_response = HovalApiError("down")
+
+        data = await coordinator._fetch_all_data()
+        hk = data.plants["p1"].circuits["hk-1"]
+        assert hk.weather_impact_supported is False
+
+
+# ---------------------------------------------------------------------------
+# SUPPORTS_PROGRAMS — BL (boiler) circuits never call get_programs (v0.23.0)
+# ---------------------------------------------------------------------------
+
+
+class TestSupportsProgramsGate:
+    """
+    Regression — v0.23.0 fix. A forensic crawl (2026-09) found the cloud
+    returns HTTP 417 for GET .../circuits/{path}/programs on BL (boiler)
+    circuits every time, never 200 — BL has no schedule of its own. Before
+    the fix this was already handled gracefully (the exception lands in
+    results["programs"] via gather(return_exceptions=True) and is logged at
+    debug level), but the coordinator still made the call, and cache-refresh
+    still repeated the failure every PROGRAM_CACHE_TTL.
+
+    The second test below locks in a real bug caught during review of the
+    fix itself: gating need_programs on circuit type as well as cache
+    freshness means a BL circuit's `cached_prog` is now always None (nothing
+    is ever cached for it) — an un-guarded `results["programs"] =
+    cached_prog[0]` fallback would raise TypeError on the very first poll.
+    """
+
+    @pytest.mark.asyncio
+    async def test_bl_circuit_never_calls_get_programs(self):
+        coordinator, api = _make_coordinator()  # default fixture includes bl-1
+        data = await coordinator._fetch_all_data()
+
+        assert not any(c.startswith("programs:bl-1") for c in api.calls)
+        # HV (a supported, programmable type) still gets fetched as normal.
+        assert "programs:hv-1" in api.calls
+        # And the circuit itself is still present and otherwise populated —
+        # excluding it from programs must not exclude it from anything else.
+        assert "bl-1" in data.plants["p1"].circuits
+
+    @pytest.mark.asyncio
+    async def test_bl_circuit_survives_repeated_polls_with_empty_program_cache(self):
+        """
+        The regression this guards: without `cached_prog is not None` in the
+        fallback condition, this would raise TypeError on the very first
+        poll already — but a second poll is included too, since a cache
+        that stays permanently empty for this circuit type is the whole
+        point of the fix and must not develop a different failure over time.
+        """
+        coordinator, _api = _make_coordinator()
+        await coordinator._fetch_all_data()
+        data = await coordinator._fetch_all_data()  # must not raise
+        assert "bl-1" in data.plants["p1"].circuits

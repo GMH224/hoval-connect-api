@@ -29,6 +29,7 @@ from .const import (
     EVENTS_CACHE_TTL,
     PROGRAM_CACHE_TTL,
     SUPPORTED_CIRCUIT_TYPES,
+    SUPPORTS_PROGRAMS,
     SUPPORTS_WEATHER_IMPACT,
     WEATHER_CACHE_TTL,
     clamp_weather_impact_outside_temperature,
@@ -1214,9 +1215,13 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                     circuit_status=circuit.get("circuitStatus"),
                 )
 
-                # Check program cache
+                # Check program cache. Only fetched for circuit types confirmed
+                # to expose a time-program endpoint (see SUPPORTS_PROGRAMS) —
+                # BL (boiler) returns HTTP 417 on every call, so skipping it
+                # avoids a predictable failure on every refresh cycle, the
+                # same reasoning already applied to weatherImpact below.
                 cached_prog = self._program_cache.get(path)
-                need_programs = (
+                need_programs = ctype in SUPPORTS_PROGRAMS and (
                     cached_prog is None or time.time() - cached_prog[1] > self._program_cache_ttl
                 )
 
@@ -1241,7 +1246,12 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
 
                 gathered = await asyncio.gather(*tasks.values(), return_exceptions=True)
                 results: dict[str, Any] = dict(zip(tasks.keys(), gathered, strict=True))
-                if not need_programs:
+                # Guarded (unlike a plain `if not need_programs`): for a circuit
+                # type outside SUPPORTS_PROGRAMS, need_programs is always False
+                # and cached_prog is always None (nothing is ever cached for
+                # it), so the old unconditional `cached_prog[0]` would raise
+                # TypeError on the very first poll of such a circuit.
+                if not need_programs and cached_prog is not None:
                     results["programs"] = cached_prog[0]
                 if not need_settings and cached_settings is not None:
                     results["settings"] = cached_settings[0]
@@ -1344,21 +1354,43 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                     if isinstance(settings, dict):
                         if need_settings:
                             self._settings_cache[path] = (settings, time.time())
-                        weather_impact = settings.get("weatherImpact") or {}
-                        circuit_data.weather_impact_supported = True
-                        circuit_data.weather_impact_outside_temperature = weather_impact.get(
-                            "outsideTemperature"
-                        )
-                        circuit_data.weather_impact_solar_radiation = weather_impact.get(
-                            "solarRadiation"
-                        )
+                        # `"weatherImpact" in settings` (key presence), not just
+                        # `.get(...)`, deliberately: Hoval's cloud has been
+                        # observed (forensic crawl, 2026-09) to drop the
+                        # `weatherImpact` key from this response entirely for
+                        # every circuit tested, returning only `circuitName`.
+                        # A missing key means the cloud no longer offers the
+                        # feature for this circuit right now and the number
+                        # entities should report unavailable, which is
+                        # different from a key present-but-null (both
+                        # sub-fields legitimately unset), which should still
+                        # show the sliders with an unknown value.
+                        if "weatherImpact" in settings:
+                            weather_impact = settings["weatherImpact"] or {}
+                            circuit_data.weather_impact_supported = True
+                            circuit_data.weather_impact_outside_temperature = weather_impact.get(
+                                "outsideTemperature"
+                            )
+                            circuit_data.weather_impact_solar_radiation = weather_impact.get(
+                                "solarRadiation"
+                            )
+                        else:
+                            _LOGGER.debug(
+                                "Circuit settings for %s do not include "
+                                "'weatherImpact' (cloud may have removed/moved "
+                                "the feature); weather-impact controls will be "
+                                "unavailable for this circuit until it "
+                                "reappears.",
+                                path,
+                            )
                     elif isinstance(settings, BaseException):
                         _LOGGER.debug("Circuit settings not available for %s: %s", path, settings)
                         # Fall back to a still-fresh cached value (if any) rather
                         # than flipping the number entities unavailable on a
-                        # single transient failure.
-                        if cached_settings is not None:
-                            weather_impact = cached_settings[0].get("weatherImpact") or {}
+                        # single transient failure. Same key-presence check as
+                        # above applies to the cached value.
+                        if cached_settings is not None and "weatherImpact" in cached_settings[0]:
+                            weather_impact = cached_settings[0]["weatherImpact"] or {}
                             circuit_data.weather_impact_supported = True
                             circuit_data.weather_impact_outside_temperature = weather_impact.get(
                                 "outsideTemperature"
