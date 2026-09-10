@@ -4,6 +4,35 @@ All notable changes to the `hoval_connect` integration are documented here.
 This project follows a loose [Semantic Versioning](https://semver.org/) scheme
 while pre-1.0 (minor = behavioural/feature change, patch = internal fix).
 
+## [0.24.1] - 2026-09-10
+
+Patch release: hardens the health-counter storage load against a version
+mismatch, purely so that rolling back to this version from a later release
+that bumps `HEALTH_STORAGE_VERSION` (e.g. v1.0.0) is safe without any
+manual file deletion. No functional changes otherwise — this release
+exists only to make v0.24.0 a safe rollback target.
+
+### Fixed
+
+- **`async_setup_entry()` could fail to load the integration entirely if
+  the persisted health-counter file was written by a different
+  `HEALTH_STORAGE_VERSION`.** Verified directly against Home Assistant's
+  `Store` helper source (`homeassistant/helpers/storage.py`): without an
+  overridden migration function (which this integration has never
+  provided), a version mismatch on load raises —
+  `UnsupportedStorageVersionError` if the stored file is *newer* than this
+  code expects (exactly the situation after installing, then rolling back
+  from, a later release), or a re-raised `NotImplementedError` if *older*.
+  This was uncaught, so it would have taken down the whole integration's
+  setup, not just lost some historical counters. `health_store.async_load()`
+  is now wrapped in a broad try/except that logs a warning and starts with
+  fresh counters on any load failure instead.
+- Found while explicitly verifying the safety of rolling back from v1.0.0
+  to this version — see that release's `docs/audit-v1.0.0.md` § 8 for the
+  full context. This was a latent bug in every version back through
+  whenever `HEALTH_STORAGE_VERSION` was introduced; it just had never been
+  exercised because the version number had never actually changed before.
+
 ## [0.24.0] - 2026-09-10
 
 Transport rewrite: replaces `aiohttp` with `requests` (run via

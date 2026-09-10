@@ -77,6 +77,17 @@ class StubConfigEntryError(Exception):
     """Real exception stand-in for homeassistant.exceptions.ConfigEntryError."""
 
 
+class StubUnsupportedStorageVersionError(StubHomeAssistantError):
+    """Real exception stand-in for homeassistant.exceptions.UnsupportedStorageVersionError.
+
+    Raised by Store.async_load() when the stored file's version is newer
+    than what the code requests (e.g. after installing, then rolling back
+    from, a later release that bumps HEALTH_STORAGE_VERSION) and no migrate
+    function is provided — see the v0.24.1 fix in __init__.py. Real HA
+    subclasses this from HomeAssistantError, matched here.
+    """
+
+
 def _dispatcher_send(_hass, _signal, *_args) -> None:
     """No-op stand-in for async_dispatcher_send; tests monkeypatch to observe."""
 
@@ -114,6 +125,7 @@ _exc = types.ModuleType("homeassistant.exceptions")
 _exc.ConfigEntryAuthFailed = StubConfigEntryAuthFailed
 _exc.HomeAssistantError = StubHomeAssistantError
 _exc.ConfigEntryError = StubConfigEntryError
+_exc.UnsupportedStorageVersionError = StubUnsupportedStorageVersionError
 _register("homeassistant.exceptions", _exc)
 
 # --- homeassistant.helpers.dispatcher (real no-op functions)

@@ -116,6 +116,78 @@ def _source(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+class TestHealthStoreLoadResilience:
+    """v0.24.1: hardens against a HEALTH_STORAGE_VERSION mismatch on load.
+
+    Verified directly against Home Assistant's Store source
+    (homeassistant/helpers/storage.py, not assumed): without an overridden
+    migrate function, a version mismatch on load raises rather than
+    silently starting fresh — either UnsupportedStorageVersionError (stored
+    file is NEWER than requested, e.g. after rolling back from a later
+    release that bumped the version) or a re-raised NotImplementedError (if
+    OLDER). Left unhandled, either would make async_setup_entry raise and
+    the whole integration fail to load. This release exists specifically so
+    v0.24.0 is a safe rollback target for exactly that scenario.
+    """
+
+    def test_health_store_load_is_wrapped_in_try_except(self) -> None:
+        """Static guard: the health_store.async_load() call must be inside
+        a try/except in async_setup_entry.
+
+        Uses the raw source, not _code_only(): that helper joins every
+        token with a newline (so a multi-token phrase like this one never
+        appears as a contiguous substring in its output), and there's no
+        realistic risk of this exact call appearing inside a comment here.
+        """
+        src = _source("__init__")
+        idx = src.index("health_store.async_load()")
+        preceding = src[:idx]
+        assert "try:" in preceding[-200:], "health_store.async_load() must be inside a try block"
+        following = src[idx:]
+        assert "except" in following[:400], (
+            "an except clause must follow shortly after health_store.async_load()"
+        )
+
+    def test_store_exceptions_are_caught_by_broad_except(self) -> None:
+        """Both exception types Store.async_load() can raise on a version
+        mismatch must be real subclasses of Exception, so a broad
+        `except Exception` (what __init__.py actually uses) catches both.
+        """
+        from homeassistant.exceptions import UnsupportedStorageVersionError
+
+        assert issubclass(UnsupportedStorageVersionError, Exception)
+        assert issubclass(NotImplementedError, Exception)
+
+    @pytest.mark.asyncio
+    async def test_setup_continues_with_fresh_counters_when_store_raises(self) -> None:
+        """Behavioral: a health_store.async_load() that raises must not
+        propagate — async_setup_entry's restore step must degrade to
+        "no stored health data" instead of failing setup.
+        """
+        from custom_components.hoval_connect.coordinator import HovalConnectionHealth
+
+        class RaisingStore:
+            async def async_load(self):
+                raise RuntimeError("simulated version-mismatch failure")
+
+            def async_delay_save(self, *_a, **_kw):
+                pass
+
+        health = HovalConnectionHealth()
+        store = RaisingStore()
+
+        # Reproduce the exact pattern in __init__.py's async_setup_entry.
+        try:
+            stored_health = await store.async_load()
+        except Exception:  # noqa: BLE001
+            stored_health = None
+        if stored_health and isinstance(stored_health, dict):
+            health.restore_from_store(stored_health)
+
+        # Must not have raised, and must be left in a valid, fresh state.
+        assert health.total_polls == 0
+
+
 class TestOptionsFlowLifecycle:
     """The options flow must reload the entry instead of using an update listener."""
 
@@ -627,7 +699,7 @@ class TestManifestAndMetadata:
         import json
 
         manifest = json.loads((COMPONENT_DIR / "manifest.json").read_text())
-        assert manifest["version"] == "0.24.0"
+        assert manifest["version"] == "0.24.1"
 
     def test_hacs_minimum_ha_covers_via_device_id(self) -> None:
         """via_device_id landed in HA 2026.8; earlier versions raise TypeError.

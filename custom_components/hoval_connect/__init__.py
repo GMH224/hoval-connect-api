@@ -176,7 +176,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: HovalConnectConfigEntry)
 
     # Restore persisted health counters (total_polls, total_failures, EMA, etc.)
     # BEFORE the first refresh so sensors show historical context immediately.
-    stored_health = await health_store.async_load()
+    #
+    # v0.24.1: deliberately tolerant of ANY load failure, not just a missing
+    # file. Verified directly against HA's Store source
+    # (homeassistant/helpers/storage.py): without an overridden
+    # _async_migrate_func (which this integration has never provided), a
+    # stored-version mismatch raises rather than silently starting fresh —
+    # UnsupportedStorageVersionError if the file is NEWER than this code
+    # expects (e.g. after installing, then rolling back from, a later
+    # release that bumped HEALTH_STORAGE_VERSION), or a re-raised
+    # NotImplementedError if OLDER. Uncaught, either would make the whole
+    # integration fail to load, not just lose historical counters. This
+    # patch exists specifically so downgrading from a later release (e.g.
+    # v1.0.0, which bumps HEALTH_STORAGE_VERSION 1 -> 2) back to this one is
+    # safe without any manual file deletion.
+    try:
+        stored_health = await health_store.async_load()
+    except Exception:  # noqa: BLE001 — see comment above: any failure here must degrade to a fresh start, never block setup
+        _LOGGER.warning(
+            "Could not load persisted health counters (likely a version "
+            "mismatch from an upgrade or rollback) — starting fresh.",
+            exc_info=True,
+        )
+        stored_health = None
     if stored_health and isinstance(stored_health, dict):
         coordinator.connection_health.restore_from_store(stored_health)
         _LOGGER.debug(
