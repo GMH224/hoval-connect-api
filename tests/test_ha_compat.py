@@ -46,9 +46,11 @@ CIRCUIT_PLATFORMS = [
     "fan",
     "number",
     "select",
-    "sensor",
     "water_heater",
 ]
+# v1.0.0 removed "sensor" from this list — sensor.py was deleted entirely
+# (every entity in it depended on telemetry this integration no longer
+# polls). See docs/audit-v1.0.0.md.
 
 
 # ---------------------------------------------------------------------------
@@ -116,23 +118,167 @@ def _source(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-class TestHealthStoreLoadResilience:
-    """v0.24.1: hardens against a HEALTH_STORAGE_VERSION mismatch on load.
+class TestApiSessionClosedOnSetupFailure:
+    """Independent audit finding (2026-09, HVC-005): api.aclose() must run
+    on any setup failure between HovalConnectApi's construction and
+    entry.runtime_data being assigned — otherwise the requests.Session
+    (and its connection pool) leaks, since async_unload_entry() — the only
+    other place that closes it — never runs for a config entry that never
+    finished loading.
+    """
 
-    Verified directly against Home Assistant's Store source
-    (homeassistant/helpers/storage.py, not assumed): without an overridden
-    migrate function, a version mismatch on load raises rather than
-    silently starting fresh — either UnsupportedStorageVersionError (stored
-    file is NEWER than requested, e.g. after rolling back from a later
-    release that bumped the version) or a re-raised NotImplementedError (if
-    OLDER). Left unhandled, either would make async_setup_entry raise and
-    the whole integration fail to load. This release exists specifically so
-    v0.24.0 is a safe rollback target for exactly that scenario.
+    def test_api_construction_to_runtime_data_is_wrapped_in_try_except(self) -> None:
+        """Static guard: the span between `api = HovalConnectApi(...)` and
+        `entry.runtime_data = HovalRuntimeData(...)` must be inside a
+        try/except that closes the api on failure.
+        """
+        src = _source("__init__")
+        start = src.index("api = HovalConnectApi(")
+        end = src.index("entry.runtime_data = HovalRuntimeData(")
+        span = src[start:end]
+        assert "try:" in span, "API construction must be followed by a try block"
+        after = src[end:]
+        assert "except" in after[:200] and "api.aclose()" in after[:400], (
+            "the except clause after entry.runtime_data assignment must close the API session"
+        )
+
+    @pytest.mark.asyncio
+    async def test_setup_failure_pattern_closes_session(self) -> None:
+        """Behavioral: reproduces the exact try/except pattern in
+        async_setup_entry and confirms a failure during first refresh
+        results in the API being closed.
+        """
+
+        class FakeApi:
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        api = FakeApi()
+
+        async def _failing_first_refresh() -> None:
+            raise RuntimeError("simulated first-refresh failure")
+
+        with pytest.raises(RuntimeError):
+            try:
+                await _failing_first_refresh()
+                # entry.runtime_data would be assigned here on success — never reached
+            except BaseException:
+                await api.aclose()
+                raise
+
+        assert api.closed is True
+
+    @pytest.mark.asyncio
+    async def test_setup_success_pattern_does_not_close_session(self) -> None:
+        """Sibling case: successful setup must NOT close the session —
+        ownership transfers to entry.runtime_data, which owns cleanup from
+        then on (via async_unload_entry).
+        """
+
+        class FakeApi:
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        api = FakeApi()
+
+        async def _successful_first_refresh() -> None:
+            return None
+
+        try:
+            await _successful_first_refresh()
+            runtime_data_assigned = True
+        except BaseException:
+            await api.aclose()
+            raise
+
+        assert runtime_data_assigned is True
+        assert api.closed is False
+
+
+class TestClimateHeatAutoAreDistinct:
+    """Independent audit finding (2026-09, fourth round, HVC-004): HEAT and
+    AUTO used to be handled by the same `elif hvac_mode in (HVACMode.AUTO,
+    HVACMode.HEAT):` branch — selecting either produced the identical
+    "resume the schedule" API call, despite being advertised as two
+    distinct, independently selectable HA climate modes.
+    """
+
+    def test_heat_and_auto_are_not_handled_by_the_same_branch(self) -> None:
+        src = _code_only(_source("climate"))
+        assert "HVACMode.AUTO,HVACMode.HEAT" not in src.replace(" ", "").replace("\n", ""), (
+            "HEAT and AUTO must not share a single elif branch in async_set_hvac_mode"
+        )
+
+    def test_heat_activates_constant_program(self) -> None:
+        """HEAT must now call set_program specifically with "constant" —
+        a real, distinct action, not api.reset_circuit() (which is what
+        AUTO calls, and what HEAT used to call too).
+        """
+        src = _source("climate")
+        heat_idx = src.index("hvac_mode == HVACMode.HEAT")
+        # The set_program(..., "constant") call must appear shortly after
+        # the HEAT branch starts, before the AUTO branch begins.
+        auto_idx = src.index("hvac_mode == HVACMode.AUTO")
+        heat_branch = src[heat_idx:auto_idx] if auto_idx > heat_idx else src[heat_idx:]
+        assert "set_program" in heat_branch
+        assert '"constant"' in heat_branch
+
+    def test_hvac_mode_read_and_write_are_consistent(self) -> None:
+        """The read side (hvac_mode property) must still report HEAT for
+        the same "not on a week/eco schedule" condition that the write
+        side (async_set_hvac_mode) now specifically targets via
+        "constant" — otherwise selecting HEAT wouldn't produce the state
+        that reading HEAT back actually means.
+        """
+        src = _source("climate")
+        # Both branches must still exist; a regression that removes either
+        # would silently break the read/write symmetry this fix relies on.
+        assert "return HVACMode.HEAT" in src
+        assert "return HVACMode.AUTO" in src
+
+
+class TestPersistedOptionsAreValidated:
+    """Independent audit finding (2026-09, fourth round, HVC-007): persisted
+    turn_on_mode/override_duration options were read directly from
+    config-entry options with no re-validation against the actual allowed
+    enums, in both fan.py AND (found while fixing fan.py) climate.py.
+    """
+
+    def test_fan_validates_turn_on_mode_and_override_duration(self) -> None:
+        src = _source("fan")
+        assert "VALID_TURN_ON_MODES" in src
+        assert "VALID_OVERRIDE_DURATIONS" in src
+
+    def test_climate_validates_override_duration(self) -> None:
+        src = _source("climate")
+        assert "VALID_OVERRIDE_DURATIONS" in src
+
+
+class TestHealthStoreLoadResilience:
+    """v1.0.0 bumped HEALTH_STORAGE_VERSION 1 -> 2. Verified directly against
+    Home Assistant's Store source (homeassistant/helpers/storage.py, not
+    assumed): without an overridden migrate function, a version mismatch on
+    load raises rather than silently starting fresh — either
+    UnsupportedStorageVersionError (stored file is NEWER than requested,
+    e.g. after a rollback) or a re-raised NotImplementedError (stored file
+    is OLDER, e.g. right after upgrading past this version bump). Left
+    unhandled, either would make async_setup_entry raise and the whole
+    integration fail to load. See docs/audit-v1.0.0.md § 8.
     """
 
     def test_health_store_load_is_wrapped_in_try_except(self) -> None:
         """Static guard: the health_store.async_load() call must be inside
-        a try/except in async_setup_entry.
+        a try/except in async_setup_entry. A dedicated regression test
+        (rather than only relying on the behavioral test below) because
+        this is exactly the kind of one-line refactor ("clean up that
+        try/except, it looks unnecessary") that would silently reintroduce
+        the bug without any other test noticing.
 
         Uses the raw source, not _code_only(): that helper joins every
         token with a newline (so a multi-token phrase like this one never
@@ -152,6 +298,8 @@ class TestHealthStoreLoadResilience:
         """Both exception types Store.async_load() can raise on a version
         mismatch must be real subclasses of Exception, so a broad
         `except Exception` (what __init__.py actually uses) catches both.
+        This would fail loudly if either exception type's base ever changed
+        to something outside the Exception hierarchy (e.g. BaseException).
         """
         from homeassistant.exceptions import UnsupportedStorageVersionError
 
@@ -186,6 +334,7 @@ class TestHealthStoreLoadResilience:
 
         # Must not have raised, and must be left in a valid, fresh state.
         assert health.total_polls == 0
+        assert health.last_successful_contact_at is None
 
 
 class TestOptionsFlowLifecycle:
@@ -214,7 +363,10 @@ class TestOptionsFlowLifecycle:
     def test_options_flow_still_saves_submitted_options(self) -> None:
         """Reloading must not change what the flow persists."""
         flow = HovalConnectOptionsFlow()
-        submitted = {"scan_interval": 300, "turn_on_mode": "resume"}
+        # v1.0.0 removed scan_interval from the options schema entirely (see
+        # docs/audit-v1.0.0.md); this dict now matches what the real form
+        # actually submits.
+        submitted = {"turn_on_mode": "resume", "override_duration": "FOUR"}
 
         result = flow.async_step_init.__wrapped__(flow, submitted) if False else None
         # async_step_init is a coroutine; drive it directly.
@@ -223,76 +375,167 @@ class TestOptionsFlowLifecycle:
         assert result["type"] == "create_entry"
         assert result["data"] == submitted
 
-    def test_scan_interval_reload_path_reads_options(self) -> None:
-        """After a reload, the interval comes from options, not from a listener."""
-        entry = MagicMock()
-        entry.options = {"scan_interval": 300}
-        assert hoval._get_scan_interval(entry).total_seconds() == 300
-
-    def test_scan_interval_coerces_legacy_string_option(self) -> None:
-        entry = MagicMock()
-        entry.options = {"scan_interval": "120"}
-        assert hoval._get_scan_interval(entry).total_seconds() == 120
-
-    def test_scan_interval_falls_back_on_garbage(self) -> None:
-        entry = MagicMock()
-        entry.options = {"scan_interval": "not-a-number"}
-        assert hoval._get_scan_interval(entry) == hoval.DEFAULT_SCAN_INTERVAL
-
-    def test_scan_interval_options_form_prefills_stored_ten_minute_value(self) -> None:
+    def test_legacy_scan_interval_option_stays_removed(self) -> None:
         """
-        Regression — v0.23.0 fix for "Polling interval field renders empty".
-
-        Before the fix, SCAN_INTERVAL_OPTIONS had no 600-second entry, so a
-        config entry with scan_interval=600 stored produced a schema whose
-        `default=600` for this field did not match any of the dropdown's own
-        valid keys. That mismatch is exactly what leaves an HA select control
-        rendered with nothing selected, even though every *other* field on
-        the same form — whose stored value did have a matching option —
-        rendered normally. This drives the real async_step_init(None)
-        "show form" path (not previously covered by any test), builds the
-        real schema config_flow.py generates, and asserts the default is
-        both present and independently valid against the dropdown's own
-        validator — the second assertion is the one that would have failed
-        before the fix.
+        v1.0.0 initially removed the polling-interval option entirely — see
+        docs/audit-v1.0.0.md and CHANGELOG.md — since there was no longer a
+        meaningful "poll rate" to tune for circuit/program/settings data
+        (still true: that data is fetched once at startup and again only
+        after a write, never on a schedule, regardless of the setting
+        below). CONF_HEALTH_CHECK_INTERVAL (reinstated later in this same
+        v1.0.0 release, at the user's explicit request) is a narrower,
+        differently-named, differently-scoped setting for the one
+        lightweight reachability check still left on a schedule — it does
+        not resurrect the OLD option. This test guards that the old
+        symbols and option key specifically stay gone, not that the whole
+        concept of a configurable interval never comes back.
         """
+        assert not hasattr(hoval, "_get_scan_interval")
+        assert not hasattr(hoval, "DEFAULT_SCAN_INTERVAL")
+
+        flow = HovalConnectOptionsFlow()
+        flow.config_entry = MagicMock(
+            options={"turn_on_mode": "resume", "override_duration": "FOUR"}
+        )
+        result = asyncio.run(flow.async_step_init(None))
+        schema_dict = result["data_schema"].schema
+        assert not any(k == "scan_interval" for k in schema_dict)
+
+    def test_health_check_interval_is_configurable_via_options(self) -> None:
+        """CONF_HEALTH_CHECK_INTERVAL — reinstated in this same v1.0.0
+        release at the user's explicit request — must actually be read
+        from config-entry options, not silently ignored in favor of the
+        constant default. HEALTH_CHECK_INTERVAL (the constant) remains the
+        correct fallback for any construction path without a config entry
+        at all (e.g. a bare coordinator built directly, as other tests in
+        this suite do), which test_options_form_offers_health_check_interval_choices
+        below covers separately.
+        """
+        from custom_components.hoval_connect import _get_health_check_interval
+
+        entry = MagicMock()
+        entry.options = {"health_check_interval": 3600}
+        assert _get_health_check_interval(entry).total_seconds() == 3600
+
+    def test_health_check_interval_falls_back_to_default_when_unset(self) -> None:
+        from custom_components.hoval_connect import _get_health_check_interval
+        from custom_components.hoval_connect.const import DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+
+        entry = MagicMock()
+        entry.options = {}
+        assert (
+            _get_health_check_interval(entry).total_seconds()
+            == DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+        )
+
+    def test_health_check_interval_coerces_legacy_string_option(self) -> None:
+        from custom_components.hoval_connect import _get_health_check_interval
+
+        entry = MagicMock()
+        entry.options = {"health_check_interval": "900"}
+        assert _get_health_check_interval(entry).total_seconds() == 900
+
+    def test_health_check_interval_falls_back_on_garbage(self) -> None:
+        from custom_components.hoval_connect import _get_health_check_interval
+        from custom_components.hoval_connect.const import DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+
+        entry = MagicMock()
+        entry.options = {"health_check_interval": "not-a-number"}
+        assert (
+            _get_health_check_interval(entry).total_seconds()
+            == DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+        )
+
+    def test_health_check_interval_rejects_zero(self) -> None:
+        """Independent audit finding (2026-09, fourth round, HVC-006): a
+        numeric-but-unsupported value (not just a non-numeric one) must
+        also fall back to the default — 0 would otherwise hand
+        DataUpdateCoordinator a non-positive update_interval.
+        """
+        from custom_components.hoval_connect import _get_health_check_interval
+        from custom_components.hoval_connect.const import DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+
+        entry = MagicMock()
+        entry.options = {"health_check_interval": 0}
+        assert (
+            _get_health_check_interval(entry).total_seconds()
+            == DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+        )
+
+    def test_health_check_interval_rejects_negative(self) -> None:
+        from custom_components.hoval_connect import _get_health_check_interval
+        from custom_components.hoval_connect.const import DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+
+        entry = MagicMock()
+        entry.options = {"health_check_interval": -1}
+        assert (
+            _get_health_check_interval(entry).total_seconds()
+            == DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+        )
+
+    def test_health_check_interval_rejects_implausibly_large_value(self) -> None:
+        from custom_components.hoval_connect import _get_health_check_interval
+        from custom_components.hoval_connect.const import DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+
+        entry = MagicMock()
+        entry.options = {"health_check_interval": 999999999}
+        assert (
+            _get_health_check_interval(entry).total_seconds()
+            == DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+        )
+
+    def test_health_check_interval_rejects_overflow_value(self) -> None:
+        """A value so large it would make timedelta() itself raise
+        OverflowError must not crash config-entry setup.
+        """
+        from custom_components.hoval_connect import _get_health_check_interval
+        from custom_components.hoval_connect.const import DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+
+        entry = MagicMock()
+        entry.options = {"health_check_interval": 10**20}
+        assert (
+            _get_health_check_interval(entry).total_seconds()
+            == DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+        )
+
+    def test_health_check_interval_accepts_every_supported_option(self) -> None:
+        from custom_components.hoval_connect import _get_health_check_interval
+        from custom_components.hoval_connect.const import HEALTH_CHECK_INTERVAL_OPTIONS
+
+        for seconds in HEALTH_CHECK_INTERVAL_OPTIONS:
+            entry = MagicMock()
+            entry.options = {"health_check_interval": seconds}
+            assert _get_health_check_interval(entry).total_seconds() == seconds
+
+    def test_options_form_offers_health_check_interval_choices(self) -> None:
         flow = HovalConnectOptionsFlow()
         flow.config_entry = MagicMock(
             options={
-                "scan_interval": 600,
                 "turn_on_mode": "resume",
                 "override_duration": "FOUR",
+                "health_check_interval": 3600,
             }
         )
-
         result = asyncio.run(flow.async_step_init(None))
 
         assert result["type"] == "form"
         schema_dict = result["data_schema"].schema
-        scan_marker = next(k for k in schema_dict if k == "scan_interval")
-        assert scan_marker.default() == 600
+        interval_marker = next(k for k in schema_dict if k == "health_check_interval")
+        assert interval_marker.default() == 3600
+        interval_validator = schema_dict[interval_marker]
+        assert interval_validator(3600) == 3600
+        assert interval_validator("3600") == 3600  # frontend submits strings
 
-        scan_validator = schema_dict[scan_marker]
-        assert scan_validator(600) == 600
-        # Also the shape the real frontend actually submits.
-        assert scan_validator("600") == 600
+    def test_default_coordinator_construction_still_uses_the_constant(self) -> None:
+        """A bare coordinator built without going through async_setup_entry
+        (as most of this test suite's coordinator tests do) has no config
+        entry options to read, so it must fall back to the constant.
+        """
+        from custom_components.hoval_connect.const import HEALTH_CHECK_INTERVAL
+        from custom_components.hoval_connect.coordinator import HovalDataCoordinator
 
-    def test_scan_interval_options_form_prefills_five_minute_value(self) -> None:
-        """Sibling case: 300 already had a matching option before this fix."""
-        flow = HovalConnectOptionsFlow()
-        flow.config_entry = MagicMock(
-            options={
-                "scan_interval": 300,
-                "turn_on_mode": "resume",
-                "override_duration": "FOUR",
-            }
-        )
-
-        result = asyncio.run(flow.async_step_init(None))
-
-        schema_dict = result["data_schema"].schema
-        scan_marker = next(k for k in schema_dict if k == "scan_interval")
-        assert scan_marker.default() == 300
+        coordinator = HovalDataCoordinator(MagicMock(), MagicMock(), MagicMock(), MagicMock())
+        assert coordinator.update_interval == HEALTH_CHECK_INTERVAL
 
 
 # ---------------------------------------------------------------------------
@@ -477,36 +720,9 @@ class TestPlatformWiring:
 # ---------------------------------------------------------------------------
 # Units
 # ---------------------------------------------------------------------------
-
-
-class TestPercentageUnits:
-    """UnitOfRatio migration must not change the emitted unit."""
-
-    def test_no_bare_percentage_import_remains(self) -> None:
-        assert "    PERCENTAGE,\n" not in _source("sensor")
-
-    def test_all_percentage_sensors_use_unit_of_ratio(self) -> None:
-        from custom_components.hoval_connect import sensor
-
-        descriptions = [
-            d
-            for collection in (
-                sensor.CIRCUIT_SENSOR_DESCRIPTIONS,
-                sensor.PLANT_SENSOR_DESCRIPTIONS,
-                sensor.CONNECTION_SENSOR_DESCRIPTIONS,
-            )
-            for d in collection
-        ]
-        percentage = [d for d in descriptions if d.native_unit_of_measurement == "%"]
-        assert len(percentage) == 9, f"expected 9 percentage sensors, found {len(percentage)}"
-        for description in percentage:
-            assert description.native_unit_of_measurement is ha_stubs.UnitOfRatio.PERCENTAGE
-
-    def test_unit_string_is_unchanged(self) -> None:
-        """Identical value means existing long-term statistics stay valid."""
-        assert ha_stubs.UnitOfRatio.PERCENTAGE == "%"
-        assert str(ha_stubs.UnitOfRatio.PERCENTAGE) == "%"
-        assert ha_stubs.UnitOfRatio.PERCENTAGE == ha_stubs.PERCENTAGE
+# v1.0.0 deleted sensor.py entirely (see docs/audit-v1.0.0.md), which is
+# where every percentage-unit sensor this class guarded used to live.
+# TestPercentageUnits removed along with it.
 
 
 # ---------------------------------------------------------------------------
@@ -683,23 +899,21 @@ class TestManifestAndMetadata:
 
     def test_version_is_bumped(self) -> None:
         """
-        Pre-existing drift found while working on this release: this
-        assertion hardcoded "2.2.0" while the shipped manifest.json already
-        said "2.22.0" — one version number ahead — so this test was already
-        silently wrong before this release touched anything. Both numbers
-        were themselves a typo for the "0.x" line this project actually uses
-        (see the "Housekeeping note" in CHANGELOG.md's [0.23.0] entry, and
-        the version-numbering note in docs/audit-v0.23.0.md) — a first pass
-        at fixing this test asserted "2.23.0", continuing the typo instead of
-        catching it. Corrected to "0.23.0" in that release, continuing
-        properly from 0.21.1. Now bumped again to "0.24.0" for the
-        requests-transport rewrite (see docs/audit-v0.24.0.md). Bump this
-        string (and manifest.json) together on release.
+        Version history (see CHANGELOG.md for the full story of the earlier
+        typo/correction cycle): 0.21.1 -> 0.23.0 -> 0.24.0 -> now 1.0.0.
+
+        1.0.0 is a deliberate major-version jump, not a routine increment:
+        v1.0.0 is a genuine architecture change (this integration no longer
+        polls telemetry on any schedule — see docs/audit-v1.0.0.md) that the
+        user explicitly wanted a clean, distinct version number for, so a
+        previously-deployed 0.24.0 install is never silently overwritten by
+        an in-place update. Bump this string (and manifest.json) together on
+        release.
         """
         import json
 
         manifest = json.loads((COMPONENT_DIR / "manifest.json").read_text())
-        assert manifest["version"] == "0.24.1"
+        assert manifest["version"] == "1.0.0"
 
     def test_hacs_minimum_ha_covers_via_device_id(self) -> None:
         """via_device_id landed in HA 2026.8; earlier versions raise TypeError.

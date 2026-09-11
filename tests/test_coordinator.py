@@ -15,13 +15,8 @@ from datetime import UTC, datetime
 from custom_components.hoval_connect.coordinator import (  # noqa: E402
     _V1_PROGRAM_MAP,
     HovalCircuitData,
-    HovalCircuitHealth,
     HovalConnectionHealth,
-    HovalEventData,
-    _is_problem_event,
-    _parse_event,
     _resolve_active_program_value,
-    resolve_fan_speed,
     resolve_weather_impact_update,
 )
 
@@ -185,37 +180,11 @@ class TestResolveActiveProgramValue:
 # ---------------------------------------------------------------------------
 
 
-class TestResolveFanSpeed:
-    """Tests for resolve_fan_speed()."""
-
-    def _circuit(self, **kwargs) -> HovalCircuitData:
-        return HovalCircuitData(circuit_type="HV", path="1.2.3", name="Test", **kwargs)
-
-    def test_none_circuit_returns_default(self):
-        assert resolve_fan_speed(None) == 40
-
-    def test_live_air_volume(self):
-        assert resolve_fan_speed(self._circuit(live_values={"airVolume": "65"})) == 65
-
-    def test_live_air_volume_float_truncates(self):
-        assert resolve_fan_speed(self._circuit(live_values={"airVolume": "72.9"})) == 72
-
-    def test_live_zero_falls_through_to_target_value(self):
-        c = self._circuit(live_values={"airVolume": "0"}, target_value=50)
-        assert resolve_fan_speed(c) == 50
-
-    def test_target_value_fallback(self):
-        assert resolve_fan_speed(self._circuit(target_value=80)) == 80
-
-    def test_program_air_volume_fallback(self):
-        assert resolve_fan_speed(self._circuit(program_air_volume=55.0)) == 55
-
-    def test_all_none_returns_default(self):
-        assert resolve_fan_speed(self._circuit()) == 40
-
-    def test_minimum_is_default_when_all_zero(self):
-        c = self._circuit(live_values={"airVolume": "0"}, target_value=0, program_air_volume=0.0)
-        assert resolve_fan_speed(c) == 40
+# v1.0.0 removed resolve_fan_speed() as dead code (it was never called
+# anywhere in the codebase — its only reference was a comment). Its
+# dependency, HovalCircuitData.program_air_volume, was removed at the same
+# time (pure telemetry, see docs/audit-v1.0.0.md), so this coverage went
+# with it rather than being kept for a function nothing calls.
 
 
 # ---------------------------------------------------------------------------
@@ -239,168 +208,11 @@ class TestV1ProgramMap:
 
 
 # ---------------------------------------------------------------------------
-# _parse_event / HovalEventData / _is_problem_event
+# v1.0.0 removed _parse_event()/HovalEventData/_is_problem_event() entirely
+# — event-history telemetry with no write dependency, replaced by deriving
+# plant.has_error directly from circuits' own hasError flags. See
+# docs/audit-v1.0.0.md.
 # ---------------------------------------------------------------------------
-
-
-class TestParseEvent:
-    def test_parse_full_event(self):
-        raw = {
-            "eventType": "warning",
-            "description": "Filterwechsel erforderlich",
-            "timeOccurred": "2026-02-17T10:30:00Z",
-            "timeResolved": None,
-            "sourcePath": "520.50.0",
-            "code": 12345,
-        }
-        ev = _parse_event(raw)
-        assert ev.event_type == "warning"
-        assert ev.description == "Filterwechsel erforderlich"
-        assert ev.time_occurred == "2026-02-17T10:30:00Z"
-        assert ev.time_resolved is None
-        assert ev.source_path == "520.50.0"
-        assert ev.code == 12345
-
-    def test_active_when_not_resolved(self):
-        assert _parse_event({"eventType": "warning", "timeResolved": None}).is_active is True
-
-    def test_inactive_when_resolved(self):
-        ev = _parse_event({"eventType": "warning", "timeResolved": "2026-02-17T12:00:00Z"})
-        assert ev.is_active is False
-
-    def test_active_when_time_resolved_missing(self):
-        assert _parse_event({"eventType": "blocking"}).is_active is True
-
-    def test_parse_empty_dict_all_none(self):
-        ev = _parse_event({})
-        assert ev.event_type is None
-        assert ev.is_active is True  # no timeResolved → active
-
-    def test_default_event_data_is_active(self):
-        assert HovalEventData().is_active is True
-
-    def test_resolved_event_data(self):
-        assert HovalEventData(time_resolved="2026-02-17T12:00:00Z").is_active is False
-
-
-class TestIsProblemEvent:
-    def test_active_blocking_is_problem(self):
-        assert _is_problem_event(HovalEventData(event_type="blocking")) is True
-
-    def test_active_locking_is_problem(self):
-        assert _is_problem_event(HovalEventData(event_type="locking")) is True
-
-    def test_active_warning_is_problem(self):
-        assert _is_problem_event(HovalEventData(event_type="warning")) is True
-
-    def test_resolved_warning_is_not_problem(self):
-        ev = HovalEventData(event_type="warning", time_resolved="2026-02-17T12:00:00Z")
-        assert _is_problem_event(ev) is False
-
-    def test_info_is_not_problem(self):
-        assert _is_problem_event(HovalEventData(event_type="info")) is False
-
-    def test_offline_is_not_problem(self):
-        assert _is_problem_event(HovalEventData(event_type="offline")) is False
-
-    def test_none_is_not_problem(self):
-        assert _is_problem_event(None) is False
-
-    def test_none_event_type_is_not_problem(self):
-        assert _is_problem_event(HovalEventData(event_type=None)) is False
-
-
-# ---------------------------------------------------------------------------
-# HovalCircuitHealth
-# ---------------------------------------------------------------------------
-
-
-class TestHovalCircuitHealth:
-    def test_initial_state(self):
-        ch = HovalCircuitHealth()
-        assert ch.total_polls == 0
-        assert ch.total_failures == 0
-        assert ch.consecutive_failures == 0
-        assert ch.failure_rate_1h is None
-        assert ch.availability_1h is None
-
-    def test_record_success(self):
-        ch = HovalCircuitHealth()
-        ts = datetime.now(UTC)
-        ch.record_success(ts)
-        assert ch.total_polls == 1
-        assert ch.total_failures == 0
-        assert ch.consecutive_failures == 0
-        assert ch.last_success == ts
-        assert ch.failure_rate_1h == 0.0
-        assert ch.availability_1h == 100.0
-
-    def test_record_failure(self):
-        ch = HovalCircuitHealth()
-        ts = datetime.now(UTC)
-        ch.record_failure(ts, "HTTP 503")
-        assert ch.total_polls == 1
-        assert ch.total_failures == 1
-        assert ch.consecutive_failures == 1
-        assert ch.last_failure == ts
-        assert ch.last_error == "HTTP 503"
-        assert ch.failure_rate_1h == 100.0
-        assert ch.availability_1h == 0.0
-
-    def test_consecutive_failures_resets_on_success(self):
-        ch = HovalCircuitHealth()
-        ts = datetime.now(UTC)
-        ch.record_failure(ts, "err")
-        ch.record_failure(ts, "err")
-        assert ch.consecutive_failures == 2
-        ch.record_success(ts)
-        assert ch.consecutive_failures == 0
-        assert ch.total_failures == 2  # cumulative never resets
-
-    def test_mixed_polls_failure_rate(self):
-        ch = HovalCircuitHealth()
-        ts = datetime.now(UTC)
-        for _ in range(8):
-            ch.record_success(ts)
-        for _ in range(2):
-            ch.record_failure(ts, "err")
-        assert ch.failure_rate_1h == 20.0
-        assert ch.availability_1h == 80.0
-
-    def test_error_truncated_to_200_chars(self):
-        ch = HovalCircuitHealth()
-        ch.record_failure(datetime.now(UTC), "x" * 300)
-        assert len(ch.last_error) == 200
-
-    def test_to_store_dict_only_cumulative_counters(self):
-        ch = HovalCircuitHealth()
-        ts = datetime.now(UTC)
-        ch.record_success(ts)
-        ch.record_failure(ts, "err")
-        d = ch.to_store_dict()
-        assert set(d.keys()) == {"total_polls", "total_failures"}
-        assert d["total_polls"] == 2
-        assert d["total_failures"] == 1
-
-    def test_restore_from_store_valid_data(self):
-        ch = HovalCircuitHealth()
-        ch.restore_from_store({"total_polls": 500, "total_failures": 42})
-        assert ch.total_polls == 500
-        assert ch.total_failures == 42
-        assert ch.consecutive_failures == 0  # session-only — not restored
-
-    def test_restore_from_store_bad_string_graceful(self):
-        """Corrupt store data must not crash the integration on startup."""
-        ch = HovalCircuitHealth()
-        ch.restore_from_store({"total_polls": "not-a-number", "total_failures": "bad"})
-        assert ch.total_polls == 0
-        assert ch.total_failures == 0
-
-    def test_restore_from_store_missing_keys_defaults_to_zero(self):
-        ch = HovalCircuitHealth()
-        ch.restore_from_store({})
-        assert ch.total_polls == 0
-        assert ch.total_failures == 0
 
 
 # ---------------------------------------------------------------------------
@@ -453,25 +265,46 @@ class TestHovalConnectionHealth:
         h.record_error(ts, "api", "a")
         assert h.error_counts == {"timeout": 2, "api": 1}
 
-    def test_circuit_health_lazy_creation(self):
-        h = HovalConnectionHealth()
-        ch = h.get_circuit_health("1.2.3")
-        assert isinstance(ch, HovalCircuitHealth)
-        assert h.get_circuit_health("1.2.3") is ch  # same object
+    # v1.0.0: per-circuit health tracking (get_circuit_health, HovalCircuitHealth)
+    # was removed along with live-values polling — see docs/audit-v1.0.0.md.
+    # Replaced by last_successful_contact_at, tested below.
 
-    def test_to_store_dict_includes_circuits(self):
+    def test_record_successful_contact_sets_timestamp(self):
         h = HovalConnectionHealth()
-        h.total_polls = 10
-        h.ema_latency_ms = 250.0
-        ch = h.get_circuit_health("1.2.3")
-        ch.record_success(datetime.now(UTC))
+        assert h.last_successful_contact_at is None
+        ts = datetime.now(UTC)
+        h.record_successful_contact(ts)
+        assert h.last_successful_contact_at == ts
+
+    def test_record_poll_success_also_records_contact(self):
+        """A successful health check counts as contact too, not just writes."""
+        h = HovalConnectionHealth()
+        ts = datetime.now(UTC)
+        h.record_poll_success(ts, 42.0)
+        assert h.last_successful_contact_at == ts
+
+    def test_record_successful_contact_overwrites_older_timestamp(self):
+        h = HovalConnectionHealth()
+        older = datetime(2026, 1, 1, tzinfo=UTC)
+        newer = datetime(2026, 6, 1, tzinfo=UTC)
+        h.record_successful_contact(older)
+        h.record_successful_contact(newer)
+        assert h.last_successful_contact_at == newer
+
+    def test_to_store_dict_includes_contact_timestamp(self):
+        h = HovalConnectionHealth()
+        ts = datetime(2026, 3, 4, 5, 6, 7, tzinfo=UTC)
+        h.record_successful_contact(ts)
         d = h.to_store_dict()
-        assert d["total_polls"] == 10
-        assert d["ema_latency_ms"] == 250.0
-        assert d["circuits"]["1.2.3"]["total_polls"] == 1
+        assert d["last_successful_contact_at"] == ts.isoformat()
+
+    def test_to_store_dict_contact_none_when_never_contacted(self):
+        h = HovalConnectionHealth()
+        assert h.to_store_dict()["last_successful_contact_at"] is None
 
     def test_restore_from_store_full(self):
         h = HovalConnectionHealth()
+        ts = datetime(2026, 3, 4, 5, 6, 7, tzinfo=UTC)
         h.restore_from_store(
             {
                 "total_polls": 1000,
@@ -479,7 +312,7 @@ class TestHovalConnectionHealth:
                 "auth_failures": 3,
                 "error_counts": {"timeout": 10, "api": 40},
                 "ema_latency_ms": 350.5,
-                "circuits": {"2.3.4": {"total_polls": 200, "total_failures": 5}},
+                "last_successful_contact_at": ts.isoformat(),
             }
         )
         assert h.total_polls == 1000
@@ -487,7 +320,7 @@ class TestHovalConnectionHealth:
         assert h.auth_failures == 3
         assert h.error_counts == {"timeout": 10, "api": 40}
         assert h.ema_latency_ms == 350.5
-        assert h._circuit_health["2.3.4"].total_polls == 200
+        assert h.last_successful_contact_at == ts
 
     def test_restore_from_store_bad_int_graceful(self):
         """Corrupt storage values must not crash the integration."""
@@ -502,6 +335,17 @@ class TestHovalConnectionHealth:
         assert h.total_polls == 0
         assert h.total_failures == 0
         assert h.auth_failures == 0
+
+    def test_restore_from_store_bad_contact_timestamp_graceful(self):
+        """A corrupt/non-ISO contact timestamp must not crash startup."""
+        h = HovalConnectionHealth()
+        h.restore_from_store({"last_successful_contact_at": "not-a-timestamp"})
+        assert h.last_successful_contact_at is None
+
+    def test_restore_from_store_missing_contact_timestamp_stays_none(self):
+        h = HovalConnectionHealth()
+        h.restore_from_store({"total_polls": 5})
+        assert h.last_successful_contact_at is None
 
     def test_restore_strips_unknown_error_types(self):
         h = HovalConnectionHealth()
@@ -518,25 +362,93 @@ class TestHovalConnectionHealth:
         h.restore_from_store({"ema_latency_ms": -5})
         assert h.ema_latency_ms is None
 
+    def test_restore_ignores_infinite_ema(self):
+        """Independent audit finding (2026-09, fourth round, HVC-012):
+        `ema > 0` alone let +infinity through, since inf > 0 is True in
+        Python — isfinite() must be checked too.
+        """
+        h = HovalConnectionHealth()
+        h.restore_from_store({"ema_latency_ms": float("inf")})
+        assert h.ema_latency_ms is None
+
+    def test_restore_ignores_nan_ema(self):
+        h = HovalConnectionHealth()
+        h.restore_from_store({"ema_latency_ms": float("nan")})
+        assert h.ema_latency_ms is None
+
+    def test_restore_from_store_naive_contact_timestamp_assumed_utc(self):
+        """Independent audit finding (2026-09, fourth round, HVC-009): a
+        timezone-naive persisted timestamp must not crash the diagnostic
+        sensor later (dt_util.utcnow() - naive_datetime raises TypeError) —
+        it's normalized to UTC-aware instead of being rejected outright.
+        """
+        h = HovalConnectionHealth()
+        h.restore_from_store({"last_successful_contact_at": "2026-01-01T12:00:00"})
+        assert h.last_successful_contact_at is not None
+        assert h.last_successful_contact_at.tzinfo is not None
+        # Subtracting an aware "now" must not raise.
+        delta = datetime.now(UTC) - h.last_successful_contact_at
+        assert delta.total_seconds() > 0
+
+    def test_restore_from_store_aware_contact_timestamp_unchanged(self):
+        h = HovalConnectionHealth()
+        h.restore_from_store({"last_successful_contact_at": "2026-01-01T12:00:00+00:00"})
+        assert h.last_successful_contact_at.tzinfo is not None
+        assert h.last_successful_contact_at.utcoffset().total_seconds() == 0
+
+    def test_restore_error_counts_ignores_nan_entry_keeps_others(self):
+        """Independent audit finding (2026-09, fourth round, HVC-012): a
+        single corrupted entry (NaN/infinity — both real possibilities
+        since Python's json module parses them by default) used to raise
+        inside a dict comprehension with no protection, crashing the
+        WHOLE restore, not just that one entry.
+        """
+        h = HovalConnectionHealth()
+        h.restore_from_store({"error_counts": {"timeout": float("nan"), "api": 3}})
+        assert "timeout" not in h.error_counts
+        assert h.error_counts == {"api": 3}
+
+    def test_restore_error_counts_ignores_infinite_entry(self):
+        h = HovalConnectionHealth()
+        h.restore_from_store({"error_counts": {"timeout": float("inf")}})
+        assert h.error_counts == {}
+
+    def test_restore_error_counts_ignores_negative_entry(self):
+        h = HovalConnectionHealth()
+        h.restore_from_store({"error_counts": {"timeout": -5}})
+        assert h.error_counts == {}
+
+    def test_restore_main_counters_ignore_negative_values(self):
+        h = HovalConnectionHealth()
+        h.restore_from_store({"total_polls": -100, "total_failures": 5})
+        assert h.total_polls == 0
+        assert h.total_failures == 5
+
+    def test_restore_main_counters_ignore_non_finite_values(self):
+        h = HovalConnectionHealth()
+        h.restore_from_store({"total_polls": float("nan")})
+        assert h.total_polls == 0
+
     def test_as_diagnostic_dict_has_required_sections(self):
         h = HovalConnectionHealth()
         d = h.as_diagnostic_dict()
         assert {
             "last_success",
+            "last_successful_contact_at",
             "last_error",
             "counters_since_startup",
             "rolling_1h_window",
             "latency_ms",
-            "circuits",
         } <= d.keys()
         assert "ema" in d["latency_ms"]
         assert "error_counts" in d["counters_since_startup"]
 
-    def test_as_diagnostic_dict_circuit_section(self):
+    def test_as_diagnostic_dict_contact_timestamp(self):
         h = HovalConnectionHealth()
-        h.get_circuit_health("5.6.7").record_success(datetime.now(UTC))
+        ts = datetime.now(UTC)
+        h.record_successful_contact(ts)
         d = h.as_diagnostic_dict()
-        assert d["circuits"]["5.6.7"]["total_polls"] == 1
+        assert d["last_successful_contact_at"] == ts.isoformat()
 
     def test_persist_roundtrip(self):
         """to_store_dict() → restore_from_store() is lossless for all counters."""
@@ -546,9 +458,8 @@ class TestHovalConnectionHealth:
         h.auth_failures = 2
         h.error_counts = {"auth": 2, "timeout": 5}
         h.ema_latency_ms = 123.4
-        ch = h.get_circuit_health("9.9.9")
-        ch.total_polls = 10
-        ch.total_failures = 1
+        ts = datetime(2026, 3, 4, 5, 6, 7, tzinfo=UTC)
+        h.record_successful_contact(ts)
 
         h2 = HovalConnectionHealth()
         h2.restore_from_store(h.to_store_dict())
@@ -558,7 +469,7 @@ class TestHovalConnectionHealth:
         assert h2.auth_failures == 2
         assert h2.error_counts == {"auth": 2, "timeout": 5}
         assert h2.ema_latency_ms == 123.4
-        assert h2._circuit_health["9.9.9"].total_polls == 10
+        assert h2.last_successful_contact_at == ts
 
 
 # ---------------------------------------------------------------------------
@@ -595,16 +506,18 @@ class TestCacheTtls:
         from datetime import timedelta
 
         from custom_components.hoval_connect.const import (
-            EVENTS_CACHE_TTL,
+            CIRCUIT_SETTINGS_CACHE_TTL,
             PROGRAM_CACHE_TTL,
-            WEATHER_CACHE_TTL,
         )
 
-        for ttl in (EVENTS_CACHE_TTL, WEATHER_CACHE_TTL, PROGRAM_CACHE_TTL):
+        # v1.0.0 removed EVENTS_CACHE_TTL / WEATHER_CACHE_TTL along with the
+        # telemetry they cached — see docs/audit-v1.0.0.md. PROGRAM_CACHE_TTL
+        # and CIRCUIT_SETTINGS_CACHE_TTL remain: both still back real control
+        # data (program names, weatherImpact) fetched at startup and after
+        # writes.
+        for ttl in (PROGRAM_CACHE_TTL, CIRCUIT_SETTINGS_CACHE_TTL):
             assert isinstance(ttl, timedelta)
             assert ttl.total_seconds() > 0
-        # Weather changes most slowly, events fastest of the three plant caches.
-        assert WEATHER_CACHE_TTL >= EVENTS_CACHE_TTL
 
 
 # ---------------------------------------------------------------------------
@@ -735,6 +648,54 @@ class TestResolveWeatherImpactUpdate:
         )
         assert outside == 10
         assert solar == -1.0
+
+    def test_hvc019_corrupted_sibling_outside_temperature_is_reclamped(self):
+        """Independent audit finding (2026-09, fourth round, HVC-019): the
+        sibling value (from cache/override/circuit data, not the field the
+        user is actually changing) used to be forwarded completely as-is.
+        An out-of-range sibling must be clamped, same as a fresh value
+        would be.
+        """
+        outside, solar = resolve_weather_impact_update(
+            500, -4.0, outside_temperature=None, solar_radiation=-2.0
+        )
+        assert outside == 100  # clamped into range, not sent as 500
+        assert solar == -2.0
+
+    def test_hvc019_corrupted_sibling_solar_radiation_is_reclamped(self):
+        outside, solar = resolve_weather_impact_update(
+            30, -99.0, outside_temperature=10, solar_radiation=None
+        )
+        assert outside == 10
+        assert solar == -10.0  # clamped, not sent as -99
+
+    def test_hvc019_non_finite_sibling_becomes_none_not_propagated(self):
+        """A genuinely unusable sibling value (NaN — from a corrupted cache
+        entry, say) must degrade to None rather than crash the write or
+        forward garbage.
+        """
+        outside, solar = resolve_weather_impact_update(
+            float("nan"), -4.0, outside_temperature=None, solar_radiation=-2.0
+        )
+        assert outside is None
+        assert solar == -2.0
+
+    def test_hvc019_wrong_type_sibling_becomes_none(self):
+        outside, solar = resolve_weather_impact_update(
+            "garbage", -4.0, outside_temperature=None, solar_radiation=-2.0
+        )
+        assert outside is None
+        assert solar == -2.0
+
+    def test_hvc019_valid_sibling_within_range_is_unaffected(self):
+        """Sanity check: a sibling that's already valid must not be altered
+        beyond ordinary clamping (which is a no-op for an in-range value).
+        """
+        outside, solar = resolve_weather_impact_update(
+            42, -3.5, outside_temperature=None, solar_radiation=-2.0
+        )
+        assert outside == 42
+        assert solar == -2.0
 
 
 class TestHovalCircuitDataWeatherImpactDefaults:
@@ -877,18 +838,9 @@ class TestResolveActiveProgramRobustness:
 
 
 # ---------------------------------------------------------------------------
-# _parse_event — non-dict guard (v0.21.1, audit F2)
+# v1.0.0 removed _parse_event()/_is_problem_event() entirely along with
+# event-history telemetry. See docs/audit-v1.0.0.md.
 # ---------------------------------------------------------------------------
-
-
-class TestParseEventGuard:
-    def test_non_dict_returns_empty_event(self):
-        for weird in ("string", 42, ["list"], None, 3.14):
-            ev = _parse_event(weird)
-            assert ev.event_type is None
-            assert ev.description is None
-            # And an empty event never flags a plant error:
-            assert _is_problem_event(ev) is False
 
 
 # ---------------------------------------------------------------------------

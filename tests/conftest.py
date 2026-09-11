@@ -60,6 +60,18 @@ class StubDataUpdateCoordinator:
     async def async_request_refresh(self) -> None:
         """No-op; tests patch or inspect the coordinator directly."""
 
+    def async_update_listeners(self) -> None:
+        """No-op stand-in for DataUpdateCoordinator.async_update_listeners().
+
+        Added alongside HVC-008's fix (coordinator.py calls this directly
+        after a successful write, to notify entities immediately rather than
+        waiting for the next full refresh). Real HA's implementation
+        notifies registered CoordinatorEntity listeners without touching
+        .data or triggering a new fetch; tests here don't register any
+        listeners, so a no-op is a faithful enough stand-in — what matters
+        for test purposes is only that calling it doesn't raise.
+        """
+
 
 class StubUpdateFailed(Exception):
     """Real exception stand-in for homeassistant.helpers.update_coordinator.UpdateFailed."""
@@ -81,10 +93,10 @@ class StubUnsupportedStorageVersionError(StubHomeAssistantError):
     """Real exception stand-in for homeassistant.exceptions.UnsupportedStorageVersionError.
 
     Raised by Store.async_load() when the stored file's version is newer
-    than what the code requests (e.g. after installing, then rolling back
-    from, a later release that bumps HEALTH_STORAGE_VERSION) and no migrate
-    function is provided — see the v0.24.1 fix in __init__.py. Real HA
-    subclasses this from HomeAssistantError, matched here.
+    than what the code requests (e.g. after a rollback) and no migrate
+    function is provided — see docs/audit-v1.0.0.md § 8 and the comment in
+    const.py above HEALTH_STORAGE_VERSION. Real HA subclasses this from
+    HomeAssistantError, matched here.
     """
 
 

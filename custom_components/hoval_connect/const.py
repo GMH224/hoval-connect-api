@@ -1,6 +1,7 @@
 """Constants for the Hoval Connect integration."""
 
 from datetime import timedelta
+from math import isfinite
 
 DOMAIN = "hoval_connect"
 
@@ -51,24 +52,51 @@ USER_AGENT = "hoval-connect-forensic-crawler/1.0 (+https://github.com/; diagnost
 ID_TOKEN_TTL = timedelta(minutes=25)
 PLANT_TOKEN_TTL = timedelta(minutes=12)
 
-# Polling interval
-DEFAULT_SCAN_INTERVAL = timedelta(seconds=60)
-CONF_SCAN_INTERVAL = "scan_interval"
-# 600 ("10 minutes") was missing entirely (bug fixed in 0.23.0, see
-# docs/audit-v0.23.0.md and CLAUDE.md). Any config entry with a stored
-# scan_interval of 600 (from documentation/user expectation of a "5 or 10
-# minutes" choice, or a manually-edited options value) had no matching key in
-# this dict. The options-flow dropdown's `default=` fell back to that
-# unmatched value, which the frontend cannot pre-select against — so the
-# Polling interval field rendered *empty* in the options dialog while every
-# other field (which did have a matching stored value) rendered normally.
-SCAN_INTERVAL_OPTIONS = {
-    30: "30 seconds",
-    60: "60 seconds",
-    120: "2 minutes",
-    300: "5 minutes",
-    600: "10 minutes",
-}
+# v1.0.0 — "lighter" architecture: this integration no longer polls
+# telemetry (live values, weather, events) on any schedule. All telemetry
+# now comes from a separate, CAN-bus-based HACS integration the user runs
+# alongside this one; this integration's job is control (writes) plus one
+# lightweight scheduled check that the cloud API is still reachable at all.
+# See docs/audit-v1.0.0.md for the full design rationale.
+#
+# History: v1.0.0 initially removed the old user-configurable scan_interval
+# entirely (CONF_SCAN_INTERVAL / SCAN_INTERVAL_OPTIONS / DEFAULT_SCAN_INTERVAL),
+# reasoning that there was no longer a meaningful "poll rate" to tune once
+# circuit/program/settings data moved to fetch-once-at-startup-and-after-
+# writes rather than a schedule. Reinstated as CONF_HEALTH_CHECK_INTERVAL,
+# still in this same v1.0.0 release (before deployment — see CHANGELOG.md),
+# at the user's explicit request: even a minimal health check's cadence is
+# still worth tuning, since it directly controls how quickly the
+# "Cloud API problem" diagnostic can react (see CLOUD_API_PROBLEM_THRESHOLD
+# below) and how much standing cloud traffic the integration generates.
+# This is a narrower, differently-scoped option than the old one — it only
+# affects the one lightweight scheduled call this integration still makes,
+# never circuit/program/settings data (which is unaffected regardless of
+# this setting, per the design above).
+CONF_HEALTH_CHECK_INTERVAL = "health_check_interval"
+# Options given in seconds, matching the old SCAN_INTERVAL_OPTIONS
+# convention. Deliberately coarser granularity than that option had (this
+# is a reachability heartbeat, not a telemetry poll — second-level
+# precision was never meaningful here): 10/15/30/60/120 minutes.
+HEALTH_CHECK_INTERVAL_OPTIONS = [600, 900, 1800, 3600, 7200]
+DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS = 1800  # 30 minutes — the original v1.0.0 default
+# Used as the fallback wherever a timedelta (not raw seconds) is needed —
+# e.g. before a config entry's options have ever been read, or in contexts
+# without a config entry at all (some tests construct a coordinator this way).
+HEALTH_CHECK_INTERVAL = timedelta(seconds=DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS)
+
+# How long since the last successful cloud contact (a health check OR an
+# actual successful write, whichever is more recent) before the diagnostic
+# "Cloud API problem" binary sensor turns on. Deliberately patient — a
+# single missed health check should not trip it; several in a row should.
+# NOTE: this stays fixed regardless of the user's chosen
+# CONF_HEALTH_CHECK_INTERVAL. Choosing a long health-check interval (e.g.
+# 2 hours) means this threshold gets little to no "several in a row"
+# margin before tripping on a single missed check — an accepted
+# consequence of that choice, not a bug; not scaled automatically since
+# the user did not ask for that and it would make this constant's
+# behavior surprising/implicit rather than a fixed, documented promise.
+CLOUD_API_PROBLEM_THRESHOLD = timedelta(hours=2)
 
 # Program cache TTL — programs change rarely, no need to fetch every poll
 PROGRAM_CACHE_TTL = timedelta(minutes=5)
@@ -77,13 +105,6 @@ PROGRAM_CACHE_TTL = timedelta(minutes=5)
 # are configuration, not telemetry; they only change when a user drags a
 # slider, so there is no value in re-fetching them every poll cycle.
 CIRCUIT_SETTINGS_CACHE_TTL = timedelta(minutes=10)
-
-# Plant-level cache TTLs — weather and events are slow-changing and plant-scoped,
-# so fetching them on every (default 60 s) poll wastes round-trips against the
-# cloud and risks rate-limiting. They are refreshed on their own cadence and the
-# last good value is reused in between.
-WEATHER_CACHE_TTL = timedelta(minutes=15)
-EVENTS_CACHE_TTL = timedelta(minutes=3)
 
 # Circuit types
 CIRCUIT_TYPE_HV = "HV"
@@ -141,6 +162,12 @@ DURATION_FOUR_HOURS = "FOUR"
 DURATION_MIDNIGHT = "MIDNIGHT"
 CONF_OVERRIDE_DURATION = "override_duration"
 DEFAULT_OVERRIDE_DURATION = DURATION_FOUR_HOURS
+# Independent audit finding (2026-09, fourth round, HVC-007): the options
+# form only ever writes one of these two values, but persisted config-entry
+# options are read directly at use time with no re-validation — an
+# out-of-band value (hand-edited storage, a future migration bug) would
+# otherwise reach the API unchanged. See fan.py's _override_duration.
+VALID_OVERRIDE_DURATIONS = frozenset({DURATION_FOUR_HOURS, DURATION_MIDNIGHT})
 
 # Turn-on mode options (what happens when fan is turned on from standby)
 TURN_ON_RESUME = "resume"
@@ -148,6 +175,8 @@ TURN_ON_WEEK1 = "week1"
 TURN_ON_WEEK2 = "week2"
 CONF_TURN_ON_MODE = "turn_on_mode"
 DEFAULT_TURN_ON_MODE = TURN_ON_RESUME
+# Same rationale as VALID_OVERRIDE_DURATIONS above. See fan.py's _turn_on_mode.
+VALID_TURN_ON_MODES = frozenset({TURN_ON_RESUME, TURN_ON_WEEK1, TURN_ON_WEEK2})
 
 # HV (HomeVent) air-volume operating bounds, in percent.
 # The Hoval cloud/firmware rejects or undefined-behaves on values below the
@@ -157,12 +186,43 @@ HV_AIR_VOLUME_MIN = 15
 HV_AIR_VOLUME_MAX = 100
 
 
+def clamp_temperature(value: float, minimum: float, maximum: float) -> float:
+    """Clamp a requested temperature into a climate/water-heater entity's declared band.
+
+    Independent audit finding (2026-09, HVC-007): climate.py and
+    water_heater.py declared _attr_min_temp/_attr_max_temp but never
+    actually enforced them on async_set_temperature() — a service call or
+    automation could send any float straight to the API. Generic (not one
+    bespoke function per entity, since climate and water heater have
+    different bounds) so both call sites share one tested implementation.
+
+    Raises ValueError for non-finite input (NaN, +-inf): clamping those
+    against a numeric range is not well-defined (Python's min/max do not
+    reliably reject NaN), and a service call passing one is almost always a
+    caller bug that should surface as a rejected call, not a silently
+    "clamped" result that doesn't correspond to what was asked for.
+    """
+    if not isfinite(value):
+        raise ValueError(f"Temperature must be a finite number, got {value!r}")
+    return max(minimum, min(maximum, value))
+
+
 def clamp_hv_air_volume(percentage: float) -> int:
     """Clamp a requested HV air-volume percentage into the device's valid band.
 
     Pure helper (no HA imports) so it is directly unit-testable. Returns an int
     in [HV_AIR_VOLUME_MIN, HV_AIR_VOLUME_MAX].
+
+    Raises ValueError for non-finite input (independent audit finding,
+    2026-09, HVC-ICS-004): without this guard, Python's min/max silently
+    turn NaN into a valid-looking endpoint value (e.g.
+    `min(HV_AIR_VOLUME_MAX, float("nan"))` returns HV_AIR_VOLUME_MAX, not
+    an error) — an invalid automation/service value would silently become
+    a legitimate-looking API setting instead of being rejected. Same fix
+    as clamp_temperature() above, applied here for consistency.
     """
+    if not isfinite(percentage):
+        raise ValueError(f"Air volume percentage must be a finite number, got {percentage!r}")
     return int(max(HV_AIR_VOLUME_MIN, min(HV_AIR_VOLUME_MAX, percentage)))
 
 
@@ -185,7 +245,12 @@ def clamp_weather_impact_outside_temperature(value: float) -> int:
     """Clamp a requested outside-temperature weighting into the API's valid band.
 
     Pure helper (no HA imports) so it is directly unit-testable.
+
+    Raises ValueError for non-finite input — see clamp_hv_air_volume's
+    docstring (HVC-ICS-004) for why this guard exists.
     """
+    if not isfinite(value):
+        raise ValueError(f"Outside-temperature weighting must be a finite number, got {value!r}")
     return int(
         max(
             WEATHER_IMPACT_OUTSIDE_TEMPERATURE_MIN,
@@ -198,7 +263,12 @@ def clamp_weather_impact_solar_radiation(value: float) -> float:
     """Clamp a requested solar-radiation weighting into the API's valid band.
 
     Pure helper (no HA imports) so it is directly unit-testable.
+
+    Raises ValueError for non-finite input — see clamp_hv_air_volume's
+    docstring (HVC-ICS-004) for why this guard exists.
     """
+    if not isfinite(value):
+        raise ValueError(f"Solar-radiation weighting must be a finite number, got {value!r}")
     return float(
         max(
             WEATHER_IMPACT_SOLAR_RADIATION_MIN,
@@ -212,6 +282,26 @@ SERVICE_RESET_WW_BOOST = "reset_ww_boost"
 
 # Persistent health storage
 # Increment HEALTH_STORAGE_VERSION whenever the stored schema changes in a
-# backwards-incompatible way; HA will discard the stale file automatically.
+# backwards-incompatible way.
+#
+# IMPORTANT, verified directly against HA's Store source
+# (homeassistant/helpers/storage.py) rather than assumed: HA does NOT
+# silently discard a version-mismatched file on its own. Without an
+# overridden _async_migrate_func (which this integration has never
+# provided), Store.async_load() raises — UnsupportedStorageVersionError if
+# the file's version is NEWER than requested (e.g. after rolling back to an
+# older release), or a re-raised NotImplementedError if OLDER (e.g. right
+# after upgrading past a version bump like this one). Either way, an
+# uncaught raise here would fail the whole integration's setup, not just
+# lose historical counters. __init__.py's async_setup_entry wraps the
+# health_store.async_load() call in a broad try/except specifically because
+# of this — see the comment there before removing it.
+#
+# Bumped 1 -> 2 in v1.0.0: per-circuit health tracking (tied to the
+# now-removed live-values polling) was dropped, and a new
+# last_successful_contact_at field was added. Thanks to the try/except in
+# __init__.py, a version mismatch in either direction now degrades to
+# "start fresh" instead of blocking setup — losing a few days of cumulative
+# counters on upgrade or rollback is an acceptable, one-time cost.
 HEALTH_STORAGE_KEY = f"{DOMAIN}_health"
-HEALTH_STORAGE_VERSION = 1
+HEALTH_STORAGE_VERSION = 2

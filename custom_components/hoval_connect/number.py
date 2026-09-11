@@ -192,7 +192,10 @@ class HovalWeatherImpactNumber(CoordinatorEntity[HovalDataCoordinator], NumberEn
             return False
         if circuit.weather_impact_supported:
             return True
-        return self.coordinator.get_weather_impact_override(self._circuit_path) is not None
+        return (
+            self.coordinator.get_weather_impact_override(self._plant_id, self._circuit_path)
+            is not None
+        )
 
     @property
     def native_value(self) -> float | None:
@@ -207,7 +210,7 @@ class HovalWeatherImpactNumber(CoordinatorEntity[HovalDataCoordinator], NumberEn
         """
         if self._pending_value is not None:
             return self._pending_value
-        override = self.coordinator.get_weather_impact_override(self._circuit_path)
+        override = self.coordinator.get_weather_impact_override(self._plant_id, self._circuit_path)
         if override is not None:
             value = override.get(self.entity_description.override_key)
             if value is not None:
@@ -263,4 +266,6 @@ class HovalWeatherImpactNumber(CoordinatorEntity[HovalDataCoordinator], NumberEn
         self.async_write_ha_state()
         # Cancel previous debounce timer and start a new one.
         self._cancel_debounce()
-        self._debounce_task = self.hass.async_create_task(self._debounced_set(value))
+        # Independent audit finding (2026-09, fourth round, HVC-003): see
+        # the identical fix/rationale in fan.py's async_set_percentage.
+        self._debounce_task = self.coordinator.create_tracked_task(self._debounced_set(value))

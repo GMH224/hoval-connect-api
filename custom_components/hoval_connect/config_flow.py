@@ -15,15 +15,16 @@ from homeassistant.config_entries import (
 
 from .api import HovalApiError, HovalAuthError, HovalConnectApi
 from .const import (
+    CONF_HEALTH_CHECK_INTERVAL,
     CONF_OVERRIDE_DURATION,
-    CONF_SCAN_INTERVAL,
     CONF_TURN_ON_MODE,
+    DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS,
     DEFAULT_OVERRIDE_DURATION,
     DEFAULT_TURN_ON_MODE,
     DOMAIN,
     DURATION_FOUR_HOURS,
     DURATION_MIDNIGHT,
-    SCAN_INTERVAL_OPTIONS,
+    HEALTH_CHECK_INTERVAL_OPTIONS,
     TURN_ON_RESUME,
     TURN_ON_WEEK1,
     TURN_ON_WEEK2,
@@ -160,7 +161,20 @@ class HovalConnectOptionsFlow(OptionsFlowWithReload):
     """
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
-        """Manage the options."""
+        """Manage the options.
+
+        v1.0.0 initially removed the polling-interval field entirely, since
+        there was no longer a meaningful "poll rate" to tune for circuit/
+        program/settings data (still true — see docs/audit-v1.0.0.md and
+        CHANGELOG.md). Reinstated here, in this same v1.0.0 release before
+        deployment, at the user's explicit request as CONF_HEALTH_CHECK_INTERVAL:
+        a narrower, differently-scoped setting that only controls the cadence
+        of the one lightweight reachability check this integration still runs
+        on a schedule — see _get_health_check_interval()'s docstring in
+        __init__.py. Any config entry with an old scan_interval value stored
+        from a pre-1.0.0 install is simply ignored (not migrated or deleted),
+        since nothing reads that option key anymore.
+        """
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
@@ -168,7 +182,11 @@ class HovalConnectOptionsFlow(OptionsFlowWithReload):
             CONF_OVERRIDE_DURATION, DEFAULT_OVERRIDE_DURATION
         )
         current_turn_on = self.config_entry.options.get(CONF_TURN_ON_MODE, DEFAULT_TURN_ON_MODE)
-        current_interval = int(self.config_entry.options.get(CONF_SCAN_INTERVAL, 60))
+        current_interval = int(
+            self.config_entry.options.get(
+                CONF_HEALTH_CHECK_INTERVAL, DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+            )
+        )
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
@@ -193,9 +211,9 @@ class HovalConnectOptionsFlow(OptionsFlowWithReload):
                         }
                     ),
                     vol.Required(
-                        CONF_SCAN_INTERVAL,
+                        CONF_HEALTH_CHECK_INTERVAL,
                         default=current_interval,
-                    ): vol.All(vol.Coerce(int), vol.In(SCAN_INTERVAL_OPTIONS)),
+                    ): vol.All(vol.Coerce(int), vol.In(HEALTH_CHECK_INTERVAL_OPTIONS)),
                 }
             ),
         )

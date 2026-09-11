@@ -16,6 +16,8 @@ Covers audit items 1, 2 and 6:
 
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -30,8 +32,10 @@ from custom_components.hoval_connect.coordinator import (
     ERROR_TYPE_AUTH,
     ERROR_TYPE_CIRCUIT_LIST,
     ERROR_TYPE_UNKNOWN,
+    HovalCircuitData,
     HovalDataCoordinator,
     _CircuitListError,
+    resolve_resume_program,
 )
 
 # ---------------------------------------------------------------------------
@@ -67,6 +71,10 @@ class FakeApi:
 
     Every response is an attribute so individual tests can rewrite one
     endpoint's behavior; callables are awaited-and-raised via _maybe().
+
+    v1.0.0 removed get_live_values/get_latest_event/get_events/get_weather
+    from the real API client entirely (pure telemetry, no write dependency —
+    see docs/audit-v1.0.0.md), so this fake no longer implements them either.
     """
 
     def __init__(self) -> None:
@@ -92,24 +100,12 @@ class FakeApi:
             {"type": "SOL", "path": "sol-1", "name": "Solar", "selectable": True},  # unsupported
             {"type": "HK", "name": "No path"},  # missing path → skipped
         ]
-        self.live_values_response: Any = [{"key": "airVolume", "value": "45"}]
         self.programs_response: Any = _VALID_PROGRAMS
         self.settings_response: Any = {
             "circuitName": "HK",
             "weatherImpact": {"outsideTemperature": 70, "solarRadiation": -3.5},
         }
-        self.latest_event_response: Any = {
-            "eventType": "warning",
-            "description": "Filter",
-            "timeOccurred": "2026-07-19T10:00:00+00:00",
-        }
-        self.events_response: Any = [
-            {"eventType": "warning", "description": "Filter"},
-            {"eventType": "info", "description": "OK", "timeResolved": "2026-07-19T11:00:00+00:00"},
-        ]
-        self.weather_response: Any = [
-            {"weatherType": "sunny", "outsideTemperature": 21.5, "outsideTemperatureMin": 12.0}
-        ]
+        self.update_settings_response: Any = None
         self.calls: list[str] = []
         self.invalidated: list[str] = []
 
@@ -127,10 +123,6 @@ class FakeApi:
         self.calls.append(f"circuits:{plant_id}")
         return await self._maybe(self.circuits_response)
 
-    async def get_live_values(self, plant_id, path, ctype):
-        self.calls.append(f"live:{path}")
-        return await self._maybe(self.live_values_response)
-
     async def get_programs(self, plant_id, path):
         self.calls.append(f"programs:{path}")
         return await self._maybe(self.programs_response)
@@ -139,17 +131,9 @@ class FakeApi:
         self.calls.append(f"settings:{path}")
         return await self._maybe(self.settings_response)
 
-    async def get_latest_event(self, plant_id):
-        self.calls.append(f"latest_event:{plant_id}")
-        return await self._maybe(self.latest_event_response)
-
-    async def get_events(self, plant_id):
-        self.calls.append(f"events:{plant_id}")
-        return await self._maybe(self.events_response)
-
-    async def get_weather(self, plant_id):
-        self.calls.append(f"weather:{plant_id}")
-        return await self._maybe(self.weather_response)
+    async def update_circuit_settings(self, plant_id, path, **kwargs):
+        self.calls.append(f"update_settings:{path}")
+        return await self._maybe(self.update_settings_response)
 
     def invalidate_plant_token(self, plant_id):
         self.invalidated.append(plant_id)
@@ -166,6 +150,66 @@ def _make_coordinator(api: FakeApi | None = None) -> tuple[HovalDataCoordinator,
 # ---------------------------------------------------------------------------
 # _fetch_all_data — happy path
 # ---------------------------------------------------------------------------
+
+
+class TestIsSelectableContractField:
+    """Independent audit finding (2026-09, "more" report, finding #1):
+    docs/openapi-v3.json's CircuitV3DTO declares `isSelectable` as
+    REQUIRED and `selectable` as merely optional — a valid response could
+    omit the legacy field entirely.
+    """
+
+    @pytest.mark.asyncio
+    async def test_circuit_with_only_isselectable_is_discovered(self):
+        coordinator, api = _make_coordinator()
+        api.circuits_response = [
+            {
+                "type": "HV",
+                "path": "hv-1",
+                "name": "Ventilation",
+                "isSelectable": True,
+                # deliberately no "selectable" key at all
+            }
+        ]
+        data = await coordinator._fetch_all_data()
+        assert "hv-1" in data.plants["p1"].circuits
+
+    @pytest.mark.asyncio
+    async def test_circuit_with_only_isselectable_false_is_skipped(self):
+        coordinator, api = _make_coordinator()
+        api.circuits_response = [
+            {"type": "HV", "path": "hv-1", "name": "Ventilation", "isSelectable": False}
+        ]
+        data = await coordinator._fetch_all_data()
+        assert "hv-1" not in data.plants["p1"].circuits
+
+    @pytest.mark.asyncio
+    async def test_legacy_selectable_only_still_works(self):
+        """Backward compatibility: a response with only the old field
+        (as every response captured so far has) must keep working exactly
+        as before.
+        """
+        coordinator, api = _make_coordinator()
+        api.circuits_response = [
+            {"type": "HV", "path": "hv-1", "name": "Ventilation", "selectable": True}
+        ]
+        data = await coordinator._fetch_all_data()
+        assert "hv-1" in data.plants["p1"].circuits
+
+    @pytest.mark.asyncio
+    async def test_isselectable_takes_precedence_over_conflicting_selectable(self):
+        coordinator, api = _make_coordinator()
+        api.circuits_response = [
+            {
+                "type": "HV",
+                "path": "hv-1",
+                "name": "Ventilation",
+                "isSelectable": True,
+                "selectable": False,
+            }
+        ]
+        data = await coordinator._fetch_all_data()
+        assert "hv-1" in data.plants["p1"].circuits
 
 
 class TestFetchAllDataHappyPath:
@@ -188,27 +232,43 @@ class TestFetchAllDataHappyPath:
         assert data.plants["p1"].circuits["hv-1"].active_program == "week1"
 
     @pytest.mark.asyncio
-    async def test_live_values_and_program_fields(self):
+    async def test_program_names_extracted(self):
+        """v1.0.0: only program_names survives from the programs response —
+        active_week_name/active_day_program_name/program_air_volume (pure
+        telemetry) and live_values (never fetched at all anymore) are gone.
+        See docs/audit-v1.0.0.md.
+        """
         coordinator, _api = _make_coordinator()
         data = await coordinator._fetch_all_data()
         hv = data.plants["p1"].circuits["hv-1"]
-        assert hv.live_values == {"airVolume": "45"}
-        assert hv.active_week_name == "Woche 1"
-        assert hv.active_day_program_name == "Normal"
-        assert hv.program_air_volume == 60
+        assert hv.live_values == {}  # always empty now — see HovalCircuitData
         assert hv.program_names == {"week1": "Woche 1", "week2": "Woche 2"}
 
     @pytest.mark.asyncio
-    async def test_events_and_weather_parsed(self):
-        coordinator, _api = _make_coordinator()
+    async def test_has_error_derived_from_circuits_not_events(self):
+        """v1.0.0: plant.has_error comes from circuits' own hasError flags —
+        no get_events()/get_latest_event() call exists anymore at all.
+        """
+        coordinator, api = _make_coordinator()
+        api.circuits_response = [
+            {
+                "type": "HV",
+                "path": "hv-1",
+                "name": "Ventilation",
+                "selectable": True,
+                "hasError": True,
+            }
+        ]
         data = await coordinator._fetch_all_data()
         plant = data.plants["p1"]
-        assert plant.latest_event is not None
-        assert plant.latest_event.event_type == "warning"
-        assert len(plant.events) == 2
-        assert plant.has_error is True  # active warning is a problem event
-        assert plant.weather is not None
-        assert plant.weather.outside_temperature == 21.5
+        assert plant.has_error is True
+        assert not any(c.startswith(("events:", "latest_event:", "weather:")) for c in api.calls)
+
+    @pytest.mark.asyncio
+    async def test_no_error_when_no_circuit_reports_one(self):
+        coordinator, _api = _make_coordinator()
+        data = await coordinator._fetch_all_data()
+        assert data.plants["p1"].has_error is False
 
     @pytest.mark.asyncio
     async def test_new_circuit_signal_fired_once(self, monkeypatch):
@@ -223,23 +283,19 @@ class TestFetchAllDataHappyPath:
         assert len(signals) == 1  # no new circuits → no second signal
 
     @pytest.mark.asyncio
-    async def test_program_and_event_caches_reused_within_ttl(self):
+    async def test_program_cache_reused_within_ttl(self):
         coordinator, api = _make_coordinator()
         await coordinator._fetch_all_data()
         await coordinator._fetch_all_data()
-        # Programs, events, latest-event and weather fetched once; live values twice.
+        # Programs cached (5 min TTL) — fetched once across two calls.
         assert api.calls.count("programs:hv-1") == 1
-        assert api.calls.count("events:p1") == 1
-        assert api.calls.count("latest_event:p1") == 1
-        assert api.calls.count("weather:p1") == 1
-        assert api.calls.count("live:hv-1") == 2
 
     @pytest.mark.asyncio
     async def test_mode_override_cleared_after_success(self):
         coordinator, _api = _make_coordinator()
-        coordinator.set_mode_override("hv-1", "standby")
+        coordinator.set_mode_override("p1", "hv-1", "standby")
         await coordinator._fetch_all_data()
-        assert coordinator.get_mode_override("hv-1") is None
+        assert coordinator.get_mode_override("p1", "hv-1") is None
 
     @pytest.mark.asyncio
     async def test_offline_plant_skips_circuit_calls_and_invalidates_token(self):
@@ -260,13 +316,13 @@ class TestFetchAllDataHappyPath:
 
 
 # ---------------------------------------------------------------------------
-# _fetch_all_data — degradation paths (audit F1 / F2 acceptance tests)
+# _fetch_all_data — degradation paths (audit F1 acceptance tests)
 # ---------------------------------------------------------------------------
 
 
 class TestFetchAllDataDegradation:
     @pytest.mark.asyncio
-    async def test_f1_malformed_programs_keep_circuit_and_live_values(self):
+    async def test_f1_malformed_programs_keep_circuit(self):
         """AUDIT F1: nested program drift must not drop the circuit."""
         coordinator, api = _make_coordinator()
         api.programs_response = {
@@ -276,9 +332,7 @@ class TestFetchAllDataDegradation:
         data = await coordinator._fetch_all_data()
         hv = data.plants["p1"].circuits.get("hv-1")
         assert hv is not None, "circuit must survive program schema drift"
-        assert hv.live_values == {"airVolume": "45"}
-        assert hv.active_week_name is None
-        assert hv.program_air_volume is None
+        assert hv.program_names == {}
 
     @pytest.mark.asyncio
     async def test_programs_empty_list_keeps_circuit(self):
@@ -296,75 +350,125 @@ class TestFetchAllDataDegradation:
         assert "hv-1" in data.plants["p1"].circuits
 
     @pytest.mark.asyncio
-    async def test_live_values_error_records_circuit_failure(self):
-        coordinator, api = _make_coordinator()
-        api.live_values_response = HovalApiError("boom")
-        data = await coordinator._fetch_all_data()
-        hv = data.plants["p1"].circuits["hv-1"]
-        assert hv.live_values == {}
-        assert hv.circuit_consecutive_failures == 1
-        ch = coordinator.connection_health.get_circuit_health("hv-1")
-        assert ch.total_failures == 1
-
-    @pytest.mark.asyncio
-    async def test_live_values_unexpected_dict_treated_as_empty(self):
-        """The lv_raw type guard, previously only grep-asserted."""
-        coordinator, api = _make_coordinator()
-        api.live_values_response = {"unexpected": "dict"}
-        data = await coordinator._fetch_all_data()
-        assert data.plants["p1"].circuits["hv-1"].live_values == {}
-
-    @pytest.mark.asyncio
-    async def test_f2_events_shape_drift_does_not_fail_poll(self):
-        """AUDIT F2: a hostile events shape must not take the poll down."""
-        coordinator, api = _make_coordinator()
-        # Simulate an unnormalised wrapper sneaking past the API layer.
-        api.events_response = {"content": [{"eventType": "warning"}], "last": True}
-        api.latest_event_response = ["not", "a", "dict"]
-        data = await coordinator._fetch_all_data()  # must not raise
-        plant = data.plants["p1"]
-        assert plant.latest_event is None
-        assert plant.events == []
-        assert "hv-1" in plant.circuits  # rest of the poll intact
-
-    @pytest.mark.asyncio
-    async def test_f2_non_dict_entries_in_events_list_filtered(self):
-        coordinator, api = _make_coordinator()
-        api.events_response = ["garbage", {"eventType": "warning"}, 42]
-        data = await coordinator._fetch_all_data()
-        assert len(data.plants["p1"].events) == 1
-        assert data.plants["p1"].events[0].event_type == "warning"
-
-    @pytest.mark.asyncio
-    async def test_events_failure_reuses_cache(self):
-        coordinator, api = _make_coordinator()
-        await coordinator._fetch_all_data()
-        # Expire the events cache, then fail the endpoints.
-        coordinator._events_cache["p1"] = (
-            coordinator._events_cache["p1"][0],
-            coordinator._events_cache["p1"][1],
-            -10_000.0,
-        )
-        api.events_response = HovalApiError("down")
-        api.latest_event_response = HovalApiError("down")
-        data = await coordinator._fetch_all_data()
-        # Cached events from the first poll are reused.
-        assert data.plants["p1"].latest_event is not None
-        assert len(data.plants["p1"].events) == 2
-
-    @pytest.mark.asyncio
-    async def test_weather_malformed_first_element_ignored(self):
-        coordinator, api = _make_coordinator()
-        api.weather_response = ["not-a-dict"]
-        data = await coordinator._fetch_all_data()
-        assert data.plants["p1"].weather is None
-
-    @pytest.mark.asyncio
     async def test_circuit_list_failure_raises_circuit_list_error(self):
         coordinator, api = _make_coordinator()
         api.circuits_response = HovalApiError("410 gone")
         with pytest.raises(_CircuitListError):
             await coordinator._fetch_all_data()
+
+    @pytest.mark.asyncio
+    async def test_hvc001_null_element_in_circuit_list_does_not_abort_refresh(self):
+        """Independent audit finding (2026-09, fourth round, HVC-001): a
+        non-dict element (null, a string, ...) anywhere in the circuits
+        list must not crash the whole refresh — it happens before
+        per-circuit gather() isolation even begins.
+        """
+        coordinator, api = _make_coordinator()
+        api.circuits_response = [
+            {"type": "HK", "path": "hk-1", "name": "Heating", "selectable": True},
+            None,
+            "garbage",
+            42,
+        ]
+        data = await coordinator._fetch_all_data()  # must not raise
+        assert "hk-1" in data.plants["p1"].circuits
+
+    @pytest.mark.asyncio
+    async def test_hvc002_duplicate_circuit_path_keeps_first_seen(self):
+        """Independent audit finding (2026-09, fourth round, HVC-002): two
+        circuits reporting the same path must not silently overwrite each
+        other with no trace.
+        """
+        coordinator, api = _make_coordinator()
+        api.circuits_response = [
+            {
+                "type": "HK",
+                "path": "hk-1",
+                "name": "First",
+                "selectable": True,
+                "targetValue": 21,
+            },
+            {
+                "type": "HK",
+                "path": "hk-1",
+                "name": "Second",
+                "selectable": True,
+                "targetValue": 99,
+            },
+        ]
+        data = await coordinator._fetch_all_data()
+        assert len(data.plants["p1"].circuits) == 1
+        assert data.plants["p1"].circuits["hk-1"].name == "First"
+
+    @pytest.mark.asyncio
+    async def test_hvc008_non_finite_actual_value_becomes_none(self):
+        """Independent audit finding (2026-09, fourth round, HVC-008): a
+        non-finite/malformed targetValue or actualValue must not reach
+        HovalCircuitData unfiltered.
+        """
+        coordinator, api = _make_coordinator()
+        api.circuits_response = [
+            {
+                "type": "HK",
+                "path": "hk-1",
+                "name": "Heating",
+                "selectable": True,
+                "actualValue": float("nan"),
+                "targetValue": "not-a-number",
+            }
+        ]
+        data = await coordinator._fetch_all_data()
+        hk = data.plants["p1"].circuits["hk-1"]
+        assert hk.actual_value is None
+        assert hk.target_value is None
+
+    @pytest.mark.asyncio
+    async def test_hvc008_valid_numeric_string_is_coerced(self):
+        coordinator, api = _make_coordinator()
+        api.circuits_response = [
+            {
+                "type": "HK",
+                "path": "hk-1",
+                "name": "Heating",
+                "selectable": True,
+                "actualValue": "21.5",
+                "targetValue": 22,
+            }
+        ]
+        data = await coordinator._fetch_all_data()
+        hk = data.plants["p1"].circuits["hk-1"]
+        assert hk.actual_value == 21.5
+        assert hk.target_value == 22.0
+
+    @pytest.mark.asyncio
+    async def test_hvc016_non_string_program_name_is_ignored(self):
+        """Independent audit finding (2026-09, fourth round, HVC-016): a
+        malformed (non-string, but truthy) program name must not reach
+        program_names, where it would later crash select.py's
+        disambiguation logic (which requires hashable/string values).
+        """
+        coordinator, api = _make_coordinator()
+        api.programs_response = {
+            "week1": {"name": ["a", "list"]},
+            "week2": {"name": {"nested": "object"}},
+        }
+        data = await coordinator._fetch_all_data()
+        hv = data.plants["p1"].circuits["hv-1"]
+        assert hv.program_names == {}
+
+    @pytest.mark.asyncio
+    async def test_hvc016_whitespace_only_name_is_ignored(self):
+        coordinator, api = _make_coordinator()
+        api.programs_response = {"week1": {"name": "   "}}
+        data = await coordinator._fetch_all_data()
+        assert "week1" not in data.plants["p1"].circuits["hv-1"].program_names
+
+    @pytest.mark.asyncio
+    async def test_hvc016_valid_string_name_still_works(self):
+        coordinator, api = _make_coordinator()
+        api.programs_response = {"week1": {"name": "  Winter  "}}
+        data = await coordinator._fetch_all_data()
+        assert data.plants["p1"].circuits["hv-1"].program_names["week1"] == "Winter"
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +548,320 @@ class TestAsyncUpdateData:
 # ---------------------------------------------------------------------------
 
 
+class TestMultiPlantCircuitPathCollision:
+    """Independent audit finding (2026-09, HVC-001): caches/overrides must be
+    keyed by (plant_id, circuit_path), not circuit_path alone. Two plants
+    can share a circuit path (there is nothing in the API that guarantees
+    otherwise) — a single-plant account can never hit this, but nothing
+    guarantees Hoval's account model stays that way (e.g. a future plant
+    split, such as AC being separated from heating). FakeApi's get_circuits
+    ignores plant_id and returns the same circuits_response regardless of
+    which plant asked, which conveniently reproduces exactly this scenario:
+    two plants ("p1", "p2") both reporting a circuit at the same path.
+    """
+
+    def _two_plant_api(self) -> FakeApi:
+        api = FakeApi()
+        api.plants_response = [
+            {"plantExternalId": "p1", "description": "Plant One", "isOnline": True},
+            {"plantExternalId": "p2", "description": "Plant Two", "isOnline": True},
+        ]
+        api.circuits_response = [
+            {
+                "type": "HK",
+                "path": "hk-1",  # same path in both plants
+                "name": "Heating",
+                "selectable": True,
+                "activeProgram": "week1",
+                "operationMode": "REGULAR",
+            }
+        ]
+        api.settings_response = {
+            "circuitName": "Heating",
+            "weatherImpact": {"outsideTemperature": 70, "solarRadiation": -3.5},
+        }
+        return api
+
+    @pytest.mark.asyncio
+    async def test_mode_override_does_not_leak_across_plants(self):
+        coordinator, _api = _make_coordinator(self._two_plant_api())
+        await coordinator._fetch_all_data()
+
+        coordinator.set_mode_override("p1", "hk-1", "standby")
+
+        assert coordinator.get_mode_override("p1", "hk-1") == "standby"
+        assert coordinator.get_mode_override("p2", "hk-1") is None
+
+    @pytest.mark.asyncio
+    async def test_weather_impact_override_does_not_leak_across_plants(self):
+        coordinator, _api = _make_coordinator(self._two_plant_api())
+        await coordinator._fetch_all_data()
+
+        await coordinator.async_set_weather_impact("p1", "hk-1", outside_temperature=99)
+
+        override_p1 = coordinator.get_weather_impact_override("p1", "hk-1")
+        override_p2 = coordinator.get_weather_impact_override("p2", "hk-1")
+        assert override_p1 is not None
+        assert override_p1["outsideTemperature"] == 99
+        assert override_p2 is None
+
+    @pytest.mark.asyncio
+    async def test_program_and_settings_caches_do_not_leak_across_plants(self):
+        coordinator, api = _make_coordinator(self._two_plant_api())
+        await coordinator._fetch_all_data()
+
+        # Both plants' circuits were fetched independently — one call per
+        # plant, not deduplicated by path alone.
+        assert api.calls.count("settings:hk-1") == 2
+        assert api.calls.count("programs:hk-1") == 2
+
+        # A second fetch within the cache TTL must not re-fetch either
+        # plant's circuit (cache hits for both, independently).
+        api.calls.clear()
+        await coordinator._fetch_all_data(fetch_started_at=time.monotonic())
+        assert "settings:hk-1" not in api.calls
+        assert "programs:hk-1" not in api.calls
+
+    @pytest.mark.asyncio
+    async def test_control_and_refresh_requires_plant_id_as_keyword(self):
+        """Signature guard: async_control_and_refresh's parameters are all
+        keyword-only after `coro` specifically so a call site that wasn't
+        updated for this fix fails loudly (TypeError) instead of silently
+        passing plant_id positionally into the wrong parameter.
+        """
+        coordinator, _api = _make_coordinator(self._two_plant_api())
+        await coordinator._fetch_all_data()
+
+        async def _noop():
+            return None
+
+        coro = _noop()
+        try:
+            with pytest.raises(TypeError):
+                # Old call shape: circuit_path positional, no plant_id at all.
+                await coordinator.async_control_and_refresh(coro, "hk-1", "standby")
+        finally:
+            coro.close()
+
+
+class TestBackgroundTaskTracking:
+    """Independent audit finding (2026-09, "more" report, finding #7, and
+    fourth round, HVC-003): every fire-and-forget post-write refresh task —
+    and, since HVC-003, every entity's debounced control-write task too —
+    must be tracked so async_shutdown() can cancel any still-pending one
+    before the API session is closed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_create_tracked_task_returns_the_task(self):
+        """HVC-003: the method must return the created task, not just
+        schedule it — fan.py/number.py need their own local reference (for
+        their existing debounce-cancel-on-new-value logic) in addition to
+        the coordinator's shared tracking.
+        """
+        coordinator, _api = _make_coordinator()
+        coordinator.hass.async_create_task = lambda coro: asyncio.ensure_future(coro)
+
+        async def _quick():
+            return None
+
+        task = coordinator.create_tracked_task(_quick())
+        assert isinstance(task, asyncio.Task)
+        await task
+
+    @pytest.mark.asyncio
+    async def test_an_externally_held_tracked_task_is_still_cancelled_on_shutdown(self):
+        """Simulates fan.py/number.py's actual usage pattern: the caller
+        keeps its own reference (as `self._debounce_task`) while the
+        coordinator also tracks the same task — both must see the same
+        object, and async_shutdown() must still be able to cancel it via
+        its own tracking, independent of whatever the caller does with its
+        copy of the reference.
+        """
+        coordinator, _api = _make_coordinator()
+        coordinator.hass.async_create_task = lambda coro: asyncio.ensure_future(coro)
+
+        was_cancelled = False
+
+        async def _debounced_write():
+            nonlocal was_cancelled
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                was_cancelled = True
+                raise
+
+        # Mirrors `self._debounce_task = self.coordinator.create_tracked_task(...)`
+        entity_local_reference = coordinator.create_tracked_task(_debounced_write())
+        await asyncio.sleep(0)  # let it actually start running
+
+        await coordinator.async_shutdown()
+
+        assert was_cancelled is True
+        assert entity_local_reference.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_create_tracked_task_adds_to_background_tasks(self):
+        coordinator, _api = _make_coordinator()
+        coordinator.hass.async_create_task = lambda coro: asyncio.ensure_future(coro)
+
+        async def _sleeper():
+            await asyncio.sleep(10)
+
+        coordinator.create_tracked_task(_sleeper())
+        assert len(coordinator._background_tasks) == 1
+
+        for task in list(coordinator._background_tasks):
+            task.cancel()
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_completed_task_is_discarded_automatically(self):
+        coordinator, _api = _make_coordinator()
+        coordinator.hass.async_create_task = lambda coro: asyncio.ensure_future(coro)
+
+        async def _quick():
+            return None
+
+        coordinator.create_tracked_task(_quick())
+        await asyncio.sleep(0.01)  # let it complete and the done-callback fire
+        assert len(coordinator._background_tasks) == 0
+
+    @pytest.mark.asyncio
+    async def test_async_shutdown_cancels_pending_tasks(self):
+        coordinator, _api = _make_coordinator()
+        coordinator.hass.async_create_task = lambda coro: asyncio.ensure_future(coro)
+
+        was_cancelled = False
+
+        async def _sleeper():
+            nonlocal was_cancelled
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                was_cancelled = True
+                raise
+
+        coordinator.create_tracked_task(_sleeper())
+        await asyncio.sleep(0)  # let the task actually start running first
+        await coordinator.async_shutdown()
+
+        assert was_cancelled is True
+        assert len(coordinator._background_tasks) == 0
+
+    @pytest.mark.asyncio
+    async def test_async_shutdown_with_no_pending_tasks_is_a_noop(self):
+        coordinator, _api = _make_coordinator()
+        await coordinator.async_shutdown()  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_write_schedules_a_tracked_task_not_a_bare_one(self):
+        """End-to-end: async_control_and_refresh's own scheduled refresh
+        task must go through create_tracked_task(), not a bare
+        hass.async_create_task() call that bypasses tracking entirely.
+        """
+        coordinator, _api = _make_coordinator()
+        await coordinator._async_update_data()
+        coordinator.hass.async_create_task = lambda coro: asyncio.ensure_future(coro)
+
+        async def _noop_coro():
+            return None
+
+        await coordinator.async_control_and_refresh(
+            _noop_coro(), plant_id="p1", circuit_path="hv-1", mode_override="standby"
+        )
+        assert len(coordinator._background_tasks) == 1
+
+        for task in list(coordinator._background_tasks):
+            task.cancel()
+        await asyncio.sleep(0)
+
+
+class TestResolveResumeProgram:
+    """Independent audit finding (2026-09, HVC-ICS-008 + "more" report
+    finding #8): resolve_resume_program() now does a fresh, targeted GET
+    before resolving, rather than trusting a potentially-stale coordinator
+    snapshot.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fresh_week2_is_preferred_over_stale_cached_week1(self):
+        api = FakeApi()
+        api.circuits_response = [
+            {"type": "HK", "path": "hk-1", "name": "Heating", "activeProgram": "week2"}
+        ]
+        stale_cached_circuit = HovalCircuitData(
+            circuit_type="HK", path="hk-1", name="Heating", active_program="week1"
+        )
+
+        result = await resolve_resume_program(api, "p1", "hk-1", stale_cached_circuit)
+
+        assert result == "week2"
+
+    @pytest.mark.asyncio
+    async def test_fresh_week1_confirmed_even_if_cache_said_week2(self):
+        api = FakeApi()
+        api.circuits_response = [
+            {"type": "HK", "path": "hk-1", "name": "Heating", "activeProgram": "week1"}
+        ]
+        stale_cached_circuit = HovalCircuitData(
+            circuit_type="HK", path="hk-1", name="Heating", active_program="week2"
+        )
+
+        result = await resolve_resume_program(api, "p1", "hk-1", stale_cached_circuit)
+
+        assert result == "week1"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_cached_value_when_fresh_fetch_fails(self):
+        api = FakeApi()
+        api.circuits_response = HovalApiError("cloud down")
+        cached_circuit = HovalCircuitData(
+            circuit_type="HK", path="hk-1", name="Heating", active_program="week2"
+        )
+
+        result = await resolve_resume_program(api, "p1", "hk-1", cached_circuit)
+
+        assert result == "week2"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_week1_default_when_fetch_fails_and_no_cache(self):
+        api = FakeApi()
+        api.circuits_response = HovalApiError("cloud down")
+
+        result = await resolve_resume_program(api, "p1", "hk-1", None)
+
+        assert result == "week1"
+
+    @pytest.mark.asyncio
+    async def test_circuit_not_found_in_fresh_response_falls_back_to_cache(self):
+        api = FakeApi()
+        api.circuits_response = [
+            {"type": "HK", "path": "some-other-circuit", "name": "Other", "activeProgram": "week1"}
+        ]
+        cached_circuit = HovalCircuitData(
+            circuit_type="HK", path="hk-1", name="Heating", active_program="week2"
+        )
+
+        result = await resolve_resume_program(api, "p1", "hk-1", cached_circuit)
+
+        assert result == "week2"
+
+    @pytest.mark.asyncio
+    async def test_legacy_v1_program_value_is_normalised(self):
+        """A fresh response using a v1-style activeProgram value must still
+        be mapped through _V1_PROGRAM_MAP, same as the main fetch path.
+        """
+        api = FakeApi()
+        api.circuits_response = [
+            {"type": "HK", "path": "hk-1", "name": "Heating", "activeProgram": "tteControlled"}
+        ]
+
+        result = await resolve_resume_program(api, "p1", "hk-1", None)
+
+        assert result == "week1"  # tteControlled maps to week1, never week2
+
+
 class TestFetchWeatherImpact:
     def _hk_api(self) -> FakeApi:
         api = FakeApi()
@@ -480,8 +898,8 @@ class TestFetchWeatherImpact:
         coordinator, api = _make_coordinator(self._hk_api())
         await coordinator._fetch_all_data()
         # Expire the settings cache so the next poll re-fetches — and fails.
-        cached = coordinator._settings_cache["hk-1"]
-        coordinator._settings_cache["hk-1"] = (cached[0], 0.0)
+        cached = coordinator._settings_cache[("p1", "hk-1")]
+        coordinator._settings_cache[("p1", "hk-1")] = (cached[0], 0.0)
         api.settings_response = HovalApiError("down")
         data = await coordinator._fetch_all_data()
         hk = data.plants["p1"].circuits["hk-1"]
@@ -542,7 +960,7 @@ class TestFetchWeatherImpact:
         # cached value itself to simulate a cache populated before this fix
         # against an old-shape response (or simply to match the new no-key
         # server response for this sibling test).
-        coordinator._settings_cache["hk-1"] = ({"circuitName": "Heating"}, 0.0)
+        coordinator._settings_cache[("p1", "hk-1")] = ({"circuitName": "Heating"}, 0.0)
         api.settings_response = HovalApiError("down")
 
         data = await coordinator._fetch_all_data()
@@ -597,3 +1015,414 @@ class TestSupportsProgramsGate:
         await coordinator._fetch_all_data()
         data = await coordinator._fetch_all_data()  # must not raise
         assert "bl-1" in data.plants["p1"].circuits
+
+
+# ---------------------------------------------------------------------------
+# v1.0.0 — _async_update_data dispatch: full resync vs. minimal health check
+# ---------------------------------------------------------------------------
+
+
+class TestEmptyPlantsGuard:
+    """Independent audit finding (2026-09, "more" report, finding #3): an
+    anomalous-but-well-formed empty get_plants() response must not
+    silently wipe every known plant. Requires
+    HovalDataCoordinator._EMPTY_PLANTS_CONFIRMATION_THRESHOLD consecutive
+    empty responses before actually accepting the wipe.
+    """
+
+    @pytest.mark.asyncio
+    async def test_single_empty_response_does_not_wipe_topology(self):
+        coordinator, api = _make_coordinator()
+        first = await coordinator._async_update_data()
+        coordinator.data = first
+        assert set(first.plants["p1"].circuits) == {"hv-1", "bl-1"}
+
+        api.plants_response = []
+        second = await coordinator._async_update_data()
+
+        assert set(second.plants["p1"].circuits) == {"hv-1", "bl-1"}
+
+    @pytest.mark.asyncio
+    async def test_confirmed_empty_response_eventually_wipes_topology(self):
+        coordinator, api = _make_coordinator()
+        first = await coordinator._async_update_data()
+        coordinator.data = first
+
+        api.plants_response = []
+        for _ in range(coordinator._EMPTY_PLANTS_CONFIRMATION_THRESHOLD - 1):
+            result = await coordinator._async_update_data()
+            coordinator.data = result
+            assert result.plants  # not yet wiped
+
+        result = await coordinator._async_update_data()
+        assert result.plants == {}
+
+    @pytest.mark.asyncio
+    async def test_non_empty_response_resets_the_counter(self):
+        coordinator, api = _make_coordinator()
+        first = await coordinator._async_update_data()
+        coordinator.data = first
+
+        api.plants_response = []
+        result = await coordinator._async_update_data()  # one strike
+        coordinator.data = result
+        assert coordinator._consecutive_empty_plants == 1
+
+        api.plants_response = [
+            {"plantExternalId": "p1", "description": "Test Plant", "isOnline": True}
+        ]
+        result = await coordinator._async_update_data()  # back to normal
+        coordinator.data = result
+        assert coordinator._consecutive_empty_plants == 0
+
+    @pytest.mark.asyncio
+    async def test_first_ever_fetch_with_zero_plants_is_trusted_immediately(self):
+        """A genuinely new/empty account has nothing to lose by accepting
+        an empty response right away — the guard only distrusts an empty
+        response when plants were PREVIOUSLY known.
+        """
+        coordinator, api = _make_coordinator()
+        api.plants_response = []
+        result = await coordinator._async_update_data()
+        assert result.plants == {}
+        assert coordinator._did_initial_discovery is True
+
+    @pytest.mark.asyncio
+    async def test_fetch_all_data_also_applies_the_guard(self):
+        """The same guard must protect the write-triggered full-fetch path,
+        not just the scheduled health check.
+        """
+        coordinator, api = _make_coordinator()
+        first = await coordinator._fetch_all_data()
+        coordinator.data = first
+
+        api.plants_response = []
+        result = await coordinator._fetch_all_data()
+        assert set(result.plants["p1"].circuits) == {"hv-1", "bl-1"}
+
+
+class TestTopologyChangeDetection:
+    """Independent audit finding (2026-09, HVC-ICS-001): a plant that was
+    offline during initial discovery, or a brand-new plant that appears
+    after startup, must not remain entity-less indefinitely. _health_check()
+    now detects either condition and upgrades itself to a real discovery
+    fetch for that one cycle, instead of depending on some unrelated write
+    to incidentally trigger one (which might never happen).
+    """
+
+    @pytest.mark.asyncio
+    async def test_plant_offline_at_startup_then_online_triggers_discovery(self):
+        coordinator, api = _make_coordinator()
+        api.plants_response = [
+            {"plantExternalId": "p1", "description": "Test Plant", "isOnline": False}
+        ]
+        first = await coordinator._async_update_data()  # startup
+        coordinator.data = first
+        assert first.plants["p1"].circuits == {}
+        assert "circuits:p1" not in api.calls  # offline plants skip circuit calls
+
+        # Plant comes online on the next scheduled health check.
+        api.plants_response = [
+            {"plantExternalId": "p1", "description": "Test Plant", "isOnline": True}
+        ]
+        api.calls.clear()
+        second = await coordinator._async_update_data()
+
+        assert "circuits:p1" in api.calls  # upgraded to a real discovery fetch
+        assert set(second.plants["p1"].circuits) == {"hv-1", "bl-1"}
+
+    @pytest.mark.asyncio
+    async def test_new_plant_appearing_after_startup_triggers_discovery(self):
+        coordinator, api = _make_coordinator()
+        first = await coordinator._async_update_data()  # startup — only p1 exists
+        coordinator.data = first
+        assert set(first.plants) == {"p1"}
+
+        # A second plant appears — e.g. Hoval splitting the account.
+        api.plants_response = [
+            {"plantExternalId": "p1", "description": "Test Plant", "isOnline": True},
+            {"plantExternalId": "p2", "description": "New Plant", "isOnline": True},
+        ]
+        api.calls.clear()
+        second = await coordinator._async_update_data()
+
+        assert set(second.plants) == {"p1", "p2"}
+        assert "circuits:p2" in api.calls
+        assert set(second.plants["p2"].circuits) == {"hv-1", "bl-1"}
+        # p1 was untouched by the topology change but still gets a real
+        # discovery fetch this cycle too (simplest correct behavior — the
+        # upgrade re-runs full discovery for everything, not just the
+        # plant that changed).
+        assert "circuits:p1" in api.calls
+
+    @pytest.mark.asyncio
+    async def test_plant_going_offline_does_not_trigger_discovery(self):
+        """The asymmetric case: going online is a topology change worth a
+        real fetch; going offline is not — there's nothing new to discover,
+        and the existing light health check already handles it correctly
+        (circuits carried forward, is_online updated).
+        """
+        coordinator, api = _make_coordinator()
+        first = await coordinator._async_update_data()  # startup — online
+        coordinator.data = first
+        assert set(first.plants["p1"].circuits) == {"hv-1", "bl-1"}
+
+        api.plants_response = [
+            {"plantExternalId": "p1", "description": "Test Plant", "isOnline": False}
+        ]
+        api.calls.clear()
+        second = await coordinator._async_update_data()
+
+        assert api.calls == ["plants"]  # still just a light check
+        assert second.plants["p1"].is_online is False
+        # Circuits carried forward unchanged, not wiped just because the
+        # plant went offline.
+        assert set(second.plants["p1"].circuits) == {"hv-1", "bl-1"}
+
+    @pytest.mark.asyncio
+    async def test_no_topology_change_stays_a_light_check(self):
+        """Sibling/regression case for the dispatch test above: an
+        already-known, already-online plant with no changes must not
+        trigger the upgrade — otherwise every single scheduled tick would
+        silently become a full fetch again, defeating the whole point.
+        """
+        coordinator, api = _make_coordinator()
+        first = await coordinator._async_update_data()  # startup
+        coordinator.data = first
+
+        api.calls.clear()
+        await coordinator._async_update_data()
+
+        assert api.calls == ["plants"]
+
+
+class TestHealthCheckDispatch:
+    """The core new mechanism this release exists for.
+
+    _async_update_data() must do a full (telemetry-trimmed) resync exactly
+    once at startup and again whenever a write requests it
+    (_pending_full_refresh), and the minimal _health_check() (one auth call,
+    one get_plants(), nothing circuit-specific) on every other scheduled
+    tick. See coordinator.py's _async_update_data docstring and
+    docs/audit-v1.0.0.md.
+    """
+
+    @pytest.mark.asyncio
+    async def test_first_call_does_full_discovery(self):
+        coordinator, api = _make_coordinator()
+        assert coordinator._did_initial_discovery is False
+
+        data = await coordinator._async_update_data()
+
+        assert coordinator._did_initial_discovery is True
+        assert "circuits:p1" in api.calls
+        assert set(data.plants["p1"].circuits) == {"hv-1", "bl-1"}
+
+    @pytest.mark.asyncio
+    async def test_second_scheduled_call_is_a_light_health_check_only(self):
+        coordinator, api = _make_coordinator()
+        first = await coordinator._async_update_data()  # startup: full discovery
+        coordinator.data = first  # normally done by DataUpdateCoordinator.async_refresh()
+        api.calls.clear()
+
+        await coordinator._async_update_data()  # scheduled tick: light check
+
+        assert api.calls == ["plants"]  # nothing else — no circuits, no programs
+
+    @pytest.mark.asyncio
+    async def test_health_check_preserves_existing_circuits_unchanged(self):
+        coordinator, _api = _make_coordinator()
+        first = await coordinator._async_update_data()
+        coordinator.data = first  # normally done by DataUpdateCoordinator.async_refresh()
+        original_circuits = first.plants["p1"].circuits
+
+        second = await coordinator._async_update_data()
+
+        # Same circuit objects carried forward, not refetched/rebuilt.
+        assert second.plants["p1"].circuits is original_circuits
+
+    @pytest.mark.asyncio
+    async def test_health_check_updates_is_online(self):
+        coordinator, api = _make_coordinator()
+        first = await coordinator._async_update_data()
+        coordinator.data = first
+        assert coordinator.data.plants["p1"].is_online is True
+
+        api.plants_response = [
+            {"plantExternalId": "p1", "description": "Test Plant", "isOnline": False}
+        ]
+        data = await coordinator._async_update_data()
+
+        assert data.plants["p1"].is_online is False
+        # Circuits are still carried forward even though the plant went offline —
+        # unlike a full resync, the light health check never invalidates them.
+        assert set(data.plants["p1"].circuits) == {"hv-1", "bl-1"}
+
+    @pytest.mark.asyncio
+    async def test_health_check_recomputes_has_error_from_existing_circuits(self):
+        coordinator, api = _make_coordinator()
+        api.circuits_response = [
+            {"type": "HV", "path": "hv-1", "name": "V", "selectable": True, "hasError": True}
+        ]
+        first = await coordinator._async_update_data()
+        coordinator.data = first
+        assert first.plants["p1"].has_error is True
+
+        second = await coordinator._async_update_data()  # light health check
+        assert second.plants["p1"].has_error is True  # recomputed, not lost
+
+    @pytest.mark.asyncio
+    async def test_pending_full_refresh_forces_a_real_resync(self):
+        coordinator, api = _make_coordinator()
+        await coordinator._async_update_data()  # startup
+        api.calls.clear()
+
+        coordinator._pending_full_refresh_since = time.monotonic()
+        await coordinator._async_update_data()
+
+        assert "circuits:p1" in api.calls  # full resync happened, not a light check
+        assert coordinator._pending_full_refresh_since is None  # cleared after success
+
+    @pytest.mark.asyncio
+    async def test_pending_full_refresh_stays_set_if_the_resync_fails(self):
+        coordinator, api = _make_coordinator()
+        await coordinator._async_update_data()  # startup
+
+        coordinator._pending_full_refresh_since = time.monotonic()
+        api.circuits_response = HovalApiError("down")
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+
+        # Must retry the full resync next time, not silently downgrade to a
+        # light check just because this attempt failed.
+        assert coordinator._pending_full_refresh_since is not None
+
+    @pytest.mark.asyncio
+    async def test_second_write_during_first_refresh_is_not_lost(self):
+        """HVC-002 regression: a second write's refresh request, made while
+        an earlier write's own refresh is still fetching, must survive that
+        earlier refresh's completion instead of being silently cleared.
+        """
+        coordinator, api = _make_coordinator()
+        await coordinator._async_update_data()  # startup
+
+        # Simulate write A's _do_refresh() having set the flag just before
+        # its _async_update_data() call started fetching...
+        write_a_requested_at = time.monotonic()
+        coordinator._pending_full_refresh_since = write_a_requested_at
+
+        # ...and write B's _do_refresh() setting a NEWER timestamp WHILE
+        # write A's fetch is conceptually still in flight. Since FakeApi's
+        # calls are synchronous (no real concurrency in this test), we
+        # simulate "during" by advancing the flag between capturing
+        # do_full_refresh's snapshot and the fetch completing — which is
+        # exactly what _async_update_data does internally via
+        # refresh_requested_at, so bumping the field here before awaiting
+        # is a faithful reproduction of the race.
+        original_get_circuits = api.get_circuits
+
+        async def _get_circuits_and_race(plant_id):
+            # Write B's request lands here, mid-fetch.
+            coordinator._pending_full_refresh_since = time.monotonic()
+            return await original_get_circuits(plant_id)
+
+        api.get_circuits = _get_circuits_and_race
+
+        await coordinator._async_update_data()  # serves write A's request
+
+        # Write B's later timestamp must survive — NOT cleared by write A's
+        # refresh completing, since write A's fetch could not possibly have
+        # captured write B's effect.
+        assert coordinator._pending_full_refresh_since is not None
+        assert coordinator._pending_full_refresh_since > write_a_requested_at
+
+        # And the next tick must therefore still do a full resync, not
+        # silently downgrade to a health-check-only cycle.
+        api.calls.clear()
+        await coordinator._async_update_data()
+        assert "circuits:p1" in api.calls
+
+    @pytest.mark.asyncio
+    async def test_mode_override_set_during_refresh_is_not_wiped(self):
+        """HVC-002 regression: an optimistic mode override set for a
+        DIFFERENT circuit while a refresh is already fetching must not be
+        wiped by that refresh's unconditional clear — the refresh's own
+        snapshot was taken before the override's write happened, so
+        clearing it would show stale data with no optimistic value to
+        cover the gap until the next successful refresh.
+        """
+        coordinator, api = _make_coordinator()
+        await coordinator._async_update_data()  # startup — hv-1, bl-1 exist
+
+        original_get_circuits = api.get_circuits
+
+        async def _get_circuits_and_race(plant_id):
+            # A write "lands" for bl-1 while this refresh is mid-fetch —
+            # after the refresh's fetch_started_at was captured, before its
+            # data snapshot (built from this very call's return value) is
+            # finalised.
+            coordinator.set_mode_override("p1", "bl-1", "standby")
+            return await original_get_circuits(plant_id)
+
+        api.get_circuits = _get_circuits_and_race
+        coordinator._pending_full_refresh_since = time.monotonic()
+
+        await coordinator._async_update_data()
+
+        # The override for bl-1 must still be present — a plain
+        # self._mode_override.clear() would have wiped it.
+        assert coordinator.get_mode_override("p1", "bl-1") == "standby"
+
+    @pytest.mark.asyncio
+    async def test_mode_override_set_before_refresh_is_still_cleared(self):
+        """Sibling case: an override that was already stale BEFORE this
+        refresh started fetching must still be cleared as before — only
+        overrides racing with an in-flight fetch are protected.
+        """
+        coordinator, _api = _make_coordinator()
+        await coordinator._async_update_data()  # startup
+
+        coordinator.set_mode_override("p1", "hv-1", "standby")
+        # Force the next call to be a real full refresh, not a light health
+        # check — only a full refresh (_fetch_all_data) ever touches
+        # _mode_override at all.
+        coordinator._pending_full_refresh_since = time.monotonic()
+        await coordinator._async_update_data()
+
+        assert coordinator.get_mode_override("p1", "hv-1") is None
+
+    @pytest.mark.asyncio
+    async def test_failed_startup_discovery_is_retried_next_call(self):
+        coordinator, api = _make_coordinator()
+        api.circuits_response = HovalApiError("down")
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+        assert coordinator._did_initial_discovery is False
+
+        api.circuits_response = [{"type": "HV", "path": "hv-1", "name": "V", "selectable": True}]
+        data = await coordinator._async_update_data()  # must attempt full discovery again
+        assert coordinator._did_initial_discovery is True
+        assert "hv-1" in data.plants["p1"].circuits
+
+    @pytest.mark.asyncio
+    async def test_health_check_success_records_contact(self):
+        coordinator, _api = _make_coordinator()
+        await coordinator._async_update_data()  # startup
+        assert coordinator.connection_health.last_successful_contact_at is not None
+
+        before = coordinator.connection_health.last_successful_contact_at
+        await coordinator._async_update_data()  # health check
+        after = coordinator.connection_health.last_successful_contact_at
+
+        assert after >= before
+
+    @pytest.mark.asyncio
+    async def test_health_check_does_not_call_get_programs_or_get_circuit_settings(self):
+        """The whole point: the recurring scheduled call must be minimal."""
+        coordinator, api = _make_coordinator()
+        await coordinator._async_update_data()  # startup — calls programs/settings
+        api.calls.clear()
+
+        await coordinator._async_update_data()  # scheduled tick
+
+        assert not any(c.startswith(("programs:", "settings:")) for c in api.calls)

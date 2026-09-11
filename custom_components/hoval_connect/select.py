@@ -38,6 +38,37 @@ DEFAULT_NAMES: dict[str, str] = {
 }
 
 
+def resolve_program_display_names(program_names: dict[str, str]) -> dict[str, str]:
+    """Map every API program key to a UNIQUE display name.
+
+    Independent audit finding (2026-09, "more" report, finding #10): a
+    naive per-key lookup can't detect that two DIFFERENT keys produced the
+    SAME display name — if a user names both week1 and week2 identically
+    in the Hoval app (e.g. both "Summer"), the select's option list would
+    contain a literal duplicate, and the reverse lookup (display name ->
+    API key) would always resolve to whichever key happened to be checked
+    first, regardless of which duplicate entry the user actually clicked.
+    Computing every key's name at once (rather than one key in isolation)
+    is what makes the collision detectable at all.
+
+    Any name that collides across more than one key gets disambiguated by
+    appending the API key itself (e.g. "Summer (week1)" / "Summer
+    (week2)"); a name that's already unique across all programs is
+    returned completely unchanged, so the common case (no duplicates)
+    looks exactly as before.
+
+    A standalone pure function (no entity/coordinator dependency) so this
+    algorithm is directly unit-testable — see tests/test_select.py.
+    """
+    raw_names = {key: program_names.get(key, DEFAULT_NAMES.get(key, key)) for key in API_PROGRAMS}
+    counts: dict[str, int] = {}
+    for name in raw_names.values():
+        counts[name] = counts.get(name, 0) + 1
+    return {
+        key: (f"{name} ({key})" if counts[name] > 1 else name) for key, name in raw_names.items()
+    }
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: HovalConnectConfigEntry,
@@ -105,37 +136,21 @@ class HovalProgramSelect(CoordinatorEntity[HovalDataCoordinator], SelectEntity):
             return None
         return plant.circuits.get(self._circuit_path)
 
-    def _display_name(self, api_key: str) -> str:
-        """Get display name for an API program key."""
-        circuit = self._circuit
-        if circuit and api_key in circuit.program_names:
-            return circuit.program_names[api_key]
-        return DEFAULT_NAMES.get(api_key, api_key)
+    def _all_display_names(self) -> dict[str, str]:
+        """Map every API program key to a UNIQUE display name for this circuit.
 
-    def _api_key_from_display(self, display: str) -> str:
-        """Reverse-lookup: display name → API key.
-
-        User-defined names take precedence.  When falling back to DEFAULT_NAMES,
-        only consider keys that have no user-defined name — this prevents a
-        collision where the user names their week2 program "Week 1" and the
-        lookup incorrectly returns "week1".
+        See resolve_program_display_names() for the disambiguation logic
+        itself (independent audit finding, 2026-09, "more" report,
+        finding #10) — this just supplies this entity's current
+        program_names.
         """
         circuit = self._circuit
-        if circuit:
-            for key, name in circuit.program_names.items():
-                if name == display:
-                    return key
-        # Only use DEFAULT_NAMES for keys that the user hasn't renamed
-        user_named_keys = set(circuit.program_names.keys()) if circuit else set()
-        for key, name in DEFAULT_NAMES.items():
-            if key not in user_named_keys and name == display:
-                return key
-        return display
+        return resolve_program_display_names(circuit.program_names if circuit else {})
 
     @property
     def options(self) -> list[str]:
         """Return list of program display names."""
-        return [self._display_name(k) for k in API_PROGRAMS]
+        return list(self._all_display_names().values())
 
     @property
     def available(self) -> bool:
@@ -144,15 +159,32 @@ class HovalProgramSelect(CoordinatorEntity[HovalDataCoordinator], SelectEntity):
 
     @property
     def current_option(self) -> str | None:
-        """Return the currently active program's display name."""
+        """Return the currently active program's display name.
+
+        Independent audit finding (2026-09, fourth round, HVC-015): the
+        API permits `activeProgram` values ("manual", "externalConstant")
+        that were never included in `options` (API_PROGRAMS only lists the
+        programs this integration lets a user actively select). Returning
+        the raw string for one of those violated HA's own SelectEntity
+        contract — `current_option` is supposed to always be a member of
+        `options`, or None — which could confuse automations checking
+        membership, or render oddly in the frontend. Returns None instead,
+        the same choice already made for water_heater.py's `high_demand`
+        (a real, observable state with no real "select this to activate
+        it" action, not something to force into the selectable list).
+        """
         circuit = self._circuit
         if circuit is None or circuit.active_program is None:
             return None
-        return self._display_name(circuit.active_program)
+        display_names = self._all_display_names()
+        if circuit.active_program not in display_names:
+            return None
+        return display_names[circuit.active_program]
 
     async def async_select_option(self, option: str) -> None:
         """Set the active program."""
-        api_program = self._api_key_from_display(option)
+        display_names = self._all_display_names()
+        api_program = next((k for k, name in display_names.items() if name == option), option)
         if api_program not in VALID_API_PROGRAMS:
             raise HomeAssistantError(
                 f"Unknown program '{option}' (resolved to '{api_program}'); "
@@ -172,6 +204,7 @@ class HovalProgramSelect(CoordinatorEntity[HovalDataCoordinator], SelectEntity):
                     self._circuit_path,
                     api_program,
                 ),
+                plant_id=self._plant_id,
                 circuit_path=self._circuit_path,
                 mode_override=mode,
             )

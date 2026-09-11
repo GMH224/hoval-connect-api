@@ -17,9 +17,10 @@ from homeassistant.helpers.storage import Store
 from .api import HovalConnectApi
 from .const import (
     CIRCUIT_TYPE_NAMES,
-    CONF_SCAN_INTERVAL,
-    DEFAULT_SCAN_INTERVAL,
+    CONF_HEALTH_CHECK_INTERVAL,
+    DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS,
     DOMAIN,
+    HEALTH_CHECK_INTERVAL_OPTIONS,
     HEALTH_STORAGE_KEY,
     HEALTH_STORAGE_VERSION,
 )
@@ -43,9 +44,19 @@ PLATFORMS = [
     Platform.FAN,
     Platform.NUMBER,
     Platform.SELECT,
-    Platform.SENSOR,
     Platform.WATER_HEATER,
 ]
+# v1.0.0 removed Platform.SENSOR entirely: every sensor entity depended on
+# telemetry (live-values, events, weather) this integration no longer polls
+# — a separate CAN-bus HACS integration is now the source for that data. See
+# docs/audit-v1.0.0.md and CHANGELOG.md. This is a breaking change: existing
+# sensor.* entities from this integration will stop updating and eventually
+# show as "not provided by the integration" in Settings > Devices & Services
+# > Entities; removing them from the registry is a manual step for the user
+# since Home Assistant does not do this automatically. The five entities the
+# user confirmed depending on for automations (2026-09-10) are unaffected —
+# select.*_program, number.*_weather_based_control_*, binary_sensor.*_error,
+# and water_heater.* were never sensor.py entities.
 
 type HovalConnectConfigEntry = ConfigEntry[HovalRuntimeData]
 
@@ -126,20 +137,62 @@ def circuit_device_info(
     )
 
 
-def _get_scan_interval(entry: HovalConnectConfigEntry) -> timedelta:
-    """Get the scan interval from options or use default.
+def _get_health_check_interval(entry: HovalConnectConfigEntry) -> timedelta:
+    """Get the health-check interval from options, or use the default.
 
-    The stored value is coerced to int defensively: earlier builds could persist
-    the interval as a string (the frontend submits dropdown values as strings),
-    which would otherwise raise TypeError in timedelta(). A non-numeric value
-    falls back to the default so the integration always loads.
+    Reinstated at the user's explicit request (this same v1.0.0 release,
+    before deployment — see CHANGELOG.md): v1.0.0 initially removed the
+    old CONF_SCAN_INTERVAL entirely, since there was no longer a
+    meaningful "poll rate" to tune for circuit/program/settings data. This
+    is a narrower, differently-scoped setting — it only affects the
+    cadence of the one lightweight reachability check this integration
+    still runs on a schedule (see HEALTH_CHECK_INTERVAL's comment in
+    const.py); it does not bring back telemetry polling of any kind.
+
+    The stored value is coerced to int defensively, mirroring the old
+    _get_scan_interval()'s reasoning: earlier builds — or an options form
+    resubmission — could persist the interval as a string (dropdown values
+    often arrive as strings from the frontend), which would otherwise
+    raise TypeError in timedelta(). A non-numeric value falls back to the
+    default so the integration always loads.
+
+    Independent audit finding (2026-09, fourth round, HVC-006): the
+    coerced integer was never checked against HEALTH_CHECK_INTERVAL_OPTIONS
+    — the options FORM only ever offers those choices, but nothing stopped
+    an out-of-band value (a hand-edited config-entry options file, a
+    migration bug, or simply a persisted value from a build that offered
+    different choices) from reaching this function. `0` or a negative
+    value would hand DataUpdateCoordinator a non-positive update_interval
+    (undefined/pathological scheduling); an enormous value would
+    effectively disable health checks entirely; and a truly enormous one
+    can make `timedelta()` itself raise `OverflowError`, which the
+    original `except (TypeError, ValueError)` never caught. Any persisted
+    value outside the supported options — not just non-numeric ones — now
+    falls back to the default.
     """
-    default_s = int(DEFAULT_SCAN_INTERVAL.total_seconds())
+    default_s = DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
     try:
-        seconds = int(entry.options.get(CONF_SCAN_INTERVAL, default_s))
+        seconds = int(entry.options.get(CONF_HEALTH_CHECK_INTERVAL, default_s))
     except (TypeError, ValueError):
         seconds = default_s
-    return timedelta(seconds=seconds)
+    if seconds not in HEALTH_CHECK_INTERVAL_OPTIONS:
+        _LOGGER.warning(
+            "Persisted health_check_interval=%r is not one of the supported "
+            "options %s; using the default of %d seconds instead.",
+            seconds,
+            HEALTH_CHECK_INTERVAL_OPTIONS,
+            default_s,
+        )
+        seconds = default_s
+    try:
+        return timedelta(seconds=seconds)
+    except OverflowError:
+        # Unreachable in practice now that `seconds` is constrained to
+        # HEALTH_CHECK_INTERVAL_OPTIONS above, but kept as defense in depth
+        # in case that constant is ever changed to include a pathological
+        # value — timedelta() itself can raise OverflowError for an
+        # absurdly large integer, which is not a TypeError or ValueError.
+        return timedelta(seconds=DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS)
 
 
 def _check_ha_version() -> None:
@@ -169,53 +222,75 @@ async def async_setup_entry(hass: HomeAssistant, entry: HovalConnectConfigEntry)
     # aiohttp session.
     api = HovalConnectApi(hass, entry.data["email"], entry.data["password"])
 
-    health_store = Store(hass, HEALTH_STORAGE_VERSION, HEALTH_STORAGE_KEY)
-
-    coordinator = HovalDataCoordinator(hass, entry, api, health_store)
-    coordinator.update_interval = _get_scan_interval(entry)
-
-    # Restore persisted health counters (total_polls, total_failures, EMA, etc.)
-    # BEFORE the first refresh so sensors show historical context immediately.
-    #
-    # v0.24.1: deliberately tolerant of ANY load failure, not just a missing
-    # file. Verified directly against HA's Store source
-    # (homeassistant/helpers/storage.py): without an overridden
-    # _async_migrate_func (which this integration has never provided), a
-    # stored-version mismatch raises rather than silently starting fresh —
-    # UnsupportedStorageVersionError if the file is NEWER than this code
-    # expects (e.g. after installing, then rolling back from, a later
-    # release that bumped HEALTH_STORAGE_VERSION), or a re-raised
-    # NotImplementedError if OLDER. Uncaught, either would make the whole
-    # integration fail to load, not just lose historical counters. This
-    # patch exists specifically so downgrading from a later release (e.g.
-    # v1.0.0, which bumps HEALTH_STORAGE_VERSION 1 -> 2) back to this one is
-    # safe without any manual file deletion.
+    # Everything from here until entry.runtime_data is actually assigned
+    # (below) is wrapped in try/except specifically to close `api`'s
+    # requests.Session on any failure (independent audit finding, 2026-09).
+    # Before this fix: if async_config_entry_first_refresh() raised (auth
+    # failure, timeout, circuit-list error, anything), entry.runtime_data
+    # was never set, so async_unload_entry() — the only other place that
+    # calls api.aclose() — never ran for this attempt. The session (and its
+    # connection pool) leaked until Python's garbage collector eventually
+    # caught it, which is non-deterministic and, given Home Assistant retries
+    # failed config entry setups automatically, could accumulate multiple
+    # abandoned sessions during a persistent failure (e.g. wrong credentials)
+    # well before GC catches up.
     try:
-        stored_health = await health_store.async_load()
-    except Exception:  # noqa: BLE001 — see comment above: any failure here must degrade to a fresh start, never block setup
-        _LOGGER.warning(
-            "Could not load persisted health counters (likely a version "
-            "mismatch from an upgrade or rollback) — starting fresh.",
-            exc_info=True,
-        )
-        stored_health = None
-    if stored_health and isinstance(stored_health, dict):
-        coordinator.connection_health.restore_from_store(stored_health)
-        _LOGGER.debug(
-            "Restored health counters: total_polls=%d total_failures=%d ema=%.0f ms",
-            coordinator.connection_health.total_polls,
-            coordinator.connection_health.total_failures,
-            coordinator.connection_health.ema_latency_ms or 0,
-        )
+        health_store = Store(hass, HEALTH_STORAGE_VERSION, HEALTH_STORAGE_KEY)
 
-    await coordinator.async_config_entry_first_refresh()
+        coordinator = HovalDataCoordinator(hass, entry, api, health_store)
+        # Reinstated at the user's explicit request (this same v1.0.0
+        # release) — see _get_health_check_interval()'s docstring for why
+        # this is a narrower, differently-scoped setting than the old,
+        # fully-removed CONF_SCAN_INTERVAL, not a reversal of the decision
+        # to stop polling telemetry.
+        coordinator.update_interval = _get_health_check_interval(entry)
 
-    plant_devices = HovalPlantDevices(hass, entry)
-    entry.runtime_data = HovalRuntimeData(
-        coordinator=coordinator,
-        api=api,
-        plant_devices=plant_devices,
-    )
+        # Restore persisted health counters (total_polls, total_failures, EMA, etc.)
+        # BEFORE the first refresh so sensors show historical context immediately.
+        #
+        # Deliberately tolerant of ANY load failure, not just a missing file.
+        # HEALTH_STORAGE_VERSION was bumped 1 -> 2 in v1.0.0 (schema changed),
+        # and HA's Store helper does NOT silently discard a version mismatch on
+        # its own the way an earlier comment here assumed — verified directly
+        # against Store's source (homeassistant/helpers/storage.py): without an
+        # overridden _async_migrate_func (which this integration has never
+        # provided), a version mismatch raises UnsupportedStorageVersionError
+        # (reading a NEWER file than requested, e.g. after downgrading from a
+        # later release) or a re-raised NotImplementedError (reading an OLDER
+        # file, e.g. after upgrading into a version bump like this one) instead
+        # of returning None. Without this try/except, EITHER direction —
+        # upgrading past a version bump, or rolling back afterwards — would
+        # make async_setup_entry raise here and the whole integration fail to
+        # load, not just lose historical counters. See docs/audit-v1.0.0.md.
+        try:
+            stored_health = await health_store.async_load()
+        except Exception:  # noqa: BLE001 — see comment above: any failure here must degrade to a fresh start, never block setup
+            _LOGGER.warning(
+                "Could not load persisted health counters (likely a version "
+                "mismatch from an upgrade or rollback) — starting fresh.",
+                exc_info=True,
+            )
+            stored_health = None
+        if stored_health and isinstance(stored_health, dict):
+            coordinator.connection_health.restore_from_store(stored_health)
+            _LOGGER.debug(
+                "Restored health counters: total_polls=%d total_failures=%d ema=%.0f ms",
+                coordinator.connection_health.total_polls,
+                coordinator.connection_health.total_failures,
+                coordinator.connection_health.ema_latency_ms or 0,
+            )
+
+        await coordinator.async_config_entry_first_refresh()
+
+        plant_devices = HovalPlantDevices(hass, entry)
+        entry.runtime_data = HovalRuntimeData(
+            coordinator=coordinator,
+            api=api,
+            plant_devices=plant_devices,
+        )
+    except BaseException:
+        await api.aclose()
+        raise
 
     # Register the parent device for each plant BEFORE forwarding to the
     # platforms: a circuit's via_device_id must already resolve when its entity
@@ -240,6 +315,12 @@ async def async_unload_entry(hass: HomeAssistant, entry: HovalConnectConfigEntry
     # Force an immediate save so counters are not lost on a clean shutdown even
     # if the debounced save (triggered after each successful poll) hasn't fired.
     await coordinator.async_save_health()
+    # Independent audit finding (2026-09, "more" report, finding #7): cancel
+    # any post-write refresh task that might still be sleeping through its
+    # 2-second settle delay BEFORE closing the API session below — otherwise
+    # it could wake up afterwards and try to use an already-closed
+    # requests.Session.
+    await coordinator.async_shutdown()
     # v0.24.0: release the requests.Session()'s connection pool. Harmless to
     # skip (Python would eventually garbage-collect it), but tidy shutdown is
     # cheap and consistent with how an aiohttp session would have been

@@ -4,34 +4,436 @@ All notable changes to the `hoval_connect` integration are documented here.
 This project follows a loose [Semantic Versioning](https://semver.org/) scheme
 while pre-1.0 (minor = behavioural/feature change, patch = internal fix).
 
-## [0.24.1] - 2026-09-10
+## [1.0.0] - 2026-09-10
 
-Patch release: hardens the health-counter storage load against a version
-mismatch, purely so that rolling back to this version from a later release
-that bumps `HEALTH_STORAGE_VERSION` (e.g. v1.0.0) is safe without any
-manual file deletion. No functional changes otherwise — this release
-exists only to make v0.24.0 a safe rollback target.
+**Pre-deployment note:** this entry was amended after an independent code
+audit and a separately-reported production bug were reviewed and addressed
+— all *before* this version was ever deployed, so the fixes below are
+folded into this same v1.0.0 entry rather than a separate release. Full
+details in `docs/audit-v1.0.0.md` §§ "Pre-deployment audit response" and
+"Post-audit bug report".
 
-### Fixed
+**Architecture change, not a routine release: this integration no longer
+polls telemetry on any schedule.** Full investigation and design rationale
+in `docs/audit-v1.0.0.md`; summary below. Deliberately versioned 1.0.0
+(a real jump, not 0.25.0) at the user's explicit request, so a previously
+deployed v0.24.0 install is never silently overwritten in place — anyone
+who wants to go back to the old always-polling behavior can simply not
+upgrade, rather than needing to hunt down and reinstall a specific old
+version.
 
-- **`async_setup_entry()` could fail to load the integration entirely if
-  the persisted health-counter file was written by a different
-  `HEALTH_STORAGE_VERSION`.** Verified directly against Home Assistant's
-  `Store` helper source (`homeassistant/helpers/storage.py`): without an
-  overridden migration function (which this integration has never
-  provided), a version mismatch on load raises —
-  `UnsupportedStorageVersionError` if the stored file is *newer* than this
-  code expects (exactly the situation after installing, then rolling back
-  from, a later release), or a re-raised `NotImplementedError` if *older*.
-  This was uncaught, so it would have taken down the whole integration's
-  setup, not just lost some historical counters. `health_store.async_load()`
-  is now wrapped in a broad try/except that logs a warning and starts with
-  fresh counters on any load failure instead.
-- Found while explicitly verifying the safety of rolling back from v1.0.0
-  to this version — see that release's `docs/audit-v1.0.0.md` § 8 for the
-  full context. This was a latent bug in every version back through
-  whenever `HEALTH_STORAGE_VERSION` was introduced; it just had never been
-  exercised because the version number had never actually changed before.
+### Why
+
+The user runs a separate, CAN-bus-based HACS integration that already
+covers all telemetry (temperatures, energy, live values) — a strict
+superset of what this integration's cloud polling ever provided. The only
+things they actually need this integration for are (a) the handful of
+controls the CAN-bus integration can't reach — heating/hot-water program
+selection, the weather-based-control Eco/Comfort sliders — and (b) knowing
+if the cloud API itself has stopped working, so they can go investigate.
+Continuously polling a dozen-plus telemetry endpoints for data going
+unused, every 60 seconds to 10 minutes, forever, no longer served any
+purpose and was pure standing cloud-API footprint.
+
+### Changed — the core mechanism
+
+- **No more recurring telemetry polling.** `get_live_values()`,
+  `get_events()`, `get_latest_event()`, and `get_weather()` are removed
+  from `api.py` entirely — not just unused, deleted, since nothing calls
+  them anymore.
+- **Circuit/program/settings data (the control surface) is now fetched
+  once at startup, and again only after an actual write** — not on a
+  recurring schedule. This still uses `get_circuits()`, `get_programs()`
+  (for program display names), and `get_circuit_settings()` (for the
+  weatherImpact Eco/Comfort sliders' current values) — all genuinely needed
+  to render and use the controls — just no longer on a timer.
+- **The only thing left on a recurring schedule is a new, minimal health
+  check**, every `HEALTH_CHECK_INTERVAL` (30 minutes, fixed): one auth
+  call, one `GET /api/my-plants`, nothing plant- or circuit-specific. Its
+  only job is confirming the cloud API still responds at all.
+- **New diagnostic: `binary_sensor.*_cloud_api_problem`** (device_class
+  `problem`, diagnostic category). Tracks `last_successful_contact_at` —
+  updated by *either* a successful health check *or* a successful write,
+  whichever happens more recently — and turns on once more than
+  `CLOUD_API_PROBLEM_THRESHOLD` (2 hours, fixed) has passed with no
+  successful contact of either kind. Deliberately patient: a single missed
+  health check does not trip it, several in a row do.
+- **`plant.has_error` is now derived from circuits' own `hasError` flags**
+  (already part of the circuits-list response, so this is free) instead of
+  event-history telemetry. A narrower definition than before (any circuit
+  reporting an active error, vs. any active blocking/locking/warning event
+  in the plant's recent history), but needs no extra API call.
+
+### Removed
+
+- **`sensor.py` deleted entirely.** Every entity in it depended on
+  telemetry this integration no longer polls, with no write capability of
+  its own — there was nothing left for it to usefully show.
+  **This is a breaking change**: existing `sensor.*` entities from this
+  integration will stop updating on upgrade, and will eventually show as
+  "not provided by the integration" in Settings → Devices & Services →
+  Entities. Home Assistant does not remove orphaned entities
+  automatically; deleting them from the registry (if desired) is a manual
+  step. The user's own must-not-break automation entities were confirmed
+  unaffected before this release shipped: `select.*_program` (both
+  circuits), `number.*_weather_based_control_outside_temperature`,
+  `number.*_weather_based_control_solar_radiation`,
+  `binary_sensor.*_error`, and `water_heater.*` (including its
+  `reset_ww_boost` action) were never `sensor.py` entities, and none of
+  their identifying fields changed.
+- **The polling-interval option is gone entirely** — `CONF_SCAN_INTERVAL`,
+  `SCAN_INTERVAL_OPTIONS`, and `DEFAULT_SCAN_INTERVAL` are all removed from
+  `const.py`, and the corresponding dropdown removed from the options
+  flow. There is no longer a meaningful "poll rate" for a user to tune —
+  see "Changed" above. This supersedes (makes moot, not wrong) the whole
+  v0.19.0/v0.23.0 bug-fix history for that option.
+- `climate.py` and `fan.py` are **unchanged** and remain fully functional
+  for control — they simply show less live-value detail now (current
+  temperature, HVAC action) since `HovalCircuitData.live_values` is never
+  populated anymore. Every `.live_values.get(...)` call in those files
+  degrades gracefully to `None` on its own; no code there needed to
+  change.
+
+### Internal
+
+- `HovalCircuitHealth` (per-circuit reliability tracking, tied to the
+  now-removed live-values polling), `HovalEventData`, `HovalWeatherData`,
+  and the dead `resolve_fan_speed()` helper (defined but never actually
+  called anywhere in the codebase) are all removed from `coordinator.py`.
+- `HEALTH_STORAGE_VERSION` bumped 1 → 2 (the persisted health-tracking
+  schema changed — added `last_successful_contact_at`, removed per-circuit
+  data). **Found and fixed a real bug while writing this changelog entry**:
+  Home Assistant's `Store` helper does not silently discard a
+  version-mismatched file on its own — verified against its actual source,
+  not assumed — so without a fix, this version bump would have made the
+  whole integration fail to load on the very first run after either
+  upgrading into this release or rolling back out of it. `__init__.py` now
+  wraps the health-store load in a broad try/except that starts fresh on
+  any load failure instead of blocking setup. See `docs/audit-v1.0.0.md`
+  §8 for the rollback implication this still leaves (v0.24.0 itself has no
+  equivalent fix).
+- Test suite adjusted accordingly: 255 tests pass, ruff clean, 60% overall
+  coverage. New coverage added specifically for the health-check dispatch
+  (`TestHealthCheckDispatch` in `tests/test_coordinator_fetch.py`) — the
+  core new mechanism this release exists for.
+
+### Pre-deployment audit response
+
+An independent code audit was run against this release before it was ever
+deployed. Every finding was independently re-verified against the actual
+code (not taken on faith) before being acted on; full detail, including
+which findings were pre-existing vs. new to this release, in
+`docs/audit-v1.0.0.md` § "Pre-deployment audit response". Fixed:
+
+- **`get_circuits()` now fails closed on an unrecognised response shape**
+  (a dict with no list `content` key, a string, null) instead of silently
+  treating it as "zero circuits" — under this release's fetch-once-at-
+  startup model, a single bad response during startup could otherwise
+  leave every circuit entity missing until a restart.
+- **The API session is now closed on any setup failure**, not just on a
+  clean unload — previously, a failure between constructing
+  `HovalConnectApi` and finishing first refresh left the session (and its
+  connection pool) leaked, since `async_unload_entry()` never ran for an
+  entry that never finished loading.
+- **A post-write refresh race that could silently drop a second write's
+  confirmation for up to `HEALTH_CHECK_INTERVAL`.** The pending-refresh
+  flag is now a timestamp, not a bare bool, so a second write's request
+  made while an earlier write's refresh is still in flight survives that
+  earlier refresh completing. The optimistic mode-override clear at the
+  end of a refresh is now scoped to only clear entries older than when
+  that refresh started, so a write landing for a *different* circuit
+  mid-fetch no longer gets its optimistic state wiped in favour of a stale
+  snapshot.
+- **The cloud-problem diagnostic (and every optimistic write) now updates
+  immediately.** Both write paths call the coordinator's listener
+  notification right after recording a successful contact, instead of
+  waiting for the next full refresh to reach entities.
+- **`actualValue` and `temporaryChange`** — already part of the
+  circuits-list response this release still fetches, previously ignored —
+  are now mapped into real fields and used by climate/fan/water-heater as
+  a free, zero-extra-call source of some current-state display, restoring
+  part of what removing live-values polling took away.
+- **Missing/`None` `operationMode`** now correctly reports as unknown in
+  climate, fan, and water-heater entities instead of defaulting to an
+  active state with no actual basis for it.
+- **Temperature bounds are now enforced** on `async_set_temperature` in
+  both climate and water-heater entities (clamped, matching this
+  codebase's existing convention for other out-of-range input, rather than
+  rejected outright).
+- **Every cache and optimistic override is now keyed by `(plant_id,
+  circuit_path)`, not `circuit_path` alone.** Circuit paths are only
+  guaranteed unique within a plant; a single-plant account can never hit
+  this, but nothing guarantees that stays true (e.g. a future plant split
+  such as AC being separated from heating). `async_control_and_refresh`'s
+  parameters are now keyword-only specifically so a call site that wasn't
+  updated for this fails loudly instead of silently misrouting.
+- Two minor engineering-tool/cleanliness items: `tools/mutation_check.py`'s
+  mutations that targeted the now-deleted `sensor.py` were retargeted or
+  removed, and stale `scan_interval` translation strings were removed from
+  `strings.json`/`translations/en.json`.
+
+Test suite grew to 272 tests (from 255) covering these fixes specifically,
+including a dedicated multi-plant collision test proving the cache-keying
+fix actually works. Still ruff clean, 60% overall coverage.
+
+### Post-audit bug report
+
+A separately-filed bug report (verified live against a real v0.24.1
+deployment, confirmed still present in this release before the fix below)
+found that a weather-impact `number` write which returns success from the
+API but is not actually applied by the device could be masked indefinitely
+— far longer than the optimistic override's own 120-second TTL. The root
+cause: `async_set_weather_impact` was optimistically pre-populating the
+settings cache with its own just-written guess immediately after a write,
+which made the scheduled post-write verification refresh see a "fresh"
+cache and skip doing a real confirming API call entirely, for up to
+`CIRCUIT_SETTINGS_CACHE_TTL` (10 minutes) — not just the override's 120s.
+Fixed by removing that optimistic cache write (the override alone already
+covers the UI during the few-second gap before real verification lands)
+and by reconciling the override against genuine fresh poll data using the
+same race-safe timestamp guard built for the mode-override fix above.
+
+### Second independent audit round
+
+A follow-up independent ICS-style review (scoped to production/runtime code
+only, explicitly excluding tests and prior audit docs as evidence) found 9
+further issues (HVC-ICS-001 through HVC-ICS-009). All 9 were independently
+re-verified against the actual code before acting on any of them; full
+detail in `docs/audit-v1.0.0.md` § "Second independent audit round". Fixed
+8 of 9 (the 9th, a v3/v4 API compatibility risk, is a documented risk with
+no live evidence of an actual problem, so left as documentation only rather
+than an unvalidated speculative change):
+
+- **Topology discovery could stall permanently.** A plant offline during
+  initial setup, or a brand-new plant appearing later (e.g. Hoval splitting
+  an account into multiple plants), would never get its circuits
+  discovered — the health check never fires the "new circuits" signal, and
+  nothing was watching for an offline→online transition or an
+  unrecognised plant. `_health_check()` now detects either condition and
+  upgrades itself to a real discovery fetch for that one cycle.
+- **A fan turn-off could be silently undone.** `async_turn_off()` (and
+  `async_turn_on()`) never cancelled a pending debounced speed write —
+  setting a speed then turning off within the 1.5s debounce window could
+  turn the fan back on right after the explicit off. Both now cancel any
+  pending write first.
+- **Water heater `high_demand` did the opposite of what it implied.**
+  Selecting it ran the exact same code as `heat_pump` — resetting to the
+  normal schedule, not starting a boost. Removed from the selectable
+  operation list (the real way to start a boost, setting a target
+  temperature, already worked correctly); selecting it now raises a clear
+  error instead of silently doing nothing like what was asked.
+- **NaN/infinity silently became a valid clamp value.** `clamp_hv_air_volume()`
+  and both `clamp_weather_impact_*()` functions now reject non-finite input,
+  matching the guard `clamp_temperature()` already had.
+- **Malformed nested API objects could delete a whole circuit.** A truthy
+  non-dict `airQuality` or `weatherImpact` value raised `AttributeError`
+  deep inside per-circuit processing, which — since that runs under
+  `asyncio.gather(..., return_exceptions=True)` — silently dropped the
+  entire circuit rather than just that one optional feature. Both now use
+  explicit `isinstance(x, dict)` checks.
+- **A 401 could push total HTTP attempts past the documented retry
+  budget**, and conversely **a transient error acquiring an auth token
+  bypassed retries entirely.** The 401 handler used to recurse into a
+  fresh `_request()` call with its own new retry budget (so a 401 followed
+  by one transient error could take 3 total attempts against a documented
+  budget of 2); separately, token acquisition ran outside this method's
+  retry try/except altogether, so a network blip talking to the identity
+  provider failed immediately regardless of `_MAX_RETRIES`. Both fixed
+  together by removing the recursion — a 401 now `continue`s within the
+  same loop, and header acquisition shares that same loop's retry/backoff.
+- **"Resume the schedule" could silently switch an active week2 schedule
+  to week1.** `reset_circuit()` defaults to `program="week1"`, and none of
+  the three "resume" callers (fan/climate/water-heater) passed the
+  circuit's actual active program. New `resolve_resume_program()` helper
+  preserves week2 when that's what's actually running.
+- A plant-name fallback inconsistency between `_fetch_all_data()` and
+  `_health_check()` (`plant.get("description", plant_id)` doesn't apply
+  the fallback for an explicit `null`, unlike the `or`-based version) was
+  also fixed while verifying the malformed-object finding above.
+
+Test suite grew to 280 tests (from 272). Still ruff clean, 60.5% overall
+coverage.
+
+### Third independent audit round ("more" report)
+
+A follow-up review, again scoped to production/runtime code, found 12
+further issues plus 2 documentation observations. All 14 were
+independently re-verified against the actual code (including checking the
+OpenAPI spec's `required` list directly for finding #1, and tracing exact
+control flow for the retry/auth findings) before acting on any of them;
+full detail in `docs/audit-v1.0.0.md` § "Pre-deployment audit response,
+third round". All 12 code findings and both documentation observations
+were fixed:
+
+- **`isSelectable` vs `selectable`**: the v3 schema requires `isSelectable`
+  but only optionally sends the legacy `selectable` field — a response
+  omitting the optional field could silently drop an otherwise-selectable
+  circuit. Now prefers the guaranteed field.
+- **`get_plants()` failed open** on an unrecognised response shape — the
+  same class of bug already fixed for `get_circuits()` in the previous
+  round, just missed on this sibling method. Now raises consistently.
+- **An anomalous-but-well-formed empty plant list could silently wipe
+  every known plant.** Both `_health_check()` and `_fetch_all_data()` now
+  require 2 consecutive empty responses (when plants were previously
+  known) before accepting the wipe as genuine.
+- **The weather-impact write path used a settings cache with no
+  freshness check at all**, and could crash on a malformed cached value.
+  Implemented the real fix (a fresh GET when the cache is stale or
+  missing, not just falling through to equally-stale data), plus a proper
+  `isinstance` guard on the cached value.
+- **A 401 fetching the plant-access token was always treated as a hard
+  auth failure**, unlike the main request path's identical signal (which
+  correctly refreshes and retries). Now retries once before giving up,
+  matching that same semantics.
+- **Post-write refresh tasks were never tracked**, so one could wake up
+  after a config-entry reload had already closed the API session. Now
+  tracked and cancelled by a new `coordinator.async_shutdown()`, called
+  before the session closes.
+- **"Resume" could act on a stale cached schedule.** The previous round's
+  fix read the coordinator's last-known snapshot, which is only refreshed
+  at startup or after a write — `resolve_resume_program()` now does one
+  fresh, targeted fetch immediately before resolving.
+- **Diagnostics redaction had real gaps**: plant IDs and circuit paths used
+  as *dictionary keys* were never touched by `async_redact_data` (it only
+  redacts matching field names), and the entire `connection_health`
+  section — including error messages that can embed a circuit path or
+  plant ID — bypassed redaction completely. Diagnostics are now built
+  explicitly with indexed placeholder keys and free-text identifier
+  scrubbing; `tests/test_diagnostics.py` was rewritten from scratch with
+  real behavioral tests instead of only checking redaction-set membership.
+- **Two identically-named week1/week2 programs were ambiguous** in the
+  program select entity — disambiguated automatically by appending the
+  API key when a collision is detected.
+- **CI installed `aiohttp` instead of `requests`** — a leftover from
+  before the v0.24.0 transport rewrite.
+- **The example client was badly stale**: no `User-Agent` (would
+  reproduce the exact 403 this project spent significant effort
+  diagnosing), and demonstrated telemetry endpoints this integration no
+  longer uses. Rewritten to reflect the actual v1.0.0 control-only surface.
+- **README's troubleshooting/limitations sections described entities that
+  no longer exist** (circuit-level sensors, weather/events entities) —
+  corrected, and stale translation strings for the deleted sensor platform
+  were removed from `strings.json`/`translations/en.json`.
+
+One correction made to the audit's own analysis rather than following its
+suggestion as given: the settings-cache finding's own "simple" suggested
+fix (fall through to `circuit.weather_impact_*` on a stale cache) was
+traced through and found not to actually close the reported failure
+scenario, since that field is populated from the same cache in lockstep —
+implemented the audit's own noted "maximum correctness" alternative (a
+fresh GET) instead.
+
+Test suite grew to 341 tests (from 280). Still ruff clean, 63.6% overall
+coverage.
+
+### Polling interval reinstated as a configurable option
+
+At the user's explicit request, after the above: `HEALTH_CHECK_INTERVAL`
+is no longer a fixed constant. New `CONF_HEALTH_CHECK_INTERVAL` option,
+alongside turn-on mode and override duration in the same options screen,
+with choices of 10/15/30/60/120 minutes (default: 30, unchanged from
+before). This reinstates a narrower, differently-scoped version of the
+option removed at the start of v1.0.0 (see the very first entry below) —
+it only affects the cadence of the one lightweight reachability check this
+integration still runs on a schedule, never circuit/program/settings data,
+which remains fetch-once-at-startup-and-after-writes regardless of this
+setting. `CLOUD_API_PROBLEM_THRESHOLD` (2 hours) stays a fixed constant,
+not scaled to this setting — choosing a long health-check interval means
+that diagnostic gets less "several in a row" margin before tripping, an
+accepted consequence of that choice rather than a bug.
+
+### Fourth independent audit round ("ICS deep test" report)
+
+A fourth review — the most thorough yet, deliberately re-examining every
+async boundary, state-machine transition, persistence boundary, and
+topology transition — found 22 further issues. All 22 were independently
+re-verified against the actual code (including writing a standalone async
+simulation to empirically test one timing claim rather than judge it by
+inspection alone) before acting on any of them; full detail in
+`docs/audit-v1.0.0.md` § "Pre-deployment audit response, fourth round".
+**Two findings were rejected after verification**, not accepted on faith
+— see that section for the reasoning. **Two findings (the report's own
+highest-severity ones) were deliberately deferred**, per explicit
+agreement: cancelling an in-flight write does not reliably stop the
+underlying blocking HTTP call once it's started running in its executor
+thread (an inherent property of Python's `ThreadPoolExecutor`, not a
+coding mistake, and not fixable without a genuine per-circuit write-
+serialization redesign), and a promising but unvalidated lead
+(`week1OrWeek2Active`, a real OpenAPI field whose exact semantics aren't
+confirmed) for improving resume-program correctness further. The
+remaining 18 confirmed findings were fixed:
+
+- **Malformed circuit-list elements** (`null`, strings, numbers mixed into
+  an otherwise-valid list) no longer abort the entire refresh — filtered
+  out with a warning before they can reach code that assumes every element
+  is a dict.
+- **Duplicate circuit paths and duplicate plant IDs** are now detected and
+  logged (first-seen-wins) instead of one silently overwriting the other
+  with no trace.
+- **API session close ordering didn't cover fan/number debounce tasks** —
+  a real gap in the previous round's own task-tracking fix, which only
+  covered the coordinator's own post-write refresh tasks. The tracking
+  mechanism (`create_tracked_task()`, now public) is extended to cover
+  every entity's debounced control-write task too.
+- **HEAT and AUTO climate modes performed the identical operation.** HEAT
+  now genuinely activates "constant" mode (reusing the already-proven
+  `set_program()` call, not a new unvalidated API interaction); AUTO keeps
+  resuming the schedule. Read and write sides now agree on what HEAT means.
+- **The `cloud_api_problem` binary sensor had no translation key** in
+  either `strings.json` or `translations/en.json` — a genuine oversight
+  from the very first v1.0.0 draft that had persisted through three
+  subsequent audit rounds unnoticed.
+- **Persisted options (health-check interval, fan turn-on mode, override
+  duration) were trusted without re-validation** against the actual
+  supported values — an out-of-band value could reach the API unchanged
+  or, for the interval, make `timedelta()` itself raise `OverflowError`.
+  Fixed across `__init__.py` and `fan.py`; **a second, previously
+  unnoticed occurrence of the same override-duration gap was found in
+  `climate.py`** while fixing the first one and fixed too.
+- **`targetValue`/`actualValue` were copied from the API with no
+  validation** — a malformed or non-finite (`NaN`/`Infinity` — Python's
+  own `json` module parses these by default, not hypothetical) value
+  could crash an entity property downstream. New `_coerce_finite_number()`
+  helper applied at the source.
+- **A timezone-naive persisted timestamp could crash the cloud-problem
+  sensor** later (`dt_util.utcnow() - naive_datetime` raises `TypeError`).
+  Naive timestamps are now assumed UTC instead.
+- **Corrupted persisted health-counter data could crash startup entirely**
+  — a single `NaN`/infinite/negative entry in `error_counts` or the EMA
+  latency value raised inside an unguarded conversion. Every value is now
+  validated (finite, non-negative) before use, with bad entries skipped
+  rather than aborting the whole restore.
+- **Pagination exhaustion silently returned a partial plant list** as if
+  it were a complete, successful result — inconsistent with every other
+  place in the same method that already fails closed on a detected
+  anomaly. Now raises instead.
+- **A single global lock serialized plant-access-token acquisition across
+  every plant on the account**, even though different plants' tokens are
+  entirely independent. Now one lock per plant, created on first use.
+- **The program select entity could report a `current_option` outside its
+  own `options` list** (`activeProgram` values like `manual` or
+  `externalConstant`, which the API permits but the entity never offered
+  as selectable) — a real violation of `SelectEntity`'s own contract. Now
+  reports `None` for those, the same choice already made for
+  water-heater's `high_demand`.
+- **Non-string program names could crash the select entity's state
+  computation entirely** (a malformed name that's merely truthy — a list
+  or dict — is unhashable, crashing the disambiguation logic from the
+  third audit round). Now requires an actual non-empty string.
+- **Weather-impact sibling values weren't re-validated before being sent**
+  — only the field the user was actually changing was clamped; the
+  sibling (from cache/override/circuit data) was forwarded as-is even if
+  its source had been corrupted. Now re-clamped, degrading a genuinely
+  unusable value to `None` rather than propagating it.
+- **No active entity/device-registry cleanup for removed circuits, and no
+  live device-name sync on rename** — both documented as accepted,
+  deliberate limitations (consistent with this integration's existing
+  "static hardware, reboot/reload for topology changes" design) rather
+  than new removal/sync machinery, per the audit's own "or document"
+  option for both findings. See the README's Known Limitations.
+
+Test suite grew to 377 tests (from 343). Still ruff clean, 64.2% overall
+coverage.
 
 ## [0.24.0] - 2026-09-10
 

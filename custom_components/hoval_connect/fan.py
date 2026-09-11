@@ -25,9 +25,16 @@ from .const import (
     OPERATION_MODE_REGULAR,
     OPERATION_MODE_STANDBY,
     TURN_ON_RESUME,
+    VALID_OVERRIDE_DURATIONS,
+    VALID_TURN_ON_MODES,
     clamp_hv_air_volume,
 )
-from .coordinator import SIGNAL_NEW_CIRCUITS, HovalCircuitData, HovalDataCoordinator
+from .coordinator import (
+    SIGNAL_NEW_CIRCUITS,
+    HovalCircuitData,
+    HovalDataCoordinator,
+    resolve_resume_program,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -111,13 +118,26 @@ class HovalFan(CoordinatorEntity[HovalDataCoordinator], FanEntity):
 
     @property
     def _override_duration(self) -> str:
-        """Get override duration enum from options (FOUR or MIDNIGHT)."""
-        return self._entry.options.get(CONF_OVERRIDE_DURATION, DEFAULT_OVERRIDE_DURATION)
+        """Get override duration enum from options (FOUR or MIDNIGHT).
+
+        Independent audit finding (2026-09, fourth round, HVC-007): the
+        raw persisted value is now validated against VALID_OVERRIDE_DURATIONS
+        before use — an out-of-band value would otherwise reach the API
+        unchanged, producing a confusing failure there instead of a
+        graceful local fallback.
+        """
+        value = self._entry.options.get(CONF_OVERRIDE_DURATION, DEFAULT_OVERRIDE_DURATION)
+        return value if value in VALID_OVERRIDE_DURATIONS else DEFAULT_OVERRIDE_DURATION
 
     @property
     def _turn_on_mode(self) -> str:
-        """Get turn-on mode from options (resume, week1, week2)."""
-        return self._entry.options.get(CONF_TURN_ON_MODE, DEFAULT_TURN_ON_MODE)
+        """Get turn-on mode from options (resume, week1, week2).
+
+        Independent audit finding (2026-09, fourth round, HVC-007): same
+        validation rationale as _override_duration above.
+        """
+        value = self._entry.options.get(CONF_TURN_ON_MODE, DEFAULT_TURN_ON_MODE)
+        return value if value in VALID_TURN_ON_MODES else DEFAULT_TURN_ON_MODE
 
     @property
     def _circuit(self) -> HovalCircuitData | None:
@@ -138,20 +158,34 @@ class HovalFan(CoordinatorEntity[HovalDataCoordinator], FanEntity):
         circuit = self._circuit
         if circuit is None:
             return None
-        override = self.coordinator.get_mode_override(self._circuit_path)
+        override = self.coordinator.get_mode_override(self._plant_id, self._circuit_path)
         mode = override if override is not None else circuit.operation_mode
+        # Independent audit finding (2026-09, HVC-006): operationMode is not
+        # a required API field. Missing/None previously made
+        # `mode != OPERATION_MODE_STANDBY` evaluate True, reporting the fan
+        # as ON with no actual basis for it. Report unknown instead.
+        if mode is None:
+            return None
         return mode != OPERATION_MODE_STANDBY
 
     @property
     def percentage(self) -> int | None:
-        """Return the current speed percentage (0-100)."""
+        """Return the current speed percentage (0-100).
+
+        Independent audit finding (2026-09, HVC-003): checks
+        `circuit.actual_value` (free, from the circuits-list response)
+        before falling back to the now-permanently-empty `live_values`,
+        then `target_value` as the last resort.
+        """
         # Show pending value immediately for responsive UI
         if self._pending_percentage is not None:
             return self._pending_percentage
         circuit = self._circuit
         if circuit is None:
             return None
-        val = circuit.live_values.get("airVolume")
+        val = circuit.actual_value
+        if val is None:
+            val = circuit.live_values.get("airVolume")
         if val is None:
             val = circuit.target_value
         if val is None:
@@ -169,7 +203,16 @@ class HovalFan(CoordinatorEntity[HovalDataCoordinator], FanEntity):
         turn-off earlier in async_set_percentage and never reaches here.
         """
         self._pending_percentage = None
-        clamped = clamp_hv_air_volume(percentage)
+        try:
+            clamped = clamp_hv_air_volume(percentage)
+        except ValueError as err:
+            # Independent audit finding (2026-09, HVC-ICS-004): clamp_hv_air_volume
+            # now rejects non-finite input instead of silently returning a
+            # boundary value. Converted to HomeAssistantError here (this method
+            # runs inside a fire-and-forget background task — see
+            # _debounced_set's docstring — so an uncaught ValueError would
+            # otherwise be invisible to the user).
+            raise HomeAssistantError(f"Invalid fan speed: {err}") from err
         if clamped != percentage:
             _LOGGER.debug(
                 "Clamped requested air volume %d%% to device band %d-%d%% → %d%%",
@@ -186,6 +229,7 @@ class HovalFan(CoordinatorEntity[HovalDataCoordinator], FanEntity):
                     value=clamped,
                     duration=self._override_duration,
                 ),
+                plant_id=self._plant_id,
                 circuit_path=self._circuit_path,
                 mode_override=OPERATION_MODE_REGULAR,
             )
@@ -230,7 +274,17 @@ class HovalFan(CoordinatorEntity[HovalDataCoordinator], FanEntity):
         # Cancel previous debounce timer
         self._cancel_debounce()
         # Start new debounce timer
-        self._debounce_task = self.hass.async_create_task(self._debounced_set(percentage))
+        # Independent audit finding (2026-09, fourth round, HVC-003):
+        # routed through the coordinator's shared task tracking instead of
+        # a bare hass.async_create_task() call, so async_shutdown() (called
+        # before the API session closes on unload/reload) cancels AND
+        # awaits this too — not just the coordinator's own post-write
+        # refresh tasks. Without this, a debounce task still asleep at
+        # reload time could wake up and try to use an already-closed
+        # requests.Session, since this entity's own
+        # async_will_remove_from_hass() (which also cancels it) only runs
+        # during platform unload, which happens after the session closes.
+        self._debounce_task = self.coordinator.create_tracked_task(self._debounced_set(percentage))
 
     async def async_turn_on(
         self,
@@ -238,15 +292,32 @@ class HovalFan(CoordinatorEntity[HovalDataCoordinator], FanEntity):
         preset_mode: str | None = None,
         **kwargs,
     ) -> None:
-        """Turn on the fan."""
+        """Turn on the fan.
+
+        Independent audit finding (2026-09, HVC-ICS-002): cancels any
+        pending debounced percentage write first. Without this, a stale
+        queued speed write (from a slider drag shortly before this call)
+        could fire ~1.5s later and override the state this call just set.
+        """
+        self._cancel_debounce()
+        self._pending_percentage = None
         if percentage is not None:
             await self.async_set_percentage(percentage)
             return
         mode = self._turn_on_mode
         if mode == TURN_ON_RESUME:
+            # Independent audit finding (2026-09, HVC-ICS-008 + "more"
+            # report finding #8): preserve week2 if that's the circuit's
+            # actual, freshly-confirmed active program, instead of always
+            # forcing week1 or trusting a possibly-stale cached snapshot —
+            # see resolve_resume_program().
+            resume_program = await resolve_resume_program(
+                self.coordinator.api, self._plant_id, self._circuit_path, self._circuit
+            )
             coro = self.coordinator.api.reset_circuit(
                 self._plant_id,
                 self._circuit_path,
+                program=resume_program,
             )
         else:
             coro = self.coordinator.api.set_program(
@@ -257,6 +328,7 @@ class HovalFan(CoordinatorEntity[HovalDataCoordinator], FanEntity):
         try:
             await self.coordinator.async_control_and_refresh(
                 coro,
+                plant_id=self._plant_id,
                 circuit_path=self._circuit_path,
                 mode_override=OPERATION_MODE_REGULAR,
             )
@@ -264,7 +336,15 @@ class HovalFan(CoordinatorEntity[HovalDataCoordinator], FanEntity):
             raise HomeAssistantError(f"Failed to turn on fan: {err}") from err
 
     async def async_turn_off(self, **kwargs) -> None:
-        """Turn off the fan (standby mode)."""
+        """Turn off the fan (standby mode).
+
+        Independent audit finding (2026-09, HVC-ICS-002): cancels any
+        pending debounced percentage write first — without this, a queued
+        speed write from just before this call could fire ~1.5s later and
+        turn the fan back on immediately after this explicit turn-off.
+        """
+        self._cancel_debounce()
+        self._pending_percentage = None
         try:
             await self.coordinator.async_control_and_refresh(
                 self.coordinator.api.set_circuit_mode(
@@ -272,6 +352,7 @@ class HovalFan(CoordinatorEntity[HovalDataCoordinator], FanEntity):
                     self._circuit_path,
                     OPERATION_MODE_STANDBY,
                 ),
+                plant_id=self._plant_id,
                 circuit_path=self._circuit_path,
                 mode_override=OPERATION_MODE_STANDBY,
             )

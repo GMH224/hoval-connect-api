@@ -28,8 +28,14 @@ from .const import (
     OPERATION_MODE_REGULAR,
     OPERATION_MODE_STANDBY,
     SERVICE_RESET_WW_BOOST,
+    clamp_temperature,
 )
-from .coordinator import SIGNAL_NEW_CIRCUITS, HovalCircuitData, HovalDataCoordinator
+from .coordinator import (
+    SIGNAL_NEW_CIRCUITS,
+    HovalCircuitData,
+    HovalDataCoordinator,
+    resolve_resume_program,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -105,7 +111,20 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
     _attr_min_temp = WW_MIN_TEMP
     _attr_max_temp = WW_MAX_TEMP
     _attr_target_temperature_step = WW_TEMP_STEP
-    _attr_operation_list = [_OP_HEAT_PUMP, _OP_HIGH_DEMAND, _OP_OFF]
+    _attr_operation_list = [_OP_HEAT_PUMP, _OP_OFF]
+    # Independent audit finding (2026-09, HVC-ICS-003): _OP_HIGH_DEMAND is
+    # deliberately NOT in this list. current_operation (below) can still
+    # report it — a temporary boost genuinely can be active, and that's a
+    # real, observable state — but it was never actually selectable: the
+    # old async_set_operation_mode() branch treated `heat_pump` and
+    # `high_demand` identically, both resetting to the normal schedule,
+    # which is the opposite of what selecting "high_demand" implies. The
+    # correct way to start a boost is already implemented correctly:
+    # async_set_temperature() (a real WaterHeaterEntityFeature.TARGET_
+    # TEMPERATURE call, which callers already use) sends a genuine
+    # temporary-change command with an actual target value — something
+    # async_set_operation_mode() never receives (it only gets a mode
+    # string, no numeric value to boost to). See docs/audit-v1.0.0.md.
     _attr_supported_features = (
         WaterHeaterEntityFeature.TARGET_TEMPERATURE | WaterHeaterEntityFeature.OPERATION_MODE
     )
@@ -142,10 +161,16 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
 
     @property
     def current_temperature(self) -> float | None:
-        """Return current water temperature (top-of-tank sensor)."""
+        """Return current water temperature (top-of-tank sensor).
+
+        Independent audit finding (2026-09, HVC-003): `circuit.actual_value`
+        (free, from the circuits-list response) is checked first.
+        """
         circuit = self._circuit
         if circuit is None:
             return None
+        if circuit.actual_value is not None:
+            return circuit.actual_value
         val = circuit.live_values.get("tempSf1Actual") or circuit.live_values.get("tempActual")
         if val is not None:
             try:
@@ -156,10 +181,16 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
 
     @property
     def target_temperature(self) -> float | None:
-        """Return target water temperature."""
+        """Return target water temperature.
+
+        Independent audit finding (2026-09, HVC-003): `circuit.target_value`
+        (already fetched for the write path anyway) is checked first.
+        """
         circuit = self._circuit
         if circuit is None:
             return None
+        if circuit.target_value is not None:
+            return circuit.target_value
         val = circuit.live_values.get("tempTarget")
         if val is not None:
             try:
@@ -169,17 +200,30 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
         return None
 
     @property
-    def current_operation(self) -> str:
-        """Return current operation mode."""
+    def current_operation(self) -> str | None:
+        """Return current operation mode.
+
+        Independent audit finding (2026-09, HVC-006 and HVC-003):
+        - Missing/None operationMode previously fell through to
+          _OP_HEAT_PUMP, reporting an active state with no actual basis.
+          Returns None (WaterHeaterEntity supports this) instead.
+        - `circuit.temporary_change_active` (free, derived from the
+          circuits-list response's `temporaryChange` object being non-null)
+          replaces the old `live_values.get("temporaryChangeActive") ==
+          "true"` check, which was permanently False since v1.0.0 stopped
+          fetching live values at all.
+        """
         circuit = self._circuit
         if circuit is None:
-            return _OP_OFF
-        override = self.coordinator.get_mode_override(self._circuit_path)
+            return None
+        override = self.coordinator.get_mode_override(self._plant_id, self._circuit_path)
         mode = override if override is not None else circuit.operation_mode
+        if mode is None:
+            return None
         if mode == OPERATION_MODE_STANDBY:
             return _OP_OFF
         # If a temporary change is active, show as high_demand
-        if circuit.live_values.get("temporaryChangeActive") == "true":
+        if circuit.temporary_change_active:
             return _OP_HIGH_DEMAND
         return _OP_HEAT_PUMP
 
@@ -189,10 +233,20 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
         The Hoval API's 'midnight' duration means the override automatically
         expires at 00:00, so the regular week program resumes the next day
         without any cleanup automation.
+
+        Independent audit finding (2026-09, HVC-007): _attr_min_temp/
+        _attr_max_temp were declared but never enforced — see the matching
+        fix and rationale in climate.py's async_set_temperature.
         """
         temperature = kwargs.get("temperature")
         if temperature is None:
             return
+        try:
+            temperature = clamp_temperature(
+                float(temperature), self._attr_min_temp, self._attr_max_temp
+            )
+        except (ValueError, TypeError) as err:
+            raise HomeAssistantError(f"Invalid target temperature: {temperature!r}") from err
         _LOGGER.debug(
             "WW set_temperature: circuit=%s temp=%s (override until midnight)",
             self._circuit_path,
@@ -206,6 +260,7 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
                     value=float(temperature),
                     duration="midnight",
                 ),
+                plant_id=self._plant_id,
                 circuit_path=self._circuit_path,
                 mode_override=OPERATION_MODE_REGULAR,
             )
@@ -213,7 +268,16 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
             raise HomeAssistantError(f"Failed to set hot water temperature: {err}") from err
 
     async def async_set_operation_mode(self, operation_mode: str) -> None:
-        """Switch operation mode."""
+        """Switch operation mode.
+
+        Independent audit finding (2026-09, HVC-ICS-003): `high_demand` was
+        removed from `_attr_operation_list` (see that attribute's comment)
+        because there was never a real implementation for selecting it —
+        this method treated it identically to `heat_pump`. It's rejected
+        explicitly here too (raising, not silently resetting to normal)
+        in case anything calls this service directly with a value outside
+        the currently-advertised list.
+        """
         try:
             if operation_mode == _OP_OFF:
                 await self.coordinator.async_control_and_refresh(
@@ -222,18 +286,34 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
                         self._circuit_path,
                         "standby",
                     ),
+                    plant_id=self._plant_id,
                     circuit_path=self._circuit_path,
                     mode_override=OPERATION_MODE_STANDBY,
                 )
-            elif operation_mode in (_OP_HEAT_PUMP, _OP_HIGH_DEMAND):
-                # Reset to the normal week program
+            elif operation_mode == _OP_HEAT_PUMP:
+                # Reset to the normal week program. Independent audit
+                # finding (2026-09, HVC-ICS-008 + "more" report finding
+                # #8): preserve week2 if that's actually (freshly-
+                # confirmed) active — see resolve_resume_program().
+                resume_program = await resolve_resume_program(
+                    self.coordinator.api, self._plant_id, self._circuit_path, self._circuit
+                )
                 await self.coordinator.async_control_and_refresh(
                     self.coordinator.api.reset_circuit(
                         self._plant_id,
                         self._circuit_path,
+                        program=resume_program,
                     ),
+                    plant_id=self._plant_id,
                     circuit_path=self._circuit_path,
                     mode_override=OPERATION_MODE_REGULAR,
+                )
+            else:
+                raise HomeAssistantError(
+                    f"Unsupported operation mode: {operation_mode!r}. To start a "
+                    "temporary boost, set a target temperature instead — that's "
+                    "what actually activates one; there is no separate "
+                    "'high_demand' operation-mode command."
                 )
         except HovalApiError as err:
             raise HomeAssistantError(f"Failed to set operation mode: {err}") from err
@@ -259,6 +339,7 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
                     self._plant_id,
                     self._circuit_path,
                 ),
+                plant_id=self._plant_id,
                 circuit_path=self._circuit_path,
                 mode_override=OPERATION_MODE_REGULAR,
             )

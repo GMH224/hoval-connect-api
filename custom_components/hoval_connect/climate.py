@@ -25,8 +25,15 @@ from .const import (
     DEFAULT_OVERRIDE_DURATION,
     OPERATION_MODE_REGULAR,
     OPERATION_MODE_STANDBY,
+    VALID_OVERRIDE_DURATIONS,
+    clamp_temperature,
 )
-from .coordinator import SIGNAL_NEW_CIRCUITS, HovalCircuitData, HovalDataCoordinator
+from .coordinator import (
+    SIGNAL_NEW_CIRCUITS,
+    HovalCircuitData,
+    HovalDataCoordinator,
+    resolve_resume_program,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -111,12 +118,17 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
     def current_temperature(self) -> float | None:
         """Return the current room temperature.
 
-        Live-values key for HK circuits is 'roomTempActual'.  The fallback
-        keys cover future circuit types that may use different field names.
+        Independent audit finding (2026-09, HVC-003): `circuit.actual_value`
+        (from the circuits-list response, already fetched — no extra call)
+        is checked first. `live_values` is permanently empty since v1.0.0
+        (see HovalCircuitData's field comment) but the loop is left in place
+        as a harmless no-op fallback rather than touched for this release.
         """
         circuit = self._circuit
         if circuit is None:
             return None
+        if circuit.actual_value is not None:
+            return circuit.actual_value
         for key in ("roomTempActual", "actualTemperature", "roomTemperature"):
             val = circuit.live_values.get(key)
             if val is not None:
@@ -130,11 +142,16 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
     def target_temperature(self) -> float | None:
         """Return the target room temperature.
 
-        Live-values key for HK circuits is 'roomTempTarget'.
+        Independent audit finding (2026-09, HVC-003): `circuit.target_value`
+        (from the circuits-list response, already fetched for the write
+        path anyway) is checked first, instead of only ever reading the
+        now-permanently-empty `live_values`.
         """
         circuit = self._circuit
         if circuit is None:
             return None
+        if circuit.target_value is not None:
+            return circuit.target_value
         for key in ("roomTempTarget", "targetTemperature"):
             val = circuit.live_values.get(key)
             if val is not None:
@@ -146,12 +163,30 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
 
     @property
     def hvac_mode(self) -> HVACMode | None:
-        """Return the current HVAC mode."""
+        """Return the current HVAC mode.
+
+        HEAT (independent audit finding, 2026-09, fourth round, HVC-004)
+        specifically means "not on a week/eco schedule" — constant,
+        manual, externalConstant, or anything else not in the AUTO set
+        below. This is intentionally the mirror image of what selecting
+        HEAT now does (async_set_hvac_mode activates "constant"
+        specifically): a circuit already on "constant" reports back as
+        HEAT, and selecting HEAT puts it on "constant", so read and write
+        agree on what HEAT actually means instead of write silently
+        landing in whatever AUTO would have produced.
+        """
         circuit = self._circuit
         if circuit is None:
             return None
-        override = self.coordinator.get_mode_override(self._circuit_path)
+        override = self.coordinator.get_mode_override(self._plant_id, self._circuit_path)
         mode = override if override is not None else circuit.operation_mode
+        # Independent audit finding (2026-09, HVC-006): operationMode is not
+        # a required API field. Missing/None used to fall through silently
+        # to HEAT below, reporting an active state with no actual basis for
+        # it. Report unknown instead — ClimateEntity's hvac_mode explicitly
+        # allows None.
+        if mode is None:
+            return None
         if mode == OPERATION_MODE_STANDBY:
             return HVACMode.OFF
         # If a time program is active, show as AUTO
@@ -171,8 +206,11 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
         circuit = self._circuit
         if circuit is None:
             return None
-        override = self.coordinator.get_mode_override(self._circuit_path)
+        override = self.coordinator.get_mode_override(self._plant_id, self._circuit_path)
         mode = override if override is not None else circuit.operation_mode
+        # See the identical guard in hvac_mode above (HVC-006).
+        if mode is None:
+            return None
         if mode == OPERATION_MODE_STANDBY:
             return HVACAction.OFF
         # Prefer the live-values 'status' key; fall back to circuit-list field.
@@ -184,7 +222,27 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
         return HVACAction.IDLE
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        """Set HVAC mode."""
+        """Set HVAC mode.
+
+        Independent audit finding (2026-09, fourth round, HVC-004): HEAT
+        and AUTO used to perform the IDENTICAL operation (resume the week
+        program) despite being advertised as two distinct, independently
+        selectable modes — selecting HEAT did not produce any different
+        outcome from selecting AUTO, which is misleading given HA's
+        climate entity contract implies each advertised mode is a genuine,
+        distinct target state. Fixed by giving HEAT a real, different
+        target: the circuit's "constant" program (a fixed target
+        temperature, no schedule) — reusing api.set_program(), an already
+        proven, already-used mechanism (select.py's Constant option calls
+        this same thing), not a new unvalidated API interaction. AUTO
+        keeps its original meaning: resume the underlying week schedule.
+        This also makes the write side consistent with the read side
+        (hvac_mode below already reports HEAT specifically when the
+        circuit is NOT on a week/eco program, i.e. exactly the "constant"-
+        like states) — selecting HEAT now actually produces the state
+        hvac_mode would report back as HEAT, instead of silently
+        resuming the schedule and often landing back in AUTO.
+        """
         try:
             if hvac_mode == HVACMode.OFF:
                 await self.coordinator.async_control_and_refresh(
@@ -193,15 +251,35 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
                         self._circuit_path,
                         OPERATION_MODE_STANDBY,
                     ),
+                    plant_id=self._plant_id,
                     circuit_path=self._circuit_path,
                     mode_override=OPERATION_MODE_STANDBY,
                 )
-            elif hvac_mode in (HVACMode.AUTO, HVACMode.HEAT):
+            elif hvac_mode == HVACMode.HEAT:
+                await self.coordinator.async_control_and_refresh(
+                    self.coordinator.api.set_program(
+                        self._plant_id,
+                        self._circuit_path,
+                        "constant",
+                    ),
+                    plant_id=self._plant_id,
+                    circuit_path=self._circuit_path,
+                    mode_override=OPERATION_MODE_REGULAR,
+                )
+            elif hvac_mode == HVACMode.AUTO:
+                # Independent audit finding (2026-09, HVC-ICS-008 + "more"
+                # report finding #8): preserve week2 if that's actually
+                # (freshly-confirmed) active — see resolve_resume_program().
+                resume_program = await resolve_resume_program(
+                    self.coordinator.api, self._plant_id, self._circuit_path, self._circuit
+                )
                 await self.coordinator.async_control_and_refresh(
                     self.coordinator.api.reset_circuit(
                         self._plant_id,
                         self._circuit_path,
+                        program=resume_program,
                     ),
+                    plant_id=self._plant_id,
                     circuit_path=self._circuit_path,
                     mode_override=OPERATION_MODE_REGULAR,
                 )
@@ -209,14 +287,35 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
             raise HomeAssistantError(f"Failed to set HVAC mode: {err}") from err
 
     async def async_set_temperature(self, **kwargs) -> None:
-        """Set new target temperature via temporary change."""
+        """Set new target temperature via temporary change.
+
+        Independent audit finding (2026-09, HVC-007): _attr_min_temp/
+        _attr_max_temp were declared but never enforced here — any value
+        (including out-of-range or non-finite) went straight to the API.
+        Clamped, not rejected, to match this codebase's existing convention
+        for out-of-range input (see clamp_hv_air_volume in fan.py,
+        clamp_weather_impact_* in number.py) rather than introducing a
+        different failure mode just for this entity.
+        """
         temperature = kwargs.get("temperature")
         if temperature is None:
             return
+        try:
+            temperature = clamp_temperature(
+                float(temperature), self._attr_min_temp, self._attr_max_temp
+            )
+        except (ValueError, TypeError) as err:
+            raise HomeAssistantError(f"Invalid target temperature: {temperature!r}") from err
         duration = self._entry.options.get(
             CONF_OVERRIDE_DURATION,
             DEFAULT_OVERRIDE_DURATION,
         )
+        # Independent audit finding (2026-09, fourth round, HVC-007): found
+        # a second occurrence of the same gap fixed in fan.py's
+        # _override_duration — validated here too, rather than trusting an
+        # out-of-band persisted value to reach the API unchanged.
+        if duration not in VALID_OVERRIDE_DURATIONS:
+            duration = DEFAULT_OVERRIDE_DURATION
         try:
             await self.coordinator.async_control_and_refresh(
                 self.coordinator.api.set_temporary_change(
@@ -225,6 +324,7 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
                     value=float(temperature),
                     duration=duration,
                 ),
+                plant_id=self._plant_id,
                 circuit_path=self._circuit_path,
                 mode_override=OPERATION_MODE_REGULAR,
             )

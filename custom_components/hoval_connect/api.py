@@ -143,7 +143,22 @@ class HovalConnectApi:
         # per-plant access token avoid any re-entrant deadlock, because
         # _get_plant_access_token() calls _get_id_token() while holding its own.
         self._id_token_lock = asyncio.Lock()
-        self._pat_lock = asyncio.Lock()
+        # Independent audit finding (2026-09, fourth round, HVC-014): this
+        # used to be ONE global asyncio.Lock() shared across every plant on
+        # the account, not one per plant. A multi-plant account would
+        # serialize plant-access-token acquisition across entirely
+        # unrelated plants — if two plants both need a fresh token at
+        # startup, the second plant's acquisition would wait for the
+        # first's to finish even though they're independent HTTP calls to
+        # independent endpoints. Combined with retries and the coordinator's
+        # 90-second overall timeout, this could meaningfully extend (or in
+        # a bad case, blow) startup for a multi-plant account. Now one lock
+        # per plant_id, created on first use via setdefault() — atomic in
+        # asyncio's single-threaded model (no await between the dict check
+        # and the assignment), so no race in creating a plant's first lock
+        # even if two circuits of the same new plant request one
+        # simultaneously.
+        self._pat_locks: dict[str, asyncio.Lock] = {}
 
     def _sync_post(
         self, url: str, *, data: dict[str, str], headers: dict[str, str]
@@ -253,38 +268,60 @@ class HovalConnectApi:
             return self._id_token
 
     async def _get_plant_access_token(self, plant_id: str) -> str:
-        """Get or refresh the plant access token (double-checked locking)."""
+        """Get or refresh the plant access token (double-checked locking).
+
+        Independent audit finding (2026-09, "more" report, finding #6): a
+        401 here used to immediately raise HovalAuthError ("credentials are
+        bad"), even though the main request path (_request()) treats the
+        identical signal — a 401 — as "the bearer token simply expired,
+        refresh it and retry", not a credentials problem. Those are
+        genuinely different situations, but this method previously could
+        not tell them apart, so ANY 401 fetching the plant token was always
+        treated as the worse one, surfacing as an unnecessary config-entry
+        auth failure instead of recovering automatically like the main path
+        already does. At most one retry, mirroring that same path's own
+        single-refresh semantics (see _request()'s docstring in this file).
+        """
         cached = self._pat_cache.get(plant_id)
         if cached and time.time() < cached[1]:
             return cached[0]
 
-        async with self._pat_lock:
+        async with self._pat_locks.setdefault(plant_id, asyncio.Lock()):
             # Re-check inside the lock in case a concurrent caller refreshed it.
             cached = self._pat_cache.get(plant_id)
             if cached and time.time() < cached[1]:
                 return cached[0]
 
-            id_token = await self._get_id_token()
-            try:
-                resp = await self._hass.async_add_executor_job(
-                    functools.partial(
-                        self._sync_get,
-                        f"{BASE_URL}/v1/plants/{plant_id}/settings",
-                        headers={
-                            "Authorization": f"Bearer {id_token}",
-                            "User-Agent": USER_AGENT,
-                        },
+            for attempt in range(2):
+                id_token = await self._get_id_token()
+                try:
+                    resp = await self._hass.async_add_executor_job(
+                        functools.partial(
+                            self._sync_get,
+                            f"{BASE_URL}/v1/plants/{plant_id}/settings",
+                            headers={
+                                "Authorization": f"Bearer {id_token}",
+                                "User-Agent": USER_AGENT,
+                            },
+                        )
                     )
-                )
-                if resp.status_code == 401:
-                    self._id_token = None
-                    raise HovalAuthError("ID token rejected")
-                resp.raise_for_status()
-                data = resp.json()
-            except (HovalAuthError, HovalApiError):
-                raise
-            except (requests.exceptions.RequestException, TimeoutError) as err:
-                raise HovalApiError(f"Connection error fetching plant token: {err}") from err
+                    if resp.status_code == 401:
+                        self._id_token = None
+                        if attempt == 0:
+                            _LOGGER.debug(
+                                "ID token rejected while fetching plant access "
+                                "token for %s; refreshing and retrying once.",
+                                plant_id,
+                            )
+                            continue
+                        raise HovalAuthError("ID token rejected")
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break
+                except (HovalAuthError, HovalApiError):
+                    raise
+                except (requests.exceptions.RequestException, TimeoutError) as err:
+                    raise HovalApiError(f"Connection error fetching plant token: {err}") from err
 
             if not isinstance(data, dict) or "token" not in data:
                 keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
@@ -317,16 +354,66 @@ class HovalConnectApi:
         plant_id: str | None = None,
         params: dict[str, str] | None = None,
         json_data: Any = None,
-        _retry: bool = True,
     ) -> Any:
-        """Make an authenticated API request with token retry and transient error backoff."""
+        """Make an authenticated API request with token retry and transient error backoff.
+
+        Independent audit finding (2026-09, HVC-ICS-006 / HVC-ICS-007): this
+        method used to recurse into a fresh `_request()` call on a 401 (via
+        a `_retry` flag), which started a BRAND NEW `for attempt in
+        range(_MAX_RETRIES)` loop — so a 401 followed by one transient
+        error could produce up to 3 total HTTP attempts against a budget
+        `_MAX_RETRIES`'s own comment documents as 2 TOTAL (HVC-ICS-006).
+        Separately, `headers = await self._headers(plant_id)` used to run
+        OUTSIDE this method's retry try/except entirely, so a transient
+        network blip while acquiring/refreshing the ID token or
+        plant-access-token (both real network calls) bypassed this loop's
+        retry/backoff completely and failed on the very first hiccup —
+        the opposite failure mode from the 401 one (HVC-ICS-007).
+
+        Fixed by removing the recursive self-call: a 401 now does
+        `continue` within this same loop instead, so one shared `attempt`
+        counter governs the 401-triggered refresh and any transient-error
+        retries together, capping total HTTP attempts at `_MAX_RETRIES` no
+        matter which kind of failure occurs first. Header acquisition now
+        has its own try/except inside the same loop, sharing the same
+        retry budget and exponential backoff as the main request — a
+        genuinely bad credential (`HovalAuthError`) still fails immediately
+        without wasting a retry on something retrying can't fix, but a
+        transient connection problem while fetching a token
+        (`HovalApiError`) is now retried like any other transient failure.
+        """
         url = f"{BASE_URL}{path}"
+        # At most one 401-triggered token refresh is attempted per call —
+        # matches the old `_retry=False` guard's intent (don't loop forever
+        # refreshing a token that keeps getting rejected), just enforced
+        # within a single shared loop instead of via recursion.
+        token_refreshed = False
 
         for attempt in range(_MAX_RETRIES):
-            # Rebuild headers on every attempt so a token that expires mid-retry
-            # cycle is refreshed automatically rather than sending a stale bearer
-            # token that will be rejected with 401.
-            headers = await self._headers(plant_id)
+            try:
+                # Rebuild headers on every attempt so a token that expires
+                # mid-retry cycle is refreshed automatically rather than
+                # sending a stale bearer token that will be rejected with 401.
+                headers = await self._headers(plant_id)
+            except HovalAuthError:
+                raise  # genuinely bad credentials — retrying will not help
+            except HovalApiError as err:
+                if attempt < _MAX_RETRIES - 1:
+                    delay = _RETRY_BASE_DELAY * (2**attempt)
+                    _LOGGER.warning(
+                        "Transient error acquiring auth headers for %s %s, "
+                        "retrying in %.1fs (%d/%d): %s",
+                        method,
+                        path,
+                        delay,
+                        attempt + 1,
+                        _MAX_RETRIES,
+                        err,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+
             try:
                 resp = await self._hass.async_add_executor_job(
                     functools.partial(
@@ -343,16 +430,10 @@ class HovalConnectApi:
                     self._id_token = None
                     if plant_id:
                         self._pat_cache.pop(plant_id, None)
-                    if _retry:
+                    if not token_refreshed and attempt < _MAX_RETRIES - 1:
+                        token_refreshed = True
                         _LOGGER.debug("Token expired, refreshing and retrying")
-                        return await self._request(
-                            method,
-                            path,
-                            plant_id,
-                            params,
-                            json_data,
-                            _retry=False,
-                        )
+                        continue
                     raise HovalAuthError("Authentication failed")
                 if resp.status_code == 403:
                     # Not retried: unlike 401 (expired token), a 403 has not
@@ -449,6 +530,18 @@ class HovalConnectApi:
           - A plain list (old API shape) — returned as-is.
           - A Spring/Page wrapper {"content": [...], "last": bool, ...} — the
             integration iterates all pages and returns a flat list.
+
+        Fail-closed regression guard (independent audit finding, 2026-09,
+        "more" report, finding #2): a dict response with no "content" key
+        at all used to silently become [] via `.get("content", [])` — the
+        same class of bug already fixed for get_circuits() (see that
+        method's docstring), just missed here. Since this feeds
+        _fetch_all_data()/_health_check() directly, a malformed-but-HTTP-200
+        response could silently wipe every known plant (see the fix in
+        those two methods for the second half of this same failure mode).
+        Any dict without a list "content" key, or any non-list/non-dict
+        response, now raises HovalApiError instead of quietly returning
+        fewer plants than actually exist.
         """
         all_plants: list[dict[str, Any]] = []
         page = 0
@@ -459,31 +552,40 @@ class HovalConnectApi:
             if isinstance(result, list):
                 # Old (pre-pagination) API shape: plain list, no further pages.
                 return result
-            if not isinstance(result, dict):
-                _LOGGER.warning(
-                    "Unexpected get_plants response type %s on page %d; aborting pagination",
-                    type(result).__name__,
-                    page,
+            if not isinstance(result, dict) or not isinstance(result.get("content"), list):
+                raise HovalApiError(
+                    f"Unexpected get_plants response shape on page {page}: "
+                    f"{type(result).__name__} (expected a list, or a dict with a list "
+                    "'content' key)"
                 )
-                break
-            content = result.get("content", [])
-            if not isinstance(content, list):
-                _LOGGER.warning("get_plants 'content' is not a list (%s); stopping", type(content))
-                break
+            content = result["content"]
             all_plants.extend(content)
             # "last" is False when more pages exist; True (or absent) means done.
             if result.get("last", True) or not content:
                 break
             page += 1
             if page >= _MAX_PLANT_PAGES:
-                _LOGGER.warning(
-                    "get_plants pagination exceeded %d pages (%d plants so far); "
-                    "truncating — the cloud keeps reporting more pages, which is "
-                    "almost certainly an upstream fault",
-                    _MAX_PLANT_PAGES,
-                    len(all_plants),
+                # Independent audit finding (2026-09, fourth round,
+                # HVC-013): this used to log a warning and `break`,
+                # returning the PARTIAL list collected so far as if it were
+                # a complete, successful result — converting a detected
+                # upstream pagination fault (the log message's own words)
+                # into apparently-successful partial account topology. The
+                # coordinator would have no way to tell "this account
+                # genuinely has this many plants" from "the cloud kept
+                # paginating forever and we gave up partway", and could
+                # believe the omitted plants simply don't exist. Raises
+                # instead — inconsistent with every other place in this
+                # method that already fails closed on a detected anomaly
+                # (the response-shape check above), which this one path had
+                # been missed for.
+                raise HovalApiError(
+                    f"get_plants pagination exceeded {_MAX_PLANT_PAGES} pages "
+                    f"({len(all_plants)} plants collected before giving up) — "
+                    "the cloud kept reporting more pages available, which is "
+                    "almost certainly an upstream fault. Refusing to return "
+                    "partial account topology."
                 )
-                break
         return all_plants
 
     async def get_plant_settings(self, plant_id: str) -> dict[str, Any]:
@@ -499,15 +601,32 @@ class HovalConnectApi:
         The v3 endpoint may return either a plain list or a paginated wrapper
         {"content": [...], ...}. Both shapes are normalised to a list here so
         the coordinator always receives a plain list.
+
+        Fail-closed regression guard (independent audit finding, 2026-09):
+        a response of an unrecognised shape — a dict with no "content" key,
+        a bare string, null, a number — used to silently normalise to [],
+        which the coordinator then treated as "this plant genuinely has no
+        circuits" rather than "the API returned something we don't
+        understand". Under v0.24.0's frequent polling that self-corrected
+        within the next cycle; under v1.0.0 (circuits fetched once at
+        startup, then only after a write) a single bad response during
+        startup could leave every circuit entity missing until a restart.
+        Any shape other than a plain list, or a dict that actually has a
+        list "content" key, now raises HovalApiError instead.
         """
         result = await self._request("GET", f"/v3/plants/{plant_id}/circuits", plant_id=plant_id)
-        if isinstance(result, dict):
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict) and isinstance(result.get("content"), list):
             _LOGGER.debug(
                 "get_circuits returned paginated wrapper for plant %s; extracting 'content'",
                 plant_id,
             )
-            return result.get("content", [])
-        return result if isinstance(result, list) else []
+            return result["content"]
+        raise HovalApiError(
+            f"Unexpected circuits response shape for plant {plant_id}: "
+            f"{type(result).__name__} (expected a list, or a dict with a list 'content' key)"
+        )
 
     async def get_programs(self, plant_id: str, circuit_path: str) -> Any:
         """Get time programs for a circuit."""
@@ -517,73 +636,12 @@ class HovalConnectApi:
             plant_id=plant_id,
         )
 
-    async def get_live_values(
-        self, plant_id: str, circuit_path: str, circuit_type: str
-    ) -> list[dict[str, str]]:
-        """Get live sensor values for a circuit.
-
-        The endpoint returns either a plain list of {"key": ..., "value": ...}
-        objects or (after Hoval's May 2026 pagination enforcement) a wrapper
-        {"content": [...], ...}. Both shapes are normalised to a list here.
-        """
-        result = await self._request(
-            "GET",
-            f"/v3/api/statistics/live-values/{plant_id}",
-            plant_id=plant_id,
-            params={"circuitPath": circuit_path, "circuitType": circuit_type},
-        )
-        if isinstance(result, dict):
-            _LOGGER.debug(
-                "get_live_values returned paginated wrapper for circuit %s; extracting 'content'",
-                circuit_path,
-            )
-            return result.get("content", [])
-        return result if isinstance(result, list) else []
-
-    async def get_events(self, plant_id: str) -> list[dict[str, Any]]:
-        """Get plant error events.
-
-        Normalised to a plain list, mirroring get_circuits()/get_live_values():
-        Hoval's May 2026 pagination enforcement wrapped several list endpoints
-        in {"content": [...], ...}. The events endpoints were not observed to
-        change, but before v0.21.1 this method was the only list endpoint NOT
-        hardened against the wrapper — and a wrapped response reached list
-        slicing in the coordinator and failed the entire poll (audit finding
-        F2). Any non-list, non-wrapper shape degrades to [].
-        """
-        result = await self._request("GET", f"/v1/plant-events/{plant_id}", plant_id=plant_id)
-        if isinstance(result, dict):
-            _LOGGER.debug(
-                "get_events returned paginated wrapper for plant %s; extracting 'content'",
-                plant_id,
-            )
-            content = result.get("content", [])
-            return content if isinstance(content, list) else []
-        return result if isinstance(result, list) else []
-
-    async def get_latest_event(self, plant_id: str) -> dict[str, Any]:
-        """Get latest plant event.
-
-        Always returns a dict; {} means "no event available". If the cloud ever
-        wraps this endpoint in the May 2026 pagination shape, the first content
-        element is returned so callers keep receiving a single PlantEventDTO
-        (audit finding F2 — shape drift must not propagate to the coordinator).
-        """
-        result = await self._request(
-            "GET", f"/v1/plant-events/latest/{plant_id}", plant_id=plant_id
-        )
-        if isinstance(result, dict) and isinstance(result.get("content"), list):
-            _LOGGER.debug(
-                "get_latest_event returned paginated wrapper for plant %s; taking first element",
-                plant_id,
-            )
-            content = result["content"]
-            return content[0] if content and isinstance(content[0], dict) else {}
-        return result if isinstance(result, dict) else {}
-
-    async def get_weather(self, plant_id: str) -> list[dict[str, Any]]:
-        """Get weather forecast for plant location."""
-        return await self._request("GET", f"/v2/api/weather/forecast/{plant_id}", plant_id=plant_id)
+    # v1.0.0 removed get_live_values(), get_events(), get_latest_event(), and
+    # get_weather() — pure telemetry endpoints with no write dependency,
+    # never called by coordinator.py once it stopped polling telemetry on a
+    # schedule (a separate CAN-bus HACS integration covers that data now).
+    # See docs/audit-v1.0.0.md. If a future release needs one of these back,
+    # the previous implementations are in git history / v0.24.0's api.py.
 
     async def get_circuit_settings(self, plant_id: str, circuit_path: str) -> dict[str, Any]:
         """Get circuit settings (currently: circuitName + weatherImpact).

@@ -36,12 +36,12 @@
         "data": {
           "turn_on_mode": "Turn-on mode",
           "override_duration": "Temporary override duration",
-          "scan_interval": "Polling interval"
+          "health_check_interval": "Cloud health-check interval (seconds)"
         },
         "data_description": {
           "turn_on_mode": "What happens when the fan is turned on from standby.",
           "override_duration": "How long a manual fan speed change lasts before the time program resumes.",
-          "scan_interval": "How often to poll the Hoval API for updates."
+          "health_check_interval": "How often to check that the Hoval cloud API is reachable. Does not affect how quickly writes (program changes, temperature changes) take effect."
         }
       }
     }
@@ -53,176 +53,9 @@
       },
       "plant_error": {
         "name": "Error"
-      }
-    },
-    "sensor": {
-      "outside_temperature": {
-        "name": "Outside temperature"
       },
-      "exhaust_temperature": {
-        "name": "Exhaust temperature"
-      },
-      "air_volume": {
-        "name": "Air volume"
-      },
-      "humidity_actual": {
-        "name": "Humidity"
-      },
-      "humidity_target": {
-        "name": "Target humidity"
-      },
-      "operation_mode": {
-        "name": "Operation mode"
-      },
-      "active_week_program": {
-        "name": "Week program"
-      },
-      "active_day_program": {
-        "name": "Day program"
-      },
-      "program_air_volume": {
-        "name": "Program air volume"
-      },
-      "latest_event_type": {
-        "name": "Latest event type"
-      },
-      "latest_event_message": {
-        "name": "Latest event"
-      },
-      "latest_event_time": {
-        "name": "Latest event time"
-      },
-      "active_events": {
-        "name": "Active events"
-      },
-      "weather_condition": {
-        "name": "Weather"
-      },
-      "weather_temperature": {
-        "name": "Forecast temperature"
-      },
-      "room_temp_actual": {
-        "name": "Room temperature"
-      },
-      "flow_temp_actual": {
-        "name": "Flow temperature"
-      },
-      "flow_temp_target": {
-        "name": "Flow temperature setpoint"
-      },
-      "room_temp_target": {
-        "name": "Room temperature setpoint"
-      },
-      "boiler_temp_actual": {
-        "name": "Heat generator temperature"
-      },
-      "boiler_temp_target": {
-        "name": "Heat generator setpoint"
-      },
-      "return_temperature": {
-        "name": "Return temperature"
-      },
-      "operating_hours": {
-        "name": "Operating hours"
-      },
-      "operating_hours_over_50": {
-        "name": "Operating hours >50%"
-      },
-      "operating_hours_el_heater": {
-        "name": "Electric auxiliary heater operating hours"
-      },
-      "operation_cycles_el_heater": {
-        "name": "Electric auxiliary heater switching cycles"
-      },
-      "heat_amount_el_heater": {
-        "name": "Electric auxiliary heater heat produced"
-      },
-      "energy_el_heater": {
-        "name": "Electric auxiliary heater energy consumed"
-      },
-      "el_heater_active": {
-        "name": "Electric auxiliary heater active"
-      },
-      "operation_cycles": {
-        "name": "Switching cycles"
-      },
-      "heat_amount": {
-        "name": "Heat produced"
-      },
-      "total_energy": {
-        "name": "Electrical energy consumed"
-      },
-      "ww_temp_target": {
-        "name": "Hot water setpoint"
-      },
-      "ww_temp_top": {
-        "name": "Hot water temperature top"
-      },
-      "ww_temp_bottom": {
-        "name": "Hot water temperature bottom"
-      },
-      "circuit_status_bl": {
-        "name": "Heat generator status"
-      },
-      "circuit_status_hk": {
-        "name": "Heating circuit status"
-      },
-      "circuit_status_ww": {
-        "name": "Hot water status"
-      },
-      "api_last_success": {
-        "name": "API last success"
-      },
-      "api_last_error_time": {
-        "name": "API last error time"
-      },
-      "api_last_error": {
-        "name": "API last error"
-      },
-      "api_last_error_type": {
-        "name": "API last error type"
-      },
-      "api_consecutive_failures": {
-        "name": "API consecutive failures"
-      },
-      "api_total_failures": {
-        "name": "API total failures"
-      },
-      "api_auth_failures": {
-        "name": "API authentication failures"
-      },
-      "api_total_polls": {
-        "name": "API total polls"
-      },
-      "api_poll_latency": {
-        "name": "API poll latency (last)"
-      },
-      "api_ema_latency": {
-        "name": "API poll latency (EMA)"
-      },
-      "api_avg_latency": {
-        "name": "API poll latency (avg)"
-      },
-      "api_p95_latency": {
-        "name": "API poll latency (p95)"
-      },
-      "api_failure_rate_1h": {
-        "name": "API failure rate (1 h)"
-      },
-      "api_auth_failure_rate_1h": {
-        "name": "API auth failure rate (1 h)"
-      },
-      "api_availability_1h": {
-        "name": "API availability (1 h)"
-      },
-      "circuit_failure_rate_1h": {
-        "name": "Circuit failure rate (1 h)"
-      },
-      "circuit_availability_1h": {
-        "name": "Circuit availability (1 h)"
-      },
-      "circuit_consecutive_failures": {
-        "name": "Circuit consecutive failures"
+      "cloud_api_problem": {
+        "name": "Cloud API problem"
       }
     },
     "water_heater": {

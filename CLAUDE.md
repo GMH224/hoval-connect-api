@@ -133,6 +133,204 @@ HK (heating), BL (boiler), WW (warm water), FRIWA (fresh water), HV (ventilation
 
 ## Changelog
 
+### v1.0.0 — Architecture change: no more scheduled telemetry polling
+
+**Read this if you're wondering why there's no sensor.py, why the
+coordinator barely calls anything on a schedule, or why there's no
+scan_interval option anymore.** This was a deliberate, user-requested
+redesign, not incremental cleanup. Full rationale in
+`docs/audit-v1.0.0.md`. The user runs a separate CAN-bus-based HACS
+integration that already covers all telemetry (a strict superset of what
+this integration's cloud polling provided); this integration now exists
+purely for the handful of controls the CAN-bus integration can't reach
+(program selection, weatherImpact Eco/Comfort sliders), plus knowing if
+the cloud API itself is down.
+
+- **Circuit/program/settings data — the control surface — is fetched once
+  at startup and again only after a write, never on a schedule.**
+  `_async_update_data()` now dispatches between `_fetch_all_data()` (full,
+  but telemetry-trimmed — see next point) and the new `_health_check()`
+  based on two flags: `_did_initial_discovery` (set once) and
+  `_pending_full_refresh` (set by `async_control_and_refresh()` /
+  `async_set_weather_impact()` right before requesting a post-write
+  refresh). **If you add a new write action, make sure it goes through one
+  of those two methods** — anything that writes without setting
+  `_pending_full_refresh` will have its effect invisible until the next
+  write elsewhere triggers a refresh.
+- **`get_live_values()`, `get_events()`, `get_latest_event()`,
+  `get_weather()` are gone from `api.py` entirely** — not dead code kept
+  "just in case", actually deleted, since v0.24.0's git history / the
+  v0.24.0 zip has the implementations if a future release ever needs one
+  back.
+- **`sensor.py` is deleted.** Every entity in it depended on the telemetry
+  above with zero write capability. Don't recreate it without also
+  recreating a data source for it — there isn't one anymore.
+- **The only recurring scheduled call left is `_health_check()`**, every
+  `HEALTH_CHECK_INTERVAL` (30 min, a fixed constant now — NOT
+  user-configurable; the old `CONF_SCAN_INTERVAL` options-flow field and
+  its whole v0.19.0/v0.23.0 bug-fix history are moot). It does exactly one
+  thing: `get_plants()`. Resist the urge to have it do more "while we're
+  at it" — that's exactly the drift that made the old coordinator heavy.
+- **New `last_successful_contact_at`** on `HovalConnectionHealth`, updated
+  by both a successful health check AND a successful write (see
+  `record_successful_contact()`, called from `record_poll_success()` and
+  directly inside the two write methods). Drives the new
+  `binary_sensor.*_cloud_api_problem` diagnostic (2-hour threshold, fixed
+  constant `CLOUD_API_PROBLEM_THRESHOLD`).
+- **Confirmed unaffected, on the record**: the user's actual
+  automation-critical entities —
+  `select.hoval_bodenheizung_program`,
+  `number.heating_hoval_bodenheizung_weather_based_control_outside_temperature`,
+  `number.heating_hoval_bodenheizung_weather_based_control_solar_radiation`,
+  `binary_sensor.hoval_e_..._error`,
+  `select.hoval_warmwasser_program`,
+  `water_heater.hoval_warmwasser_hot_water` (incl. its `reset_ww_boost`
+  action) — build their unique_ids from `plant_id`/`circuit_path`, which
+  this release never touches. `climate.py` and `fan.py` are untouched
+  files, not just "unaffected" — I did not edit them at all, on purpose,
+  since they still work for control with `live_values` simply always
+  empty now.
+- **Gotcha if you touch `_health_check()` again**: it must read
+  `self.data.plants` (the coordinator's own attribute, set by
+  `DataUpdateCoordinator.async_refresh()` after `_async_update_data()`
+  returns) to carry circuits forward — NOT re-fetch them. If you're
+  calling `_async_update_data()`/`_health_check()` directly in a test
+  without going through `async_refresh()`, you must set `coordinator.data`
+  yourself between calls or `self.data` will still be `None` — see
+  `TestHealthCheckDispatch` in `tests/test_coordinator_fetch.py` for the
+  pattern.
+- `HEALTH_STORAGE_VERSION` bumped 1 → 2 (schema changed: removed
+  per-circuit health tracking, added `last_successful_contact_at`).
+  **Correction to what this section originally said**: HA's `Store` helper
+  does NOT discard a version-mismatched file automatically — verified
+  against its actual source, not assumed. Without the try/except now in
+  `async_setup_entry()` (added specifically for this), a version bump like
+  this one would fail the whole integration's setup on the first run after
+  upgrading OR rolling back. See docs/audit-v1.0.0.md §8 if you're touching
+  `HEALTH_STORAGE_VERSION` again.
+
+**Pre-deployment audit response (before this release was ever installed):**
+an independent code audit plus a separately-reported live production bug
+were both reviewed and fixed before deployment — see
+`docs/audit-v1.0.0.md` §§9-10 for full detail on each. Highlights for
+future maintainers:
+- Every cache/override in this file (`_mode_override`, `_program_cache`,
+  `_settings_cache`, `_weather_impact_override`) is now keyed by
+  `(plant_id, circuit_path)`, not `circuit_path` alone — circuit paths are
+  only unique within a plant. `async_control_and_refresh()`'s parameters
+  are keyword-only after `coro` on purpose, so a call site missing
+  `plant_id` fails loudly instead of silently misrouting.
+- `_pending_full_refresh` became `_pending_full_refresh_since` (a
+  timestamp, not a bool) and `_mode_override.clear()` became a
+  timestamp-scoped filter — both exist to stop an in-flight refresh's
+  completion from erasing a write that landed *during* that refresh. If
+  you touch either mechanism again, re-read §9.3 of the audit doc first.
+- `async_set_weather_impact` deliberately does NOT optimistically refresh
+  `_settings_cache` after a write anymore — doing so silently prevented
+  the follow-up verification refresh from ever actually re-fetching. See
+  §10 of the audit doc before reintroducing anything like it.
+- `get_circuits()` in `api.py` now raises on an unrecognised response
+  shape instead of returning `[]` — don't revert this without re-reading
+  why (§9.1): under this release's fetch-once-at-startup model, "zero
+  circuits" and "malformed response" used to be indistinguishable.
+
+**Second independent audit round (before deployment, same v1.0.0):** a
+follow-up review scoped to production code only found 8 more real bugs,
+fixed — see `docs/audit-v1.0.0.md` §11 for full detail. Gotchas for future
+maintainers:
+- `_health_check()` now does a topology-change check (new/newly-online
+  plant) before deciding to stay minimal — if you touch this method again,
+  re-read §11.1 first; don't remove that check without understanding why a
+  plant could otherwise never get entities.
+- `api._request()` no longer recurses on a 401 — it `continue`s within the
+  same loop instead, and header acquisition is now inside the retry
+  try/except too. If you're tempted to "simplify" this back to a separate
+  recursive call, re-read §11.6 — that's the exact shape of the bug that
+  was there before.
+- `water_heater.py`'s `_attr_operation_list` deliberately does NOT include
+  `high_demand` — `current_operation` can still report that state (it's
+  real and observable), it's just not a valid thing to *select*, since
+  there was never a real implementation for selecting it. Don't add it
+  back to the list without also giving `async_set_operation_mode` a real
+  way to start a boost (it doesn't receive a numeric value, so this isn't
+  a small change).
+- `resolve_resume_program()` exists so "resume the schedule" doesn't
+  silently force week1 over an active week2 — used by fan/climate/
+  water-heater's reset-to-schedule actions.
+- HVC-ICS-009 (v3 vs v4 temporary-change API) was deliberately NOT acted
+  on — no live evidence v3 has stopped working. Don't switch to v4
+  preemptively; watch for an actual v3 failure first.
+
+**Third independent audit round + configurable health-check interval
+(before deployment, same v1.0.0):** 12 more findings fixed — see
+`docs/audit-v1.0.0.md` §13 for full detail. Then, at the user's explicit
+request (not an audit finding), the health-check interval became
+configurable again as `CONF_HEALTH_CHECK_INTERVAL` (§14) — a narrower
+setting than the old, fully-removed `CONF_SCAN_INTERVAL`; it only affects
+the reachability-check cadence, never circuit/program/settings data.
+Gotchas for future maintainers:
+- `get_plants()` now raises on an unrecognised shape, matching
+  `get_circuits()` — if you add a THIRD list-returning endpoint later,
+  give it the same treatment from the start; don't wait for an audit to
+  notice the sibling method was missed.
+- `_guard_against_empty_plants()` requires 2 consecutive empty responses
+  before accepting a wipe to zero plants. If you're debugging "why didn't
+  my test-account-with-zero-plants scenario update immediately", this is
+  why — call `_async_update_data()` twice, or check
+  `_consecutive_empty_plants` directly.
+- `async_set_weather_impact()` does a live GET when its settings cache is
+  stale — don't reintroduce optimistically pre-populating that cache after
+  a write (see §10's own gotcha about this) to "avoid the extra call"; that
+  exact optimization was the root of the bug this section exists to fix.
+- `_get_plant_access_token()` has its OWN small retry loop, separate from
+  `_request()`'s — this is intentional, not an oversight, because
+  `_headers()` calls this method and is itself called from inside
+  `_request()`'s loop; reusing that loop here would be circular.
+- Every post-write background task must go through `_create_tracked_task()`,
+  never a bare `hass.async_create_task()` — `async_shutdown()` can only
+  cancel what it knows about.
+- `resolve_program_display_names()` in `select.py` is a standalone pure
+  function specifically so its disambiguation logic stays unit-testable —
+  don't inline it back into the entity class.
+- `CLOUD_API_PROBLEM_THRESHOLD` does NOT scale with
+  `CONF_HEALTH_CHECK_INTERVAL` — that's deliberate (see §14), not a gap.
+
+**Fourth independent audit round (before deployment, same v1.0.0):** 18
+more findings fixed, 2 rejected after verification, 2 deferred by explicit
+agreement — see `docs/audit-v1.0.0.md` §16 for full detail. Gotchas for
+future maintainers:
+- **The two deferred findings are real, not dismissed.** HVC-011 (cancelling
+  an in-flight write does not reliably stop the underlying blocking HTTP
+  call — inherent `ThreadPoolExecutor` behavior, not a bug in this code)
+  needs a genuine per-circuit write-serialization redesign, not a patch.
+  HVC-018 (`week1OrWeek2Active`, a real OpenAPI field that might improve
+  `resolve_resume_program()` further) needs live validation of its exact
+  semantics before use — don't implement either speculatively.
+- `create_tracked_task()` (renamed from the private `_create_tracked_task`)
+  now returns the task and is used by `fan.py`/`number.py` for their
+  debounce tasks too, not just the coordinator's own refresh tasks — if
+  you add a new kind of fire-and-forget task anywhere, route it through
+  this or it won't be cancelled by `async_shutdown()`.
+- `climate.py`'s HEAT mode now calls `set_program(..., "constant")` —
+  don't collapse it back into AUTO's branch; `hvac_mode`'s read side was
+  specifically designed to agree with this.
+- `_pat_locks` is a dict now, not a single lock — don't "simplify" it back
+  to one shared `asyncio.Lock()`, that's exactly HVC-014.
+- `_coerce_finite_number()`, `_clamp_if_valid_number()`, and the
+  finite/non-negative checks added to `HovalConnectionHealth.restore_from_store()`
+  all exist because Python's `json` module parses `NaN`/`Infinity` by
+  default — this is a recurring, real risk in this codebase, not a
+  one-off. Any new numeric field read from the API or from persisted
+  storage should go through similar validation from the start.
+- HVC-007 was found in `fan.py`, then found AGAIN in `climate.py` while
+  fixing it. When you find a validation gap in one entity file, grep for
+  the same pattern (`CONF_OVERRIDE_DURATION`, `CONF_TURN_ON_MODE`, etc.)
+  across every other file before considering it fixed.
+- Entity/device-registry cleanup for removed circuits, and live device-name
+  sync on rename, are deliberately NOT implemented (see README's Known
+  Limitations) — consistent with the existing "static hardware" design.
+  Don't "fix" this without revisiting that design decision explicitly.
+
 ### v0.24.0 — Transport rewrite: aiohttp -> requests-in-executor
 
 **This is the important one if you're reading this file to understand why

@@ -44,21 +44,11 @@ Plants and circuits are discovered automatically from your account.
 - Config-category entities (hidden from the main dashboard by default; find
   them under the circuit device's entity list)
 
-**Sensor entities** (per circuit, filtered by type):
-- **HV:** Outside temperature, exhaust temperature, air volume, humidity (actual/target), program air volume
-- **HK:** Outside temperature, flow temperature (actual/target), room temperature setpoint
-- **BL:** Heat generator temperature (actual/target), return temperature, operating hours, operating hours >50%, switching cycles, heat produced, electrical energy consumed
-- **WW:** Hot water setpoint, tank temperature top (SF1), tank temperature bottom (SF2)
-- **All:** Operation mode, active week program, active day program
-
-**Plant-level sensors:**
-- Weather condition and forecast temperature
-- Latest event type, message, and timestamp
-- Active event count
-
 **Binary sensors** (per plant):
-- Online/offline (connectivity class)
-- Error status (problem class, detects blocking/locking events)
+- Error status (problem class, detects any circuit reporting an active error)
+- **Cloud API problem** (diagnostic category): on once more than 2 hours have
+  passed with no successful contact of any kind (a scheduled health check or
+  a write) — see "Since v1.0.0" below
 
 **Diagnostics:**
 - Full diagnostic data export with automatic PII redaction (tokens, credentials, plant IDs)
@@ -66,36 +56,52 @@ Plants and circuits are discovered automatically from your account.
 **Options** (configurable per integration entry):
 - Turn-on mode: resume / week1 / week2
 - Temporary override duration: 4 hours / until midnight
-- Polling interval (default: 60s)
+- Cloud health-check interval: 10 / 15 / 30 (default) / 60 / 120 minutes — see "Since v1.0.0" below for what this does and doesn't affect
 
 Since **v2.2.0**, saving options reloads the integration (a few seconds of
 entity unavailability) instead of adjusting the poll timer in place. This is
 the lifecycle Home Assistant now requires; it also means every option takes
 effect immediately and identically.
 
+**Since v1.0.0: no telemetry polling, just a configurable reachability check.**
+This integration no longer polls live values, events, or weather forecasts
+on any schedule — it's designed to run alongside a telemetry source (e.g. a
+CAN-bus-based integration) and focus purely on the controls the cloud API
+uniquely offers (program selection, weather-based-control sliders). Circuit/
+program/settings data is fetched once at startup and again only after a
+write, never on a schedule — the health-check interval option above has no
+effect on that at all. The only thing that option controls is how often a
+minimal check (nothing more than confirming the cloud API is still
+reachable) runs, which in turn controls how quickly the "Cloud API problem"
+diagnostic can notice an outage. If you want temperature/energy/event
+sensors, get them from another source — this integration doesn't provide
+them anymore. See `docs/audit-v1.0.0.md` for the full rationale and what
+changed.
+
 **Under the hood:**
 - 2-step token management (ID token + Plant Access Token) with TTL caching and auto-refresh
-- Skips API calls when plant is offline, invalidates token cache on reconnect
-- Parallel API fetches for circuits, live values, programs, events, and weather
-- Program cache (5min TTL) reduces API calls
-- Dynamic entity discovery — new circuits added without restart
+- Circuit/program/settings data (the control surface) is fetched once at startup and again only after a write — never on a recurring schedule
+- The only recurring scheduled call is a minimal health check (one `GET /api/my-plants`) — every 30 minutes by default, configurable in Options — driving the "Cloud API problem" diagnostic sensor above
+- Program cache (5min TTL) reduces API calls during startup/post-write refreshes
 - All circuit reads/writes use the `/v3` API (Hoval removed `/v1` circuit endpoints in April 2026); legacy v1 enum values still get normalized to v3 keys as a fallback
 - Cloud API calls go through `requests` (not Home Assistant's usual `aiohttp`), run via HA's background executor — a deliberate choice made in v0.24.0 after the cloud API started blocking `aiohttp` clients outright; see `docs/audit-v0.24.0.md` if you're curious why
 
 ### Troubleshooting
 
-- **Circuit entities (fan, climate, select, circuit-level sensors) stuck on "unavailable" after upgrade or HA restart** — reload the config entry: *Settings → Devices & Services → Hoval Connect → ⋮ → Reload*. The plant-level entities (weather, events, online status) staying available while every circuit-level entity is unavailable is the giveaway. Fixed in **v0.14.2** (the dispatcher now catches up if the first poll after boot came back without circuits); earlier versions need the manual reload once.
-- **All entities `unavailable`, with `Circuits endpoint failed for plant …` in the log** — the cloud rejected the circuit list call; usually a transient outage. v0.14.0+ surfaces the failure as `unavailable` rather than silently keeping stale values, so wait for the next poll.
+- **Circuit entities (fan, climate, select, number, water heater) stuck on "unavailable" after upgrade or HA restart** — reload the config entry: *Settings → Devices & Services → Hoval Connect → ⋮ → Reload*. The plant-level `binary_sensor.*_error`/`binary_sensor.*_cloud_api_problem` entities staying available while every circuit-level entity is unavailable is the giveaway.
+- **All entities `unavailable`, with `Circuits endpoint failed for plant …` in the log** — the cloud rejected the circuit list call; usually a transient outage. The failure surfaces as `unavailable` rather than silently keeping stale values; since v1.0.0 this can only happen right after startup or right after a write (circuits are no longer polled on a schedule — see "Since v1.0.0" above), so reload the config entry or trigger any write to retry immediately rather than waiting.
 - **Auth keeps failing** — re-trigger the reauth flow from the integration settings; ID-token caching means a stale password is re-tried for ~30 min before the integration prompts.
+- **A plant that was offline, or a newly-added plant, never shows up with entities** — since v1.0.0 the routine health check detects a plant coming online or a brand-new plant appearing and automatically runs a full discovery for it; if this is still stuck, reload the config entry to force one immediately.
 
 ### Known Limitations
 
 - **HV, HK, BL, and WW circuits only.** Solar (SOL), fresh water (FRIWA), and other circuit types are not yet implemented.
-- **BL energy sensors:** Heat produced and electrical energy consumed are in MWh (verified on UltraSource B Compact).
-- **No time program editing.** Time programs can be read but not modified through the integration.
-- **No energy/temperature history.** Historical statistics endpoints are documented but not yet integrated.
+- **No time program editing.** Time programs can be selected (which week/mode is active) but their internal schedule (phase times/values) can't be modified through the integration.
 - **No holiday mode control.**
 - **Single account only.** Each HA instance supports one Hoval Connect account.
+- **No telemetry sensors since v1.0.0.** Temperatures, energy, humidity, and similar live values are no longer polled or exposed by this integration at all — see "Since v1.0.0" above. Get that data from another source (e.g. a CAN-bus-based integration) if you need it.
+- **Static hardware assumption: no hot-swap.** Circuits/plants are discovered once at startup and again after a topology change is detected on a scheduled check (a plant coming online, or a new plant appearing) or a write; a circuit that's permanently *removed* from the account does not get its entity actively cleaned up — it will show as `unavailable` rather than disappearing. Removing it from Home Assistant, if wanted, is a manual step (Settings → Devices & Services → Entities). Consistent with this integration's existing "no hot-swap" design: reload the config entry to force a resync sooner than waiting for the next scheduled check.
+- **Device/circuit names sync on reload, not live.** If a plant or circuit is renamed in the Hoval app while Home Assistant keeps running, the device registry keeps showing the old name until the config entry is reloaded (Settings → Devices & Services → Hoval Connect → ⋮ → Reload) or HA restarts — the same reload boundary already used for options changes.
 
 ### Requirements
 

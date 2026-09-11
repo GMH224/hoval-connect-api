@@ -12,6 +12,7 @@ of view: same inputs, same outputs, same exceptions propagate the same way.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -31,7 +32,6 @@ sys.modules.setdefault("homeassistant.helpers.dispatcher", ha_mock)
 sys.modules.setdefault("homeassistant.util", ha_mock)
 sys.modules.setdefault("homeassistant.util.dt", ha_mock)
 import requests  # noqa: E402
-import voluptuous as vol  # noqa: E402
 
 from custom_components.hoval_connect.api import (  # noqa: E402
     _MAX_RETRIES,
@@ -40,10 +40,7 @@ from custom_components.hoval_connect.api import (  # noqa: E402
     HovalAuthError,
     HovalConnectApi,
 )
-from custom_components.hoval_connect.const import (  # noqa: E402
-    SCAN_INTERVAL_OPTIONS,
-    USER_AGENT,
-)
+from custom_components.hoval_connect.const import USER_AGENT  # noqa: E402
 
 
 class FakeHass:
@@ -108,6 +105,48 @@ def _mock_auth_ok(session: MagicMock, token: str = "token") -> None:
 
 class TestHovalConnectApiAuth:
     """Tests for authentication logic."""
+
+    @pytest.mark.asyncio
+    async def test_pat_locks_are_separate_objects_per_plant(self):
+        """Independent audit finding (2026-09, fourth round, HVC-014): this
+        used to be ONE global asyncio.Lock() shared across every plant —
+        confirms each plant now gets its own distinct Lock instance
+        (created lazily on first use), which is what makes independent
+        parallel acquisition possible at all.
+        """
+        session = _make_session()
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat"}))
+
+        api = _make_api(session)
+        await api._get_plant_access_token("plant-a")
+        await api._get_plant_access_token("plant-b")
+
+        assert "plant-a" in api._pat_locks
+        assert "plant-b" in api._pat_locks
+        assert api._pat_locks["plant-a"] is not api._pat_locks["plant-b"]
+
+    @pytest.mark.asyncio
+    async def test_plant_b_token_acquisition_does_not_wait_on_plant_as_lock(self):
+        """Behavioral confirmation of the fix: holding plant A's lock
+        manually must not block plant B's token acquisition from
+        completing — proving they're genuinely independent locks, not two
+        names for the same one.
+        """
+        session = _make_session()
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-b"}))
+
+        api = _make_api(session)
+        api._pat_locks["plant-a"] = asyncio.Lock()
+        await api._pat_locks["plant-a"].acquire()  # simulate plant A's acquisition in flight
+        try:
+            # Must complete without ever waiting on plant A's (held) lock.
+            token = await asyncio.wait_for(api._get_plant_access_token("plant-b"), timeout=1)
+        finally:
+            api._pat_locks["plant-a"].release()
+
+        assert token == "pat-b"
 
     @pytest.mark.asyncio
     async def test_get_id_token_success(self):
@@ -254,6 +293,47 @@ class TestHovalConnectApiRequest:
         assert headers["User-Agent"] == USER_AGENT
 
     @pytest.mark.asyncio
+    async def test_get_plant_access_token_401_retries_once_with_fresh_id_token(self):
+        """
+        Independent audit finding (2026-09, "more" report, finding #6): a
+        401 here used to immediately raise HovalAuthError, even though the
+        main request path treats the identical signal as "the bearer token
+        expired, refresh and retry" — not a credentials problem. This
+        reproduces that exact recovery: the plant-settings call 401s once
+        (simulating the ID token used for it having expired in the
+        interim), then succeeds after a fresh ID token is fetched.
+        """
+        session = _make_session()
+        _mock_auth_ok(session, token="first-token")
+        session.get = MagicMock(
+            side_effect=[_make_response(401), _make_response(200, {"token": "pat-123"})]
+        )
+
+        api = _make_api(session)
+        token = await api._get_plant_access_token("plant-1")
+
+        assert token == "pat-123"
+        assert session.get.call_count == 2
+        assert session.post.call_count == 2  # ID token fetched fresh for the retry
+
+    @pytest.mark.asyncio
+    async def test_get_plant_access_token_401_twice_raises_auth_error(self):
+        """A second consecutive 401 (even with a freshly-refreshed ID
+        token) is treated as a genuine credentials problem, not retried
+        further — matching the main request path's own single-refresh
+        semantics.
+        """
+        session = _make_session()
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(401))
+
+        api = _make_api(session)
+        with pytest.raises(HovalAuthError, match="ID token rejected"):
+            await api._get_plant_access_token("plant-1")
+
+        assert session.get.call_count == 2  # one retry attempted, then gave up
+
+    @pytest.mark.asyncio
     async def test_request_403_raises_api_error_without_retry(self):
         """
         403 is deliberately NOT retried like 401: refreshing the token has not
@@ -307,6 +387,90 @@ class TestHovalConnectApiRequest:
         api = _make_api(session)
         with pytest.raises(HovalAuthError, match="Authentication failed"):
             await api._request("GET", "/api/test")
+
+    @pytest.mark.asyncio
+    async def test_request_401_then_transient_error_does_not_exceed_total_budget(self):
+        """
+        Independent audit finding (2026-09, HVC-ICS-006): a 401 used to
+        recurse into a brand-new `_request()` call with its own fresh
+        `_MAX_RETRIES`-sized loop, so a 401 followed by a transient error
+        could produce up to 3 total HTTP attempts against a budget
+        documented (see _MAX_RETRIES's own comment) as 2 TOTAL. This
+        reproduces exactly the audit's example sequence — 401, then 500 —
+        and asserts it gives up after exactly _MAX_RETRIES attempts, not
+        _MAX_RETRIES + 1.
+        """
+        session = _make_session()
+        _mock_auth_ok(session)
+        session.request = MagicMock(
+            side_effect=[_make_response(401), _make_response(500)],
+        )
+
+        api = _make_api(session)
+        with (
+            patch("custom_components.hoval_connect.api.asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(HovalApiError, match="HTTP 500"),
+        ):
+            await api._request("GET", "/api/test")
+
+        assert session.request.call_count == _MAX_RETRIES
+
+    @pytest.mark.asyncio
+    async def test_headers_transient_error_is_retried(self):
+        """
+        Independent audit finding (2026-09, HVC-ICS-007): `headers = await
+        self._headers(plant_id)` used to run outside this method's
+        try/except entirely, so a transient network problem while
+        acquiring/refreshing a token bypassed the retry/backoff loop
+        completely and failed on the very first hiccup — the opposite
+        failure mode from HVC-ICS-006. Simulates exactly that: the auth
+        call itself fails once with a connection error, then succeeds.
+        """
+        session = _make_session()
+        session.post = MagicMock(
+            side_effect=[
+                requests.exceptions.ConnectionError("transient IDP blip"),
+                _make_response(200, {"id_token": "token"}),
+            ]
+        )
+        session.request = MagicMock(return_value=_make_response(200, {"data": "ok"}))
+
+        api = _make_api(session)
+        with patch("custom_components.hoval_connect.api.asyncio.sleep", new_callable=AsyncMock):
+            result = await api._request("GET", "/api/test")
+
+        assert result == {"data": "ok"}
+        assert session.post.call_count == 2  # first attempt failed, second succeeded
+
+    @pytest.mark.asyncio
+    async def test_headers_persistent_transient_error_raises_after_budget(self):
+        session = _make_session()
+        session.post = MagicMock(
+            side_effect=requests.exceptions.ConnectionError("persistent IDP outage")
+        )
+
+        api = _make_api(session)
+        with (
+            patch("custom_components.hoval_connect.api.asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(HovalApiError, match="Connection error"),
+        ):
+            await api._request("GET", "/api/test")
+
+        assert session.post.call_count == _MAX_RETRIES
+
+    @pytest.mark.asyncio
+    async def test_headers_auth_error_is_not_retried(self):
+        """Genuinely bad credentials (HovalAuthError) must fail immediately —
+        only transient connection problems (HovalApiError) get retried.
+        """
+        session = _make_session()
+        session.post = MagicMock(return_value=_make_response(401))  # IDP rejects credentials
+
+        api = _make_api(session)
+        with pytest.raises(HovalAuthError, match="Invalid credentials"):
+            await api._request("GET", "/api/test")
+
+        assert session.post.call_count == 1  # no retry attempted
 
     @pytest.mark.asyncio
     async def test_request_4xx_raises_api_error(self):
@@ -492,60 +656,64 @@ class TestHovalConnectApiEndpoints:
         assert result == circuits
 
     @pytest.mark.asyncio
-    async def test_get_live_values_plain_list(self):
-        """get_live_values returns a plain list unchanged."""
-        session = _make_session()
-        _mock_auth_ok(session)
-        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
-
-        lv = [{"key": "tempActual", "value": "24.5"}, {"key": "operatingHours", "value": "13751"}]
-        session.request = MagicMock(return_value=_make_response(200, lv))
-
-        api = _make_api(session)
-        result = await api.get_live_values("plant-1", "1.10.1", "BL")
-
-        assert result == lv
-
-    @pytest.mark.asyncio
-    async def test_get_live_values_paginated_wrapper(self):
-        """get_live_values extracts 'content' when the API returns a paginated wrapper.
-
-        Regression: Hoval's May 2026 API change introduced pagination on this
-        endpoint.  Without the fix the coordinator would receive a dict, iterate
-        over its string keys, and crash with TypeError inside _fetch_circuit —
-        causing BL to be silently dropped from plant_data.circuits.
+    async def test_get_circuits_unrecognised_dict_shape_raises(self):
+        """Independent audit finding (2026-09, HVC-004): a dict without a
+        list 'content' key must raise, not silently become []. Before this
+        fix, an unexpected shape like this was indistinguishable from "this
+        plant genuinely has zero circuits" — which under v1.0.0's
+        fetch-once-at-startup model could leave every entity missing until
+        a restart, with no error logged above debug level.
         """
         session = _make_session()
         _mock_auth_ok(session)
         session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
-
-        lv = [{"key": "tempActual", "value": "24.5"}, {"key": "operatingHours", "value": "13751"}]
-        paginated = {"content": lv, "totalElements": 2, "size": 12, "last": True}
-        session.request = MagicMock(return_value=_make_response(200, paginated))
+        session.request = MagicMock(return_value=_make_response(200, {"unexpected": "shape"}))
 
         api = _make_api(session)
-        result = await api.get_live_values("plant-1", "1.10.1", "BL")
-
-        assert result == lv
+        with pytest.raises(HovalApiError, match="Unexpected circuits response shape"):
+            await api.get_circuits("plant-1")
 
     @pytest.mark.asyncio
-    async def test_get_live_values_none_returns_empty_list(self):
-        """HTTP 204 or empty body (→ None from _request) must return [] not None.
+    async def test_get_circuits_dict_with_non_list_content_raises(self):
+        session = _make_session()
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
+        session.request = MagicMock(return_value=_make_response(200, {"content": "not-a-list"}))
 
-        If get_live_values returned None, the coordinator dict comprehension
-        'for v in lv_raw' would raise TypeError and crash _fetch_circuit.
+        api = _make_api(session)
+        with pytest.raises(HovalApiError, match="Unexpected circuits response shape"):
+            await api.get_circuits("plant-1")
+
+    @pytest.mark.asyncio
+    async def test_get_circuits_string_response_raises(self):
+        session = _make_session()
+        _mock_auth_ok(session)
+        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
+        session.request = MagicMock(return_value=_make_response(200, "unexpected string"))
+
+        api = _make_api(session)
+        with pytest.raises(HovalApiError, match="Unexpected circuits response shape"):
+            await api.get_circuits("plant-1")
+
+    @pytest.mark.asyncio
+    async def test_get_circuits_null_response_raises(self):
+        """A 204/empty body makes _request() return None — get_circuits()
+        must raise rather than silently treat that as zero circuits.
         """
         session = _make_session()
         _mock_auth_ok(session)
         session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
-
-        # Simulate a 204 response (_request returns None)
         session.request = MagicMock(return_value=_make_response(204))
 
         api = _make_api(session)
-        result = await api.get_live_values("plant-1", "1.10.1", "BL")
+        with pytest.raises(HovalApiError, match="Unexpected circuits response shape"):
+            await api.get_circuits("plant-1")
 
-        assert result == []
+    # v1.0.0 removed get_live_values() (and get_events/get_latest_event/
+    # get_weather) from api.py entirely — pure telemetry with no write
+    # dependency, never called once the coordinator stopped polling
+    # telemetry on a schedule. Their test coverage was removed with them;
+    # see docs/audit-v1.0.0.md.
 
     @pytest.mark.asyncio
     async def test_get_programs_returns_dict_for_programmable_circuit(self):
@@ -897,20 +1065,10 @@ class TestSourceContracts:
         src = self._read("climate.py")
         assert 'live_values.get("status")' in src
 
-    def test_sensor_has_room_temp_actual_for_hk(self):
-        """sensor.py must declare room_temp_actual limited to HK circuits."""
-        import re
-
-        src = self._read("sensor.py")
-        assert 'key="room_temp_actual"' in src
-        block = re.search(
-            r'key="room_temp_actual".*?circuit_types=frozenset\(\{([^}]+)\}\)',
-            src,
-            re.DOTALL,
-        )
-        assert block is not None, "room_temp_actual descriptor not found"
-        assert "CIRCUIT_TYPE_HK" in block.group(1)
-        assert "CIRCUIT_TYPE_BL" not in block.group(1)
+    # v1.0.0 deleted sensor.py entirely (every entity in it depended on
+    # removed telemetry with no write capability) — the room_temp_actual
+    # descriptor contract test that used to live here went with it. See
+    # docs/audit-v1.0.0.md.
 
     def test_bl_still_in_non_selectable_types(self):
         """BL must remain in the non-selectable types so selectable=False doesn't exclude it."""
@@ -923,108 +1081,44 @@ class TestSourceContracts:
         assert "_NON_SELECTABLE_TYPES" in src
 
 
-class TestScanIntervalSchema:
-    """Options dropdown submits strings; schema must coerce so the interval saves.
+class TestScanIntervalRemoved:
+    """Regression guard for v1.0.0's removal of the polling-interval option.
 
-    Regression for the v0.19.0 'poll interval not saved' bug.
+    The v0.19.0/v0.23.0 bug-fix history for this option (schema coercion,
+    the missing 600 s / 10-minute value) is now moot: v1.0.0 removed the
+    scan-interval option entirely, since there's no longer a meaningful
+    "poll rate" to tune (see docs/audit-v1.0.0.md and CHANGELOG.md). This
+    test only guards that the removal was actually completed everywhere,
+    not any remaining behavior of the option itself.
     """
 
-    @staticmethod
-    def _validator():
-        return vol.Schema(
-            {vol.Required("scan_interval"): vol.All(vol.Coerce(int), vol.In(SCAN_INTERVAL_OPTIONS))}
-        )
+    def test_scan_interval_constants_do_not_exist(self):
+        import custom_components.hoval_connect.const as const_module
 
-    def test_string_from_frontend_is_coerced_and_accepted(self):
-        out = self._validator()({"scan_interval": "60"})
-        assert out["scan_interval"] == 60
-        assert isinstance(out["scan_interval"], int)
+        for name in ("CONF_SCAN_INTERVAL", "SCAN_INTERVAL_OPTIONS", "DEFAULT_SCAN_INTERVAL"):
+            assert not hasattr(const_module, name), (
+                f"{name} should have been removed in v1.0.0 — see docs/audit-v1.0.0.md"
+            )
 
-    def test_int_value_accepted(self):
-        assert self._validator()({"scan_interval": 120})["scan_interval"] == 120
+    def test_health_check_interval_exists_and_is_reasonable(self):
+        from datetime import timedelta
 
-    def test_unknown_value_rejected(self):
-        with pytest.raises(vol.Invalid):
-            self._validator()({"scan_interval": "45"})
+        from custom_components.hoval_connect.const import HEALTH_CHECK_INTERVAL
 
-    def test_ten_minutes_option_present(self):
-        """
-        Regression — v0.23.0 fix for the 'Polling interval field renders
-        empty' bug. 600 (10 minutes) was documented/expected as a choice
-        alongside 300 (5 minutes) but had no entry in SCAN_INTERVAL_OPTIONS,
-        so a stored value of 600 could not be matched by the options-flow
-        dropdown and rendered blank. See docs/audit-v0.23.0.md.
-        """
-        assert 600 in SCAN_INTERVAL_OPTIONS
-        assert self._validator()({"scan_interval": 600})["scan_interval"] == 600
-        # Frontend submits dropdown selections as strings (v0.19.0 fix).
-        assert self._validator()({"scan_interval": "600"})["scan_interval"] == 600
+        assert isinstance(HEALTH_CHECK_INTERVAL, timedelta)
+        # Sanity band, not a pin to the exact value: somewhere between
+        # "frequent enough to matter" and "so long the 2h problem threshold
+        # never gets more than one data point".
+        assert timedelta(minutes=10) <= HEALTH_CHECK_INTERVAL <= timedelta(hours=1)
 
 
 # ---------------------------------------------------------------------------
-# Event endpoints — shape normalisation (v0.21.1, audit finding F2)
 # ---------------------------------------------------------------------------
-
-
-class TestEventEndpointNormalisation:
-    """get_events/get_latest_event must normalise shape drift in the client.
-
-    Before v0.21.1 these were the only list-shaped endpoints without wrapper
-    handling; a paginated response reached list slicing in the coordinator's
-    plant loop (outside per-circuit exception isolation) and failed the whole
-    poll.
-    """
-
-    def _api_with_response(self, json_data) -> HovalConnectApi:
-        session = _make_session()
-        _mock_auth_ok(session)
-        session.get = MagicMock(return_value=_make_response(200, {"token": "pat-123"}))
-        session.request = MagicMock(return_value=_make_response(200, json_data))
-        return _make_api(session)
-
-    @pytest.mark.asyncio
-    async def test_get_events_plain_list(self):
-        events = [{"eventType": "warning"}, {"eventType": "info"}]
-        api = self._api_with_response(events)
-        assert await api.get_events("p1") == events
-
-    @pytest.mark.asyncio
-    async def test_get_events_paginated_wrapper(self):
-        events = [{"eventType": "warning"}]
-        api = self._api_with_response({"content": events, "last": True})
-        assert await api.get_events("p1") == events
-
-    @pytest.mark.asyncio
-    async def test_get_events_wrapper_with_non_list_content(self):
-        api = self._api_with_response({"content": "garbage"})
-        assert await api.get_events("p1") == []
-
-    @pytest.mark.asyncio
-    async def test_get_events_non_list_returns_empty(self):
-        api = self._api_with_response("garbage")
-        assert await api.get_events("p1") == []
-
-    @pytest.mark.asyncio
-    async def test_get_latest_event_plain_dict_passthrough(self):
-        event = {"eventType": "blocking", "description": "Fault"}
-        api = self._api_with_response(event)
-        assert await api.get_latest_event("p1") == event
-
-    @pytest.mark.asyncio
-    async def test_get_latest_event_wrapper_takes_first_element(self):
-        event = {"eventType": "warning"}
-        api = self._api_with_response({"content": [event, {"eventType": "info"}]})
-        assert await api.get_latest_event("p1") == event
-
-    @pytest.mark.asyncio
-    async def test_get_latest_event_wrapper_empty_content(self):
-        api = self._api_with_response({"content": []})
-        assert await api.get_latest_event("p1") == {}
-
-    @pytest.mark.asyncio
-    async def test_get_latest_event_non_dict_returns_empty(self):
-        api = self._api_with_response(["not", "a", "dict"])
-        assert await api.get_latest_event("p1") == {}
+# v1.0.0 removed get_events()/get_latest_event() (and their v0.21.1 shape-
+# normalisation coverage, formerly here as TestEventEndpointNormalisation)
+# along with get_live_values()/get_weather() — pure telemetry with no write
+# dependency. See docs/audit-v1.0.0.md.
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -1032,11 +1126,78 @@ class TestEventEndpointNormalisation:
 # ---------------------------------------------------------------------------
 
 
-class TestGetPlantsPageCap:
-    """A server that never reports last=True must not loop forever."""
+class TestGetPlantsFailsClosedOnUnrecognisedShape:
+    """Independent audit finding (2026-09, "more" report, finding #2): same
+    class of bug already fixed for get_circuits() — a dict response with
+    no "content" key used to silently become [] instead of raising.
+    """
 
     @pytest.mark.asyncio
-    async def test_endless_pagination_is_truncated(self):
+    async def test_dict_without_content_key_raises(self):
+        session = _make_session()
+        _mock_auth_ok(session)
+        session.request = MagicMock(return_value=_make_response(200, {"unexpected": "shape"}))
+
+        api = _make_api(session)
+        with pytest.raises(HovalApiError, match="Unexpected get_plants response shape"):
+            await api.get_plants()
+
+    @pytest.mark.asyncio
+    async def test_dict_with_non_list_content_raises(self):
+        session = _make_session()
+        _mock_auth_ok(session)
+        session.request = MagicMock(return_value=_make_response(200, {"content": "not-a-list"}))
+
+        api = _make_api(session)
+        with pytest.raises(HovalApiError, match="Unexpected get_plants response shape"):
+            await api.get_plants()
+
+    @pytest.mark.asyncio
+    async def test_string_response_raises(self):
+        session = _make_session()
+        _mock_auth_ok(session)
+        session.request = MagicMock(return_value=_make_response(200, "unexpected string"))
+
+        api = _make_api(session)
+        with pytest.raises(HovalApiError, match="Unexpected get_plants response shape"):
+            await api.get_plants()
+
+    @pytest.mark.asyncio
+    async def test_valid_plain_list_still_works(self):
+        session = _make_session()
+        _mock_auth_ok(session)
+        plants = [{"plantExternalId": "p1", "description": "Home", "isOnline": True}]
+        session.request = MagicMock(return_value=_make_response(200, plants))
+
+        api = _make_api(session)
+        assert await api.get_plants() == plants
+
+    @pytest.mark.asyncio
+    async def test_valid_empty_content_with_last_true_still_works(self):
+        """A genuinely well-formed empty response must NOT raise — only an
+        unrecognised shape should. Distinguishing "empty but well-formed"
+        from "the account has zero plants right now, trust it or not" is
+        the coordinator's job (see finding #3), not this method's.
+        """
+        session = _make_session()
+        _mock_auth_ok(session)
+        session.request = MagicMock(return_value=_make_response(200, {"content": [], "last": True}))
+
+        api = _make_api(session)
+        assert await api.get_plants() == []
+
+
+class TestGetPlantsPageCap:
+    """A server that never reports last=True must not loop forever.
+
+    Independent audit finding (2026-09, fourth round, HVC-013): reaching
+    the page cap must raise, not silently return a truncated-but-
+    plausible-looking partial plant list as if it were a complete,
+    successful result.
+    """
+
+    @pytest.mark.asyncio
+    async def test_endless_pagination_raises_instead_of_returning_partial_data(self):
         from custom_components.hoval_connect.api import _MAX_PLANT_PAGES
 
         session = _make_session()
@@ -1052,10 +1213,10 @@ class TestGetPlantsPageCap:
         session.request = MagicMock(side_effect=_endless_page)
 
         api = _make_api(session)
-        result = await api.get_plants()
+        with pytest.raises(HovalApiError, match="pagination exceeded"):
+            await api.get_plants()
 
-        # One plant per page, capped at _MAX_PLANT_PAGES pages/requests.
-        assert len(result) == _MAX_PLANT_PAGES
+        # Stopped at the cap, not looped forever.
         assert session.request.call_count == _MAX_PLANT_PAGES
 
     @pytest.mark.asyncio

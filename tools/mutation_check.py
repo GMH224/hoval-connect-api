@@ -44,12 +44,6 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         'identifiers={(DOMAIN, f"{plant_device_id}_{circuit_data.path}")},',
     ),
     (
-        "revert UnitOfRatio.PERCENTAGE -> PERCENTAGE",
-        "custom_components/hoval_connect/sensor.py",
-        "native_unit_of_measurement=UnitOfRatio.PERCENTAGE,",
-        "native_unit_of_measurement=PERCENTAGE,",
-    ),
-    (
         "lower the HACS minimum HA version below 2026.8",
         "hacs.json",
         '"homeassistant": "2026.8.0"',
@@ -66,15 +60,15 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         "        plant_devices.async_get_device_id(plant_id, plant_data)",
     ),
     (
-        "drop plant_device_id from a platform (sensor)",
-        "custom_components/hoval_connect/sensor.py",
+        "drop plant_device_id from a platform (number)",
+        "custom_components/hoval_connect/number.py",
         "circuit_device_info(plant_id, plant_device_id, circuit_data)",
         "circuit_device_info(plant_id, plant_device_id if False else plant_id, circuit_data)",
     ),
     (
         "revert manifest version to 0.21.1",
         "custom_components/hoval_connect/manifest.json",
-        '"version": "2.2.0"',
+        '"version": "1.0.0"',
         '"version": "0.21.1"',
     ),
     (
