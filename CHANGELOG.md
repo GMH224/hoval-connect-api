@@ -479,6 +479,103 @@ most others are limited to source-contract checks due to the shared test
 harness not implementing `CoordinatorEntity.available`). Still ruff
 clean, 64.7% overall coverage.
 
+### Final audit round + live-value refresh (Option A)
+
+A fifth independent review, run against the deployed artifact, plus the
+first real-world deployment feedback. Every claim was re-verified before
+acting; **two findings were rejected** and one of the report's own
+recommendations was found to be actively wrong (see below).
+
+**The defect that mattered most — self-inflicted, found by taking the
+report's telemetry framing seriously rather than at face value.** The
+previous entry's reinstated `actual_value`/`target_value` sensors were
+**frozen**: `_health_check()` — the only thing running on the scheduled
+interval — carried each plant's circuits dict forward completely
+unchanged, so those sensors only ever updated at startup or after a
+write. A temperature sensor that silently never updates is worse than no
+sensor, because it looks live. Fixed: the scheduled check now makes **one
+additional `get_circuits()` call per online plant** and refreshes the
+fields that genuinely change (`actual_value`, `target_value`,
+`operation_mode`, `active_program`, `has_error`, `circuit_status`,
+`temporary_change_active`), leaving cache-tiered slow-changing data
+(`program_names`, `weather_impact_*`) untouched.
+
+Deliberately **one call per plant, not per circuit** — `get_circuits()`
+returns every circuit at once, whereas the live-values endpoint takes
+`?circuitPath=` and scales with circuit count. Per the user's explicit
+constraint ("no extra polls just to get telemetry — might blacklist the
+account, and we have no SLA with Hoval"), `get_live_values()`,
+`get_weather()` and the event endpoints remain removed from `api.py`.
+Roughly doubles scheduled traffic (~2 → ~4 calls/cycle including auth),
+from a very low base, and does not scale with circuit count.
+
+A circuits-list failure during a scheduled check now degrades to "keep
+previous values" rather than failing the cycle — `get_plants()` has
+already succeeded by that point, so the cloud is demonstrably reachable
+and flipping every entity unavailable would be both wrong and
+self-contradictory.
+
+**The User-Agent, and why the audit's own fix was wrong.** The report
+correctly flagged that `examples/get-live-values.sh` sends no
+`User-Agent`. But its recommended replacement —
+`HovalConnectHomeAssistant/1.0 (...)` — is **not** the validated string;
+the auditor had read it off `examples/hoval_client.py`, which a previous
+round had given an invented, nicer-looking value while its own comment
+falsely claimed it matched `const.py`. That is exactly the failure mode
+`docs/audit-v0.24.0.md` § 5 warns about, and it survived because the
+existing pinning test only covered `const.py`. Following the
+recommendation literally would have propagated an unvalidated
+User-Agent into the one script whose entire purpose is diagnosing the
+403s this class of mistake causes. Both examples now carry the byte-exact
+validated string, with two new tests pinning them to `const.py` and
+explicitly rejecting the invented one by name.
+
+**Also fixed:**
+
+- **CI could not collect ~110 tests on a clean runner** (P0) — the
+  workflow was missing `voluptuous`, which `config_flow.py` imports and
+  `test_ha_compat.py` reaches transitively. Green locally only because the
+  dev environment happened to have it. An earlier release *had* added it;
+  it was later dropped, and a subsequent fix to that same line corrected
+  only `aiohttp`→`requests` without re-checking the rest. `CLAUDE.md` and
+  the `[0.21.0]` CHANGELOG entry both still claimed it was installed —
+  both now annotated as stale rather than silently corrected. A new test
+  (`TestCiInstallsEveryTestDependency`) checks the workflow's install list
+  against what the integration actually imports, in both directions.
+- **`examples/hoval_client.py` silently dropped plants** past the first
+  12 while its docstring claimed to handle pagination. Now iterates, with
+  the same 50-page cap and fail-closed behavior as the production client.
+- **`examples/get-live-values.sh`** now sends only the spec-documented
+  `circuitPath` parameter, and documents up front that the integration no
+  longer calls this endpoint — its purpose is to let you check what
+  live-values actually returns *before* deciding whether it's worth
+  reintroducing.
+- **Version lineage** — the README's two `v2.2.0` references are gone,
+  replaced by an explicit note explaining that the `[2.2.0]` CHANGELOG tag
+  is a historical typo for a `0.2x` release, not a version preceding
+  1.0.0.
+- **Zero-warning test baseline** — the un-awaited-coroutine
+  `RuntimeWarning` came from the test harness's bare `MagicMock` hass
+  discarding coroutines handed to `async_create_task()`. The fake now
+  closes them deterministically (without pretending to run them — tests
+  that need real execution still override it). CI enforces this with
+  `-W error::RuntimeWarning`, scoped rather than blanket so third-party
+  `DeprecationWarning`s can't train people to disable the flag.
+
+**Rejected after verification:** the claim that the cloud-problem sensor
+can report ON before the first successful contact (unreachable —
+`async_config_entry_first_refresh()` precedes entity creation, and a
+failure there prevents entities existing at all), and the claim that
+malformed IDP JSON escapes error classification
+(`requests.exceptions.JSONDecodeError` is a `RequestException` subclass,
+and the manifest pins `requests>=2.28.0`). The report's `circuitType`
+finding was also downgraded: the spec omits the parameter, but the
+pre-v1.0.0 client sent it in production for months, so the spec is
+likely incomplete rather than the script being wrong.
+
+Test suite grew to 415 tests (from 401), now running clean with zero
+warnings. Still ruff clean, 65.1% overall coverage.
+
 ## [0.24.0] - 2026-09-10
 
 Transport rewrite: replaces `aiohttp` with `requests` (run via
@@ -794,6 +891,12 @@ entity changes. Restart Home Assistant after updating.
   83 % → **85 %**. Coverage gate raised `fail_under = 30` → **40**.
 - CI: added the missing `voluptuous` dependency to the test-install step in
   `.github/workflows/lint.yml` (test_api.py imports it directly).
+  *(Historical note, added 2026-09: this was accurate at the time, but the
+  dependency was later dropped from the workflow again, leaving this entry
+  claiming something untrue of the shipped artifact. See the v1.0.0 entry's
+  "Final audit round" section. The import that motivated it — in
+  `test_api.py` — is also gone now; the real need is transitive, via
+  `test_ha_compat.py` → `config_flow.py`.)*
 
 ### Not in this release (deferred, see audit report §Residual risks)
 - Climate `HEAT` mode mapping (currently identical to `AUTO`), honouring the

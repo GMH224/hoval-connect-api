@@ -354,6 +354,38 @@ deployment):** see `docs/audit-v1.0.0.md` §18. Gotchas:
   worth following that pattern if you add more sensors here, rather than
   falling back to the thinner style used in climate.py/fan.py/etc.
 
+**Final audit round + Option A live-value refresh (see
+`docs/audit-v1.0.0.md` §19).** Gotchas, several of which are about
+mistakes made *in this project* rather than the API:
+- **`_health_check()` now calls `get_circuits()` per online plant.** This
+  is not optional polish — without it, sensor.py's `actual_value` is
+  frozen at startup and the temperature sensors silently lie. If you're
+  optimizing call volume, this is the LAST thing to remove. Do not extend
+  it to per-circuit calls (`live-values` takes `?circuitPath=` and scales
+  with circuit count); the user's constraint is explicit and recorded in
+  §19.1 with the arithmetic.
+- **The `USER_AGENT` in `examples/` must stay byte-identical to
+  `const.py`.** A previous round put an invented "nicer" string there
+  while its own comment claimed it matched — and a later audit report then
+  read that wrong string and recommended spreading it further. Two tests
+  now pin this. If you ever genuinely need to change it, that requires
+  live re-validation against the API, and you update const.py + both
+  examples + both tests together.
+- **When you fix a CI dependency line, re-check the WHOLE list**, not the
+  one package you came for. That's how `voluptuous` went missing for
+  multiple releases while `CLAUDE.md` and the CHANGELOG both claimed it
+  was installed. `TestCiInstallsEveryTestDependency` now checks both
+  directions automatically.
+- **A claim that holds on one code path may not hold on another.** §18
+  reinstated sensors reasoning "this data is already fetched" — true of
+  the full-refresh path, false of the scheduled path, never tested. If you
+  find yourself justifying a change with "we already have this," verify it
+  on every path that will read it.
+- The test harness's fake `hass` now **closes** coroutines passed to
+  `async_create_task()` rather than discarding them. Don't "simplify" it
+  back to a bare MagicMock — that reintroduces the un-awaited-coroutine
+  warning, and CI now fails on `RuntimeWarning`.
+
 ### v0.24.0 — Transport rewrite: aiohttp -> requests-in-executor
 
 **This is the important one if you're reading this file to understand why
@@ -490,7 +522,13 @@ Hardening-only release from a full code audit; complete report in
   Never re-add module-level `sys.modules[...] = mock` hard assignments in
   test files (import-order bug removed in this release); use the conftest.
 - 191 tests, coverage 44 % (coordinator 85 %, api 85 %), gate raised to 40.
-  CI test step now installs `voluptuous`.
+  CI test step now installs `voluptuous`. **(This was true when written,
+  but the dependency was later dropped from the workflow and the claim
+  went stale — caught by the final 2026-09 audit round, which found ~110
+  tests uncollectable on a clean runner. Re-added, with a test
+  (`TestCiInstallsEveryTestDependency`) that now checks the workflow's
+  install list against what the integration actually imports, so this
+  particular claim can't silently become false again.)**
 
 ### v0.21.0 — Weather based control (Eco↔Comfort weighting sliders)
 

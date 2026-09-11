@@ -1400,3 +1400,212 @@ format), 64.7% overall coverage (`api.py` 90%, `coordinator.py` 89%,
 entity-platform files, precisely because of the behavioral tests above).
 
 
+## 19. Final audit round + the frozen-sensor defect (Option A)
+
+A fifth independent review (`hoval_connect_v1_0_0_final_ics_quality_bug_report.md`)
+was run against the deployed artifact, alongside the first real-world
+deployment feedback. As with every previous round, each claim was
+re-verified against the actual code before being acted on. Two findings
+were rejected (§19.5), and — new for this round — one of the report's own
+*recommended fixes* was found to be actively harmful if followed
+literally (§19.2).
+
+### 19.1 The frozen-sensor defect (self-inflicted, and the real headline)
+
+§18 reinstated `actual_value`/`target_value` sensors on the grounds that
+those fields were "already fetched for control purposes — zero additional
+API calls." That was true of the *full-refresh* path. It was not true of
+the *scheduled* path, and nobody checked.
+
+`_health_check()` — the only thing running on the user's 15–120 minute
+interval — calls `get_plants()` and then does:
+
+```python
+circuits = prior.circuits if prior is not None else {}
+```
+
+The circuits dict is carried forward **byte-for-byte unchanged**. So
+`actual_value` only ever changed at startup or immediately after a write.
+The user's deployed instance showed `23.7 °C` and would have kept showing
+it indefinitely. A temperature sensor that silently never updates is
+worse than no sensor at all, because nothing about it looks broken.
+
+This is a good illustration of a failure mode worth naming: §18's
+reasoning ("the data is already fetched") was correct about one code path
+and silently assumed it generalised. The claim was never tested against
+the scheduled path, and the sensors were shipped on the strength of the
+argument rather than a check.
+
+**Fix.** `_refresh_circuit_values()` makes one `get_circuits()` call per
+online plant during the scheduled check and updates in place only the
+fields that genuinely vary between polls: `actual_value`, `target_value`,
+`operation_mode`, `active_program`, `has_error`, `circuit_status`,
+`temporary_change_active`. `program_names` and `weather_impact_*` come
+from the programs/settings endpoints (cache-tiered, slow-changing, not
+called here) and are deliberately left untouched — a test pins this, since
+blanking them would be a subtle way to break `select.py`'s option names.
+
+**Why one call per plant and not per circuit.** The user's constraint was
+explicit: *"I wouldn't do extra polls just to get telemetry. Might
+blacklist account. not worth it and we have no SLA with hoval."*
+`get_circuits()` returns every circuit in a single response;
+`/v3/api/statistics/live-values/{plant}?circuitPath=X` takes one circuit
+per call and scales with circuit count. The cost difference, counting
+auth (ID token 25 min TTL, plant token 12 min — both expire between
+cycles at any supported interval):
+
+| | Calls/cycle | At 30 min | At 120 min |
+|---|---|---|---|
+| Before | ~2 | ~96/day | ~24/day |
+| Now (Option A) | ~4 | ~192/day | ~48/day |
+| live-values (rejected) | ~7 for 3 circuits | ~336/day | ~84/day |
+
+`get_live_values()`, `get_weather()`, `get_latest_event()` and
+`get_events()` therefore remain removed from `api.py`. Roughly doubling a
+very low baseline was judged acceptable to make already-shipped entities
+honest; tripling it, with per-circuit scaling, to duplicate data the
+user's CAN-bus integration already provides locally, was not.
+
+**Failure handling.** A circuits-list failure during a scheduled check
+degrades to "keep the previous values" rather than propagating. By the
+time `_refresh_circuit_values()` runs, `get_plants()` has already
+succeeded — the check's *primary* job (confirm the cloud is reachable) is
+done. Raising here would flip every entity unavailable and record a
+failed contact for a cloud that had just demonstrably answered.
+
+### 19.2 The User-Agent: where the report's own fix was wrong
+
+The report correctly observed that `examples/get-live-values.sh` sends no
+`User-Agent`. Its §7 then recommended adding:
+
+```
+User-Agent: HovalConnectHomeAssistant/1.0 (...)
+```
+
+**That is not the validated string.** The only User-Agent ever confirmed
+live against Hoval's gateway is the one in `const.py`:
+`"hoval-connect-forensic-crawler/1.0 (+https://github.com/; diagnostic tool)"`
+(see `docs/audit-v0.24.0.md` § 2.6 and § 4.2).
+
+The auditor had read their suggested string off `examples/hoval_client.py`
+— which §13.12 rewrote and, in doing so, gave an invented, nicer-looking
+value **while its own comment claimed it matched `const.py`**. It did not.
+That comment was simply false, and it shipped.
+
+This is precisely what `docs/audit-v0.24.0.md` § 5 warns about:
+
+> Treat any change to `USER_AGENT` as needing its own live validation, not
+> an assumption that the rule is content-agnostic beyond "not
+> `python-requests`".
+
+It survived because `test_user_agent_is_the_empirically_validated_string`
+only ever checked `const.py`. The examples were outside its reach.
+
+Following the report's recommendation verbatim would have propagated an
+unvalidated User-Agent into `get-live-values.sh` — the one script whose
+entire purpose is diagnosing 403s of exactly this kind. It would have
+looked like a fix while potentially reproducing the bug v0.24.0 exists to
+solve.
+
+**Fix.** Both examples now carry the byte-exact validated literal. Two new
+tests: `test_examples_use_the_validated_user_agent` (both files must
+contain the same literal as `const.py`) and
+`test_examples_do_not_carry_the_known_bad_invented_user_agent` (names the
+rejected string explicitly, skipping comment lines — both files *document*
+the bad string deliberately, and a naive search would flag the very
+documentation meant to prevent recurrence).
+
+Honest residual uncertainty, carried forward from v0.24.0: only that one
+string was ever validated. It is plausible-but-untested that any
+non-default UA clears the rule. `curl`'s default (`curl/X.Y.Z`) is *not*
+the signature observed blocked (`python-requests/X.Y.Z`), so the shell
+script may well have worked all along. Sending the proven string costs
+nothing and removes the question.
+
+### 19.3 CI could not collect ~110 tests (P0)
+
+Confirmed. `.github/workflows/lint.yml` installed
+`requests pytest pytest-asyncio pytest-cov` — no `voluptuous`, which
+`config_flow.py` imports and `tests/test_ha_compat.py` reaches
+transitively. On a clean runner the full suite could not be collected;
+every "N tests passing" figure in this project's history was measured in a
+dev environment that happened to have the package.
+
+Worth recording the shape of how this survived: an earlier release *did*
+add it (see the `[0.21.0]` CHANGELOG entry), it was later dropped, and
+§13.11's fix to that exact line corrected only `aiohttp`→`requests`
+without re-checking the remainder against what the tests import. Both
+`CLAUDE.md` and the `[0.21.0]` entry still *claimed* the dependency was
+installed — stale documentation asserting a false fact, which is worse
+than silence. Both are now annotated in place rather than quietly
+rewritten, so the record shows what happened.
+
+**Fix.** `voluptuous` re-added, plus `TestCiInstallsEveryTestDependency`,
+which checks the workflow's install list against the integration's actual
+third-party imports **in both directions** — a missing package fails, and
+so does a listed-but-unused one (which is how `aiohttp` outlived the
+v0.24.0 transport rewrite in that file).
+
+### 19.4 Examples, version lineage, warning baseline
+
+- `examples/hoval_client.py` fetched **page 0 only** while its docstring
+  claimed to handle pagination — an account with more than 12 plants
+  silently lost the rest. Now iterates, with the same 50-page cap and
+  fail-closed behavior as the production client (§16.12).
+- `examples/get-live-values.sh` now sends only the spec-documented
+  `circuitPath`. The report called the extra `circuitType` parameter a
+  defect; that is **downgraded** — `docs/openapi-v3.json` does omit it,
+  but the pre-v1.0.0 `api.py` sent it in production for months without
+  issue, which points at an incomplete spec rather than a broken script.
+  Dropped from the example anyway, because an example should demonstrate
+  the documented contract.
+- The script's header now states plainly that the integration no longer
+  calls this endpoint, and that the script's purpose is to let someone
+  check what live-values actually returns *before* deciding whether
+  reintroducing it is worthwhile.
+- README's two `v2.2.0` references removed, replaced with an explicit
+  version-history note: the `[2.2.0]` CHANGELOG heading is a historical
+  typo for a `0.2x` release, not a version preceding 1.0.0. The heading
+  itself is left as-published rather than rewritten, so the record matches
+  what shipped.
+- The long-tolerated `RuntimeWarning` was traced to the test harness: a
+  bare `MagicMock` hass records `async_create_task()` and **discards** the
+  coroutine, so it was never awaited and surfaced at interpreter shutdown
+  — attributed to whichever test happened to be running during garbage
+  collection, which is why it wandered between test names and was easy to
+  keep ignoring. The fake now closes coroutines deterministically without
+  pretending to run them (tests that need real execution still override
+  it). CI enforces the baseline with `-W error::RuntimeWarning`, scoped
+  rather than blanket so third-party `DeprecationWarning`s can't make the
+  flag something people disable.
+
+### 19.5 Rejected after verification
+
+**"Cloud-problem sensor can report ON before first success."** Unreachable.
+`async_config_entry_first_refresh()` runs *before*
+`async_forward_entry_setups()`; if it fails, setup raises and no entities
+are created at all, and if it succeeds, `record_poll_success()` always
+calls `record_successful_contact()`. By the time the entity exists, the
+timestamp is always set. The `None` branch is correct defensive coding,
+not an observable state. (The report itself hedged this to P2.)
+
+**"Auth JSON parsing has a residual hard-failure path."** Incorrect.
+`requests.exceptions.JSONDecodeError` is a subclass of
+`RequestException` (verified via its MRO), and `manifest.json` pins
+`requests>=2.28.0`. Malformed, truncated, or HTML IDP responses are
+already caught by the existing handler and classified as `HovalApiError`.
+At most the resulting message text ("Connection error during
+authentication") is imprecise for a decode failure.
+
+Also **not new**: the report's P1 items covering HVC-011 (executor
+cancellation), v3/v4 temporary-change, HVC-018 (`week1OrWeek2Active`) and
+the absence of live end-to-end verification are all already documented
+here as known and deferred (§16.2, §11.9). Legitimate as release-readiness
+framing; not new defects.
+
+## 20. Test coverage (final)
+
+Grew from 401 to 415 tests across this round, now running with **zero
+warnings** under `-W error::RuntimeWarning`. Final: 415 tests pass, ruff
+clean (lint + format), 65.1% overall coverage (`api.py` 90%,
+`coordinator.py` 89%, `diagnostics.py` 100%, `sensor.py` 71%).

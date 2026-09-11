@@ -963,6 +963,67 @@ class TestRequestsTransport:
             == "hoval-connect-forensic-crawler/1.0 (+https://github.com/; diagnostic tool)"
         )
 
+    def test_examples_use_the_validated_user_agent(self):
+        """Both shipped examples must carry the SAME literal User-Agent as const.py.
+
+        This test exists because the guard above was not enough. When
+        examples/hoval_client.py was rewritten (2026-09, third audit
+        round), it was given an invented, nicer-looking
+        "HovalConnectHomeAssistant/1.0 (...)" string — while its own
+        comment claimed the value matched const.py. It did not. The
+        pinning test above only covered const.py, so the unvalidated
+        string shipped untested in the examples, which is precisely the
+        failure mode docs/audit-v0.24.0.md § 5 warns about ("treat any
+        change to USER_AGENT as needing its own live validation").
+
+        Worse, a subsequent audit report read the wrong string off that
+        broken example and recommended propagating it into
+        get-live-values.sh as the "fix" — so following that
+        recommendation literally would have spread an unvalidated
+        User-Agent into the one script whose entire purpose is diagnosing
+        403s caused by exactly this.
+
+        Substring check, not an exact-line match: the two files declare it
+        differently (a Python assignment vs a shell variable), and what
+        matters is that the validated literal is present in each.
+        """
+        import os
+
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for rel_path in ("examples/hoval_client.py", "examples/get-live-values.sh"):
+            with open(os.path.join(base, rel_path)) as f:
+                source = f.read()
+            assert USER_AGENT in source, (
+                f"{rel_path} does not contain the validated USER_AGENT literal; "
+                "see this test's docstring before changing it"
+            )
+
+    def test_examples_do_not_carry_the_known_bad_invented_user_agent(self):
+        """Explicit regression guard for the specific wrong string.
+
+        Named literally so a future reader (or a future audit report
+        quoting it) sees it flagged as rejected rather than plausible.
+
+        Comment lines are skipped deliberately: both example files NAME
+        the bad string in their own explanatory comments (that's the
+        point — the history is recorded where someone editing the
+        constant will read it), so a naive whole-file search would flag
+        exactly the documentation that exists to prevent the mistake.
+        Only non-comment lines are checked.
+        """
+        import os
+
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for rel_path in ("examples/hoval_client.py", "examples/get-live-values.sh"):
+            with open(os.path.join(base, rel_path)) as f:
+                code_lines = [
+                    line for line in f.read().splitlines() if not line.lstrip().startswith("#")
+                ]
+            assert "HovalConnectHomeAssistant/1.0" not in "\n".join(code_lines), (
+                f"{rel_path} uses the invented, never-live-validated User-Agent "
+                "outside of a comment"
+            )
+
     @pytest.mark.asyncio
     async def test_aclose_closes_the_session_via_executor(self):
         session = _make_session()

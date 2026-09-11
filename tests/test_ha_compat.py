@@ -249,6 +249,70 @@ class TestClimateHeatAutoAreDistinct:
         assert "return HVACMode.AUTO" in src
 
 
+class TestCiInstallsEveryTestDependency:
+    """Independent audit finding (2026-09, final round, P0): the CI test
+    step was missing `voluptuous`, so ~110 tests could not be collected on
+    a clean runner — CI was green only because it never ran them. Local
+    runs passed throughout because the dev environment happened to have
+    the package installed, which is exactly what made it invisible.
+
+    This test compares the workflow's install list against the
+    third-party packages actually reachable from the integration, rather
+    than trusting a hand-maintained list to stay in sync.
+    """
+
+    # Third-party (non-stdlib, non-HA, non-first-party) packages the
+    # integration imports at module scope. HA itself is provided by the
+    # test harness's stubs, not pip, so it is not listed here.
+    _REQUIRED_RUNTIME_PACKAGES = ("requests", "voluptuous")
+
+    @staticmethod
+    def _workflow_text() -> str:
+        import os
+
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(base, ".github", "workflows", "lint.yml")) as f:
+            return f.read()
+
+    def test_workflow_installs_every_required_package(self) -> None:
+        workflow = self._workflow_text()
+        install_lines = [ln for ln in workflow.splitlines() if "pip install" in ln]
+        assert install_lines, "no pip install step found in the workflow"
+        installed = " ".join(install_lines)
+        for package in self._REQUIRED_RUNTIME_PACKAGES:
+            assert package in installed, (
+                f"CI does not install {package!r}, but the integration imports it — "
+                "tests that reach it cannot be collected on a clean runner"
+            )
+
+    def test_required_packages_really_are_imported_by_the_integration(self) -> None:
+        """Keep the list above honest in the other direction too.
+
+        If a package stops being used, this test fails and the CI install
+        list should shrink rather than silently carrying dead
+        dependencies forward (which is how `aiohttp` outlived the v0.24.0
+        transport rewrite here).
+        """
+        import os
+
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        component = os.path.join(base, "custom_components", "hoval_connect")
+        combined = ""
+        for name in os.listdir(component):
+            if name.endswith(".py"):
+                with open(os.path.join(component, name)) as f:
+                    combined += f.read()
+        for package in self._REQUIRED_RUNTIME_PACKAGES:
+            assert f"import {package}" in combined, (
+                f"{package!r} is listed as required but no module imports it"
+            )
+
+    def test_workflow_does_not_install_the_removed_aiohttp(self) -> None:
+        """aiohttp was replaced by requests in v0.24.0 (docs/audit-v0.24.0.md)."""
+        installed = " ".join(ln for ln in self._workflow_text().splitlines() if "pip install" in ln)
+        assert "aiohttp" not in installed
+
+
 class TestPersistedOptionsAreValidated:
     """Independent audit finding (2026-09, fourth round, HVC-007): persisted
     turn_on_mode/override_duration options were read directly from

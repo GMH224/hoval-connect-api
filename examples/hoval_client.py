@@ -34,12 +34,25 @@ import time
 import requests
 
 # Empirically required (see docs/audit-v0.24.0.md): the API's gateway
-# blocks requests.Session()'s own default User-Agent string outright. Any
-# non-default, distinctive value works; this one matches the same
-# constant used by the shipped integration (const.py's USER_AGENT) so
-# this example's traffic is trivially identifiable as this example, not a
-# request pretending to be the official app.
-USER_AGENT = "HovalConnectHomeAssistant/1.0 (+https://github.com/hoval-connect/hoval-connect-api)"
+# blocks requests.Session()'s own default User-Agent ("python-requests/X.Y.Z")
+# outright — an HTTP 403 on every endpoint, which is the entire reason the
+# v0.24.0 transport rewrite exists.
+#
+# This MUST stay byte-for-byte identical to const.py's USER_AGENT. That is
+# the one and only string ever confirmed live against Hoval's gateway; the
+# v0.24.0 audit is explicit that it is plausible-but-UNTESTED that any
+# non-default string clears the rule, so a different value here would be an
+# unvalidated assumption, not a cosmetic choice.
+#
+# An earlier revision of this example got this wrong: it used an invented,
+# nicer-looking "HovalConnectHomeAssistant/1.0 (...)" string while claiming
+# in this very comment that it matched const.py — it did not. That is
+# exactly the failure mode docs/audit-v0.24.0.md § 5 warns about, and it
+# slipped through because the pinning test only covered const.py. There is
+# now a test (test_examples_use_the_validated_user_agent) asserting this
+# file and get-live-values.sh both carry the same literal string as
+# const.py; update all four together, only after live re-validation.
+USER_AGENT = "hoval-connect-forensic-crawler/1.0 (+https://github.com/; diagnostic tool)"
 
 
 class HovalClient:
@@ -100,17 +113,45 @@ class HovalClient:
             h["X-Plant-Access-Token"] = self._get_plant_access_token(plant_id)
         return h
 
+    # Mirrors the production client's cap (api.py's _MAX_PLANT_PAGES): a
+    # backend that never reports last=True must not loop forever.
+    MAX_PLANT_PAGES = 50
+
     def get_plants(self) -> list:
-        """List plants. Paginated (size/page) since Hoval's May 2026 change."""
-        resp = self._session.get(
-            f"{self.BASE_URL}/api/my-plants",
-            params={"size": "12", "page": "0"},
-            headers=self._headers(),
-            timeout=self.TIMEOUT,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, list) else data.get("content", [])
+        """List plants, following pagination to the end.
+
+        Hoval's May 2026 change capped /api/my-plants at 12 items per page.
+        An earlier revision of this example fetched page 0 only, while its
+        docstring claimed to handle pagination — so an account with more
+        than 12 plants silently lost the rest. Fixed to iterate, matching
+        the production client's behavior in api.py.
+        """
+        all_plants: list = []
+        page = 0
+        while True:
+            resp = self._session.get(
+                f"{self.BASE_URL}/api/my-plants",
+                params={"size": "12", "page": str(page)},
+                headers=self._headers(),
+                timeout=self.TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list):
+                # Old (pre-pagination) shape: a plain list, no further pages.
+                return data
+            content = data.get("content", [])
+            all_plants.extend(content)
+            if data.get("last", True) or not content:
+                break
+            page += 1
+            if page >= self.MAX_PLANT_PAGES:
+                raise RuntimeError(
+                    f"get_plants pagination exceeded {self.MAX_PLANT_PAGES} pages "
+                    f"({len(all_plants)} plants collected) — refusing to return "
+                    "partial account topology."
+                )
+        return all_plants
 
     def get_circuits(self, plant_id: str) -> list:
         """List a plant's circuits (the v3 endpoint — v1 was removed 2026-04-21)."""

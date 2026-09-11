@@ -52,9 +52,11 @@ Plants and circuits are discovered automatically from your account.
 
 **Sensors** (deliberately narrow — see "Since v1.0.0" below):
 - Per circuit (HK/WW/HV only — not BL): **Actual value** and **Target value**
-  (temperature °C for HK/WW, air-volume % for HV). Target value is
-  diagnostic-category (it duplicates what the circuit's own climate/fan/
-  water-heater entity already shows); Actual value is on the main dashboard.
+  (temperature °C for HK/WW, air-volume % for HV). These refresh on every
+  scheduled health check (see the interval option above), not just at
+  startup. Target value is diagnostic-category (it duplicates what the
+  circuit's own climate/fan/water-heater entity already shows); Actual
+  value is on the main dashboard.
 - Per plant (all diagnostic category): **API last success** (timestamp),
   **API poll latency** (ms, with average/p95/EMA as attributes), **API
   failure rate** (%, rolling 1-hour window, with the since-startup overall
@@ -70,10 +72,13 @@ Plants and circuits are discovered automatically from your account.
 - Temporary override duration: 4 hours / until midnight
 - Cloud health-check interval: 10 / 15 / 30 (default) / 60 / 120 minutes — see "Since v1.0.0" below for what this does and doesn't affect
 
-Since **v2.2.0**, saving options reloads the integration (a few seconds of
-entity unavailability) instead of adjusting the poll timer in place. This is
-the lifecycle Home Assistant now requires; it also means every option takes
-effect immediately and identically.
+Saving options reloads the integration (a few seconds of entity
+unavailability) instead of adjusting the poll timer in place. This is the
+lifecycle Home Assistant now requires; it also means every option takes
+effect immediately and identically. (Introduced in the release the
+CHANGELOG records as `[2.2.0]` — see the version-history note at the
+bottom of this file; that tag is a historical typo for a `0.2x` release,
+not a version that precedes the current `1.0.0`.)
 
 **Since v1.0.0: no scheduled telemetry polling, just a configurable
 reachability check — plus a deliberately narrow set of sensors.** This
@@ -99,7 +104,7 @@ polling live values, weather, or events, which remain out of scope. See
 **Under the hood:**
 - 2-step token management (ID token + Plant Access Token) with TTL caching and auto-refresh
 - Circuit/program/settings data (the control surface) is fetched once at startup and again only after a write — never on a recurring schedule
-- The only recurring scheduled call is a minimal health check (one `GET /api/my-plants`) — every 30 minutes by default, configurable in Options — driving the "Cloud API problem" diagnostic sensor above
+- The only recurring scheduled work is a lightweight check — every 30 minutes by default, configurable in Options — consisting of one `GET /api/my-plants` (driving the "Cloud API problem" diagnostic) plus one `GET /circuits` per online plant to refresh the current-value sensors. That second call returns every circuit at once; there are deliberately **no** per-circuit telemetry calls, which is what keeps the cost flat as circuit count grows
 - Program cache (5min TTL) reduces API calls during startup/post-write refreshes
 - All circuit reads/writes use the `/v3` API (Hoval removed `/v1` circuit endpoints in April 2026); legacy v1 enum values still get normalized to v3 keys as a fallback
 - Cloud API calls go through `requests` (not Home Assistant's usual `aiohttp`), run via HA's background executor — a deliberate choice made in v0.24.0 after the cloud API started blocking `aiohttp` clients outright; see `docs/audit-v0.24.0.md` if you're curious why
@@ -126,7 +131,7 @@ polling live values, weather, or events, which remain out of scope. See
 - A Hoval Connect account (same credentials as the Hoval Connect mobile app)
 - **Home Assistant 2026.8.0 or newer** (see below)
 
-> **v2.2.0 raised the minimum Home Assistant version from 2024.1 to 2026.8.**
+> **The minimum Home Assistant version was raised from 2024.1 to 2026.8.**
 > The integration now uses `via_device_id` to link circuit devices to their
 > plant, which Home Assistant only added in 2026.8 — on older releases the
 > call fails and no circuit entity is created. If you cannot upgrade Home
@@ -599,3 +604,22 @@ The plant access token response includes a feature map indicating what operation
 ## Disclaimer
 
 This documentation was created through API analysis and is not officially supported by Hoval. The API may change at any time. Use responsibly and respect Hoval's terms of service.
+
+## A note on version history
+
+The current release is **1.0.0** (see `manifest.json`, which is
+authoritative).
+
+`CHANGELOG.md` contains an entry tagged `[2.2.0]`, positioned between
+`[0.24.0]` and `[0.21.0]`. That is **not** a version that precedes 1.0.0 —
+it is a historical typo. A mid-2026 release that should have been tagged in
+the `0.2x` line was written as `2.2.0`, and the manifest briefly carried
+`2.22.0` alongside it. Both were corrected when the `0.2x` line resumed at
+`0.23.0`, but the CHANGELOG heading was deliberately left as-published
+rather than silently rewritten, so the record matches what was actually
+shipped at the time.
+
+Read the lineage as: `… → 0.21.0 → [2.2.0, i.e. a 0.2x release] → 0.21.1 →
+0.23.0 → 0.24.0 → 0.24.1 → 1.0.0`.
+
+If you are rolling back, **0.24.1** is the supported fallback from 1.0.0.

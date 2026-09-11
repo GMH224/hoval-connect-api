@@ -143,7 +143,29 @@ def _make_coordinator(api: FakeApi | None = None) -> tuple[HovalDataCoordinator,
     api = api or FakeApi()
     # v2.2.0: the coordinator takes the config entry explicitly instead of
     # relying on HA's current_entry ContextVar.
-    coordinator = HovalDataCoordinator(MagicMock(), MagicMock(), api, MagicMock())
+    hass = MagicMock()
+
+    # Independent audit finding (2026-09, final round, P2): a bare
+    # MagicMock's async_create_task() records the call and DISCARDS the
+    # coroutine it was handed, never awaiting it — which made every test
+    # that triggers a post-write refresh leak an un-awaited coroutine and
+    # emit "coroutine ... was never awaited" at interpreter shutdown. One
+    # warning for the whole run, attributed to whichever test happened to
+    # be running during garbage collection, which is why it wandered
+    # between test names and was easy to keep ignoring.
+    #
+    # Closing the coroutine is the honest fake here: it disposes of it
+    # deterministically (no warning, no leak) without pretending to run
+    # it. Tests that genuinely need the task to EXECUTE already override
+    # hass.async_create_task with asyncio.ensure_future themselves — see
+    # TestBackgroundTaskTracking — so this default must not schedule
+    # anything, or those tests would stop exercising what they claim to.
+    def _discard_coroutine(coro):
+        coro.close()
+        return MagicMock()
+
+    hass.async_create_task = MagicMock(side_effect=_discard_coroutine)
+    coordinator = HovalDataCoordinator(hass, MagicMock(), api, MagicMock())
     return coordinator, api
 
 
@@ -1101,6 +1123,208 @@ class TestEmptyPlantsGuard:
         assert set(result.plants["p1"].circuits) == {"hv-1", "bl-1"}
 
 
+class TestCircuitValuesRefreshOnHealthCheck:
+    """The Option A fix (docs/audit-v1.0.0.md § 19).
+
+    Before this, `_health_check()` carried each plant's circuits dict
+    forward completely unchanged, so sensor.py's `actual_value` was frozen
+    at whatever the last FULL refresh produced — a temperature sensor that
+    silently never updated. These tests pin the corrected behavior AND the
+    cost constraint that shaped it (one circuits call per plant; no
+    per-circuit telemetry calls).
+    """
+
+    @pytest.mark.asyncio
+    async def test_actual_value_updates_between_scheduled_checks(self):
+        coordinator, api = _make_coordinator()
+        api.circuits_response = [
+            {
+                "type": "HK",
+                "path": "hk-1",
+                "name": "Heating",
+                "selectable": True,
+                "actualValue": 21.0,
+                "targetValue": 20.0,
+            }
+        ]
+        first = await coordinator._async_update_data()
+        coordinator.data = first
+        assert first.plants["p1"].circuits["hk-1"].actual_value == 21.0
+
+        # The house warms up; the next SCHEDULED check must see it.
+        api.circuits_response = [
+            {
+                "type": "HK",
+                "path": "hk-1",
+                "name": "Heating",
+                "selectable": True,
+                "actualValue": 23.5,
+                "targetValue": 20.0,
+            }
+        ]
+        second = await coordinator._async_update_data()
+
+        assert second.plants["p1"].circuits["hk-1"].actual_value == 23.5
+
+    @pytest.mark.asyncio
+    async def test_health_check_makes_one_circuits_call_not_one_per_circuit(self):
+        """The cost constraint: get_circuits() returns every circuit in a
+        single call. This must not regress into per-circuit telemetry
+        calls, which is what the user explicitly ruled out.
+        """
+        coordinator, api = _make_coordinator()
+        first = await coordinator._async_update_data()
+        coordinator.data = first
+        api.calls.clear()
+
+        await coordinator._async_update_data()
+
+        assert api.calls.count("circuits:p1") == 1
+        assert not any(c.startswith("live:") for c in api.calls)
+
+    @pytest.mark.asyncio
+    async def test_operation_mode_and_program_also_refresh(self):
+        """Not just the numbers: the fields driving climate/select state
+        must track reality too, or the entities lie in a subtler way.
+        """
+        coordinator, api = _make_coordinator()
+        api.circuits_response = [
+            {
+                "type": "HK",
+                "path": "hk-1",
+                "name": "Heating",
+                "selectable": True,
+                "operationMode": "regular",
+                "activeProgram": "week1",
+            }
+        ]
+        first = await coordinator._async_update_data()
+        coordinator.data = first
+
+        api.circuits_response = [
+            {
+                "type": "HK",
+                "path": "hk-1",
+                "name": "Heating",
+                "selectable": True,
+                "operationMode": "standby",
+                "activeProgram": "week2",
+            }
+        ]
+        second = await coordinator._async_update_data()
+
+        circuit = second.plants["p1"].circuits["hk-1"]
+        assert circuit.operation_mode == "standby"
+        assert circuit.active_program == "week2"
+
+    @pytest.mark.asyncio
+    async def test_slow_changing_fields_are_not_clobbered(self):
+        """program_names / weather_impact_* come from the full-refresh path
+        (programs + settings endpoints, which a health check does NOT
+        call). Refreshing values must leave them intact, not blank them.
+        """
+        coordinator, _api = _make_coordinator()
+        first = await coordinator._async_update_data()
+        coordinator.data = first
+        before = first.plants["p1"].circuits["hv-1"].program_names
+        assert before  # sanity: the full refresh populated them
+
+        second = await coordinator._async_update_data()
+
+        assert second.plants["p1"].circuits["hv-1"].program_names == before
+
+    @pytest.mark.asyncio
+    async def test_circuits_failure_does_not_fail_the_health_check(self):
+        """A transient circuits-list failure must not flip everything
+        unavailable — get_plants() already succeeded, so the cloud is
+        demonstrably reachable and the check's primary job is done.
+        """
+        coordinator, api = _make_coordinator()
+        first = await coordinator._async_update_data()
+        coordinator.data = first
+        original = first.plants["p1"].circuits["hv-1"].actual_value
+
+        api.circuits_response = HovalApiError("transient blip")
+        second = await coordinator._async_update_data()  # must not raise
+
+        # Previous values kept rather than wiped.
+        assert second.plants["p1"].circuits["hv-1"].actual_value == original
+
+    @pytest.mark.asyncio
+    async def test_offline_plant_skips_the_circuits_call(self):
+        coordinator, api = _make_coordinator()
+        first = await coordinator._async_update_data()
+        coordinator.data = first
+
+        api.plants_response = [
+            {"plantExternalId": "p1", "description": "Test Plant", "isOnline": False}
+        ]
+        api.calls.clear()
+        await coordinator._async_update_data()
+
+        assert api.calls == ["plants"]
+
+    @pytest.mark.asyncio
+    async def test_has_error_recomputed_from_refreshed_circuits(self):
+        coordinator, api = _make_coordinator()
+        api.circuits_response = [
+            {"type": "HK", "path": "hk-1", "name": "Heating", "selectable": True, "hasError": False}
+        ]
+        first = await coordinator._async_update_data()
+        coordinator.data = first
+        assert first.plants["p1"].has_error is False
+
+        api.circuits_response = [
+            {"type": "HK", "path": "hk-1", "name": "Heating", "selectable": True, "hasError": True}
+        ]
+        second = await coordinator._async_update_data()
+
+        assert second.plants["p1"].has_error is True
+
+    @pytest.mark.asyncio
+    async def test_unknown_circuit_in_response_is_ignored_not_added(self):
+        """Discovering a genuinely NEW circuit needs the full path
+        (programs, settings, entity creation, SIGNAL_NEW_CIRCUITS). The
+        value-refresh path must not half-create one.
+        """
+        coordinator, api = _make_coordinator()
+        first = await coordinator._async_update_data()
+        coordinator.data = first
+        known = set(first.plants["p1"].circuits)
+
+        api.circuits_response = [
+            {"type": "HK", "path": "brand-new", "name": "New", "selectable": True}
+        ]
+        second = await coordinator._async_update_data()
+
+        assert set(second.plants["p1"].circuits) == known
+
+    @pytest.mark.asyncio
+    async def test_malformed_values_in_refresh_are_coerced_to_none(self):
+        """HVC-008's guard must apply on this path too, not just the full
+        refresh — otherwise NaN reaches the sensors by a different route.
+        """
+        coordinator, api = _make_coordinator()
+        first = await coordinator._async_update_data()
+        coordinator.data = first
+
+        api.circuits_response = [
+            {
+                "type": "HV",
+                "path": "hv-1",
+                "name": "Ventilation",
+                "selectable": True,
+                "actualValue": float("nan"),
+                "targetValue": "garbage",
+            }
+        ]
+        second = await coordinator._async_update_data()
+
+        circuit = second.plants["p1"].circuits["hv-1"]
+        assert circuit.actual_value is None
+        assert circuit.target_value is None
+
+
 class TestTopologyChangeDetection:
     """Independent audit finding (2026-09, HVC-ICS-001): a plant that was
     offline during initial discovery, or a brand-new plant that appears
@@ -1185,6 +1409,12 @@ class TestTopologyChangeDetection:
         already-known, already-online plant with no changes must not
         trigger the upgrade — otherwise every single scheduled tick would
         silently become a full fetch again, defeating the whole point.
+
+        "Light" means no programs/settings calls and no per-circuit calls —
+        NOT zero circuit calls: since docs/audit-v1.0.0.md § 19, a light
+        check also makes one get_circuits() call per online plant to
+        refresh live current values. The distinction that matters for this
+        test is that it did not escalate to _fetch_all_data().
         """
         coordinator, api = _make_coordinator()
         first = await coordinator._async_update_data()  # startup
@@ -1193,7 +1423,8 @@ class TestTopologyChangeDetection:
         api.calls.clear()
         await coordinator._async_update_data()
 
-        assert api.calls == ["plants"]
+        assert api.calls == ["plants", "circuits:p1"]
+        assert not any(c.startswith(("programs:", "settings:")) for c in api.calls)
 
 
 class TestHealthCheckDispatch:
@@ -1227,7 +1458,12 @@ class TestHealthCheckDispatch:
 
         await coordinator._async_update_data()  # scheduled tick: light check
 
-        assert api.calls == ["plants"]  # nothing else — no circuits, no programs
+        # plants + ONE circuits call per online plant (to refresh live
+        # current values — see _refresh_circuit_values and
+        # docs/audit-v1.0.0.md § 19). Deliberately NOT programs/settings,
+        # and deliberately not a per-circuit call: those stay on the
+        # full-refresh path only.
+        assert api.calls == ["plants", "circuits:p1"]
 
     @pytest.mark.asyncio
     async def test_health_check_preserves_existing_circuits_unchanged(self):

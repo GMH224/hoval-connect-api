@@ -1547,7 +1547,89 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 has_error=any(c.has_error for c in circuits.values()),
                 circuits=circuits,
             )
+
+        # Refresh each online plant's per-circuit CURRENT VALUES (see
+        # _refresh_circuit_values). Deliberately after the loop above, so a
+        # failure there cannot cost us the plant-level result we already
+        # have.
+        for plant_id, plant_data in plants.items():
+            if plant_data.is_online and plant_data.circuits:
+                await self._refresh_circuit_values(plant_id, plant_data)
+                plant_data.has_error = any(c.has_error for c in plant_data.circuits.values())
+
         return HovalData(plants=plants)
+
+    async def _refresh_circuit_values(self, plant_id: str, plant_data: HovalPlantData) -> None:
+        """Update in-place the fields that genuinely change between polls.
+
+        Added after the first real deployment of v1.0.0 revealed a defect in
+        that release's own sensor revival (see docs/audit-v1.0.0.md § 19):
+        `_health_check()` carried each plant's `circuits` dict forward
+        completely unchanged, so `HovalCircuitData.actual_value` — which
+        sensor.py exposes as a live temperature/air-volume reading — was
+        frozen at whatever the last FULL refresh produced (startup, or the
+        last write). A temperature sensor that silently never updates is
+        arguably worse than no sensor at all, because it looks live.
+
+        Cost, and why it's shaped this way (the user's explicit constraint
+        was "no extra polls just to get telemetry — might blacklist the
+        account, and we have no SLA with Hoval"): this is ONE extra
+        `get_circuits()` call per online plant per cycle, which returns
+        every circuit at once. It deliberately does NOT call the per-circuit
+        live-values endpoint (`?circuitPath=...`, one call PER CIRCUIT,
+        scaling with circuit count) — that endpoint, along with weather and
+        events, remains removed from api.py entirely. This is the minimum
+        that makes the already-shipped sensors honest, not a reintroduction
+        of telemetry polling.
+
+        Updates only the fields that actually vary between polls, leaving
+        program_names / weather_impact_* (fetched on the full-refresh path,
+        cache-tiered, and slow-changing) untouched. Failures degrade to
+        "keep the previous values" rather than propagating: a transient
+        circuits-list failure during a routine health check must not fail
+        the whole cycle, because the health check's PRIMARY job — confirming
+        the cloud is reachable — has already succeeded by this point
+        (get_plants() returned). Raising here would flip every entity
+        unavailable and, worse, record a failed contact for a cloud that
+        just demonstrably answered.
+        """
+        try:
+            circuits_raw = await self.api.get_circuits(plant_id)
+        except HovalApiError as err:
+            _LOGGER.debug(
+                "Could not refresh circuit values for plant %s during health check "
+                "(keeping previous values): %s",
+                plant_id,
+                err,
+            )
+            return
+
+        if not isinstance(circuits_raw, list):
+            return
+
+        for raw_circuit in circuits_raw:
+            if not isinstance(raw_circuit, dict):
+                continue
+            path = raw_circuit.get("path")
+            if not path:
+                continue
+            circuit = plant_data.circuits.get(path)
+            if circuit is None:
+                # A circuit present in the response but not in our snapshot
+                # means the topology changed. Deliberately not handled here:
+                # discovering a NEW circuit needs the full path (programs,
+                # settings, entity creation, SIGNAL_NEW_CIRCUITS), which is
+                # _fetch_all_data()'s job, triggered by the plant-level
+                # topology detection above.
+                continue
+            raw_program = raw_circuit.get("activeProgram")
+            circuit.active_program = _V1_PROGRAM_MAP.get(raw_program, raw_program)
+            circuit.operation_mode = raw_circuit.get("operationMode")
+            circuit.target_value = _coerce_finite_number(raw_circuit.get("targetValue"))
+            circuit.actual_value = _coerce_finite_number(raw_circuit.get("actualValue"))
+            circuit.temporary_change_active = raw_circuit.get("temporaryChange") is not None
+            circuit.has_error = raw_circuit.get("hasError", False)
+            circuit.circuit_status = raw_circuit.get("circuitStatus")
 
     async def async_save_health(self) -> None:
         """Force an immediate health snapshot save to HA storage.
