@@ -85,6 +85,26 @@
       "weather_impact_solar_radiation": {
         "name": "Weather based control: solar radiation"
       }
+    },
+    "sensor": {
+      "circuit_actual_value": {
+        "name": "Actual value"
+      },
+      "circuit_target_value": {
+        "name": "Target value"
+      },
+      "api_last_success": {
+        "name": "API last success"
+      },
+      "api_poll_latency": {
+        "name": "API poll latency"
+      },
+      "api_failure_rate": {
+        "name": "API failure rate"
+      },
+      "api_last_error": {
+        "name": "API last error"
+      }
     }
   },
   "services": {

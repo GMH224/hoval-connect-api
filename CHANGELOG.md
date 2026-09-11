@@ -435,6 +435,50 @@ remaining 18 confirmed findings were fixed:
 Test suite grew to 377 tests (from 343). Still ruff clean, 64.2% overall
 coverage.
 
+### `sensor.py` partially reinstated
+
+At the user's explicit request, after living with v1.0.0 for the first
+time: removing `sensor.py` entirely turned out to go further than
+actually wanted, leaving zero at-a-glance visibility from this integration
+at all — even for data it was already fetching for control purposes. This
+is a deliberately narrow revival, not a reversal of the "no scheduled
+telemetry polling" architecture decision (§§1-3 above still apply in
+full):
+
+- **Per-circuit current-value sensors** — Actual value and Target value,
+  for HK/WW (temperature) and HV (air-volume %) circuits. Both read
+  `circuit.actual_value`/`circuit.target_value`, which are already part of
+  the circuits-list response fetched for control purposes regardless (see
+  the "more" audit report, finding HVC-003/finding-#3 lineage in
+  `docs/audit-v1.0.0.md`) — zero additional API calls. BL circuits are
+  excluded; their values are consistently null/meaningless in practice.
+  Target value is diagnostic-category (it duplicates what the circuit's
+  own climate/fan/water-heater entity already shows as its target).
+- **API health diagnostic sensors** — last success (timestamp), poll
+  latency (ms, with average/p95/EMA as attributes), failure rate (%,
+  rolling 1-hour window), and last error type (with its timestamp as an
+  attribute). All four read straight from the coordinator's already-
+  computed `connection_health` — nothing new is fetched here either.
+  Deliberately exposes only the error *type*, never the raw error
+  message: some error messages elsewhere in this integration embed a
+  circuit path or plant ID, and those are redacted in the diagnostics
+  *export* but would not be if forwarded verbatim into a live entity
+  attribute (visible in Logbook/History, not just a one-time export).
+
+**Explicitly still out of scope**: live_values, weather forecasts, events,
+and energy/hours counters. Restoring any of those would mean
+reintroducing scheduled telemetry polling — the actual thing v1.0.0's
+redesign was for. `Platform.SENSOR` is back in `PLATFORMS`; the five
+entities the user depends on for automations are unaffected either way,
+as they always have been across every change in this project's history.
+
+Test suite grew to 401 tests (from 377), including a new
+`tests/test_sensor.py` with genuine behavioral tests for every new sensor
+class (unusually thorough for an entity-platform file in this project —
+most others are limited to source-contract checks due to the shared test
+harness not implementing `CoordinatorEntity.available`). Still ruff
+clean, 64.7% overall coverage.
+
 ## [0.24.0] - 2026-09-10
 
 Transport rewrite: replaces `aiohttp` with `requests` (run via

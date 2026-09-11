@@ -50,6 +50,18 @@ Plants and circuits are discovered automatically from your account.
   passed with no successful contact of any kind (a scheduled health check or
   a write) — see "Since v1.0.0" below
 
+**Sensors** (deliberately narrow — see "Since v1.0.0" below):
+- Per circuit (HK/WW/HV only — not BL): **Actual value** and **Target value**
+  (temperature °C for HK/WW, air-volume % for HV). Target value is
+  diagnostic-category (it duplicates what the circuit's own climate/fan/
+  water-heater entity already shows); Actual value is on the main dashboard.
+- Per plant (all diagnostic category): **API last success** (timestamp),
+  **API poll latency** (ms, with average/p95/EMA as attributes), **API
+  failure rate** (%, rolling 1-hour window, with the since-startup overall
+  rate as an attribute), **API last error** (error type, or "none"; the
+  timestamp is an attribute — the raw error message is never exposed here,
+  only in the redacted diagnostics export)
+
 **Diagnostics:**
 - Full diagnostic data export with automatic PII redaction (tokens, credentials, plant IDs)
 
@@ -63,20 +75,26 @@ entity unavailability) instead of adjusting the poll timer in place. This is
 the lifecycle Home Assistant now requires; it also means every option takes
 effect immediately and identically.
 
-**Since v1.0.0: no telemetry polling, just a configurable reachability check.**
-This integration no longer polls live values, events, or weather forecasts
-on any schedule — it's designed to run alongside a telemetry source (e.g. a
-CAN-bus-based integration) and focus purely on the controls the cloud API
-uniquely offers (program selection, weather-based-control sliders). Circuit/
-program/settings data is fetched once at startup and again only after a
-write, never on a schedule — the health-check interval option above has no
-effect on that at all. The only thing that option controls is how often a
-minimal check (nothing more than confirming the cloud API is still
-reachable) runs, which in turn controls how quickly the "Cloud API problem"
-diagnostic can notice an outage. If you want temperature/energy/event
-sensors, get them from another source — this integration doesn't provide
-them anymore. See `docs/audit-v1.0.0.md` for the full rationale and what
-changed.
+**Since v1.0.0: no scheduled telemetry polling, just a configurable
+reachability check — plus a deliberately narrow set of sensors.** This
+integration doesn't poll live values, weather forecasts, or events on any
+schedule — it's designed to run alongside a dedicated telemetry source
+(e.g. a CAN-bus-based integration) and focus mainly on the controls the
+cloud API uniquely offers (program selection, weather-based-control
+sliders). Circuit/program/settings data is fetched once at startup and
+again only after a write, never on a schedule — the health-check interval
+option above has no effect on that at all; it only controls how often the
+minimal reachability check runs, which in turn controls how quickly the
+"Cloud API problem" diagnostic can notice an outage.
+
+The original v1.0.0 release removed `sensor.py` entirely. In practice that
+went further than wanted — it left zero at-a-glance visibility from this
+integration at all, even for data it was already fetching for control
+purposes. The **Actual value**/**Target value** and **API health** sensors
+above were added back specifically because they cost nothing extra (both
+use data already fetched for other reasons) — this is not a return to
+polling live values, weather, or events, which remain out of scope. See
+`docs/audit-v1.0.0.md` for the full history and rationale.
 
 **Under the hood:**
 - 2-step token management (ID token + Plant Access Token) with TTL caching and auto-refresh
@@ -99,7 +117,7 @@ changed.
 - **No time program editing.** Time programs can be selected (which week/mode is active) but their internal schedule (phase times/values) can't be modified through the integration.
 - **No holiday mode control.**
 - **Single account only.** Each HA instance supports one Hoval Connect account.
-- **No telemetry sensors since v1.0.0.** Temperatures, energy, humidity, and similar live values are no longer polled or exposed by this integration at all — see "Since v1.0.0" above. Get that data from another source (e.g. a CAN-bus-based integration) if you need it.
+- **Only a narrow slice of telemetry.** The Actual value/Target value sensors and API-health diagnostics (see "What You Get" above) are all this integration exposes — no full live-values, energy/hours counters, weather, or event history, and no plan to add them back (that would mean reintroducing scheduled polling, which is exactly what v1.0.0 removed). Get anything beyond that from another source (e.g. a CAN-bus-based integration).
 - **Static hardware assumption: no hot-swap.** Circuits/plants are discovered once at startup and again after a topology change is detected on a scheduled check (a plant coming online, or a new plant appearing) or a write; a circuit that's permanently *removed* from the account does not get its entity actively cleaned up — it will show as `unavailable` rather than disappearing. Removing it from Home Assistant, if wanted, is a manual step (Settings → Devices & Services → Entities). Consistent with this integration's existing "no hot-swap" design: reload the config entry to force a resync sooner than waiting for the next scheduled check.
 - **Device/circuit names sync on reload, not live.** If a plant or circuit is renamed in the Hoval app while Home Assistant keeps running, the device registry keeps showing the old name until the config entry is reloaded (Settings → Devices & Services → Hoval Connect → ⋮ → Reload) or HA restarts — the same reload boundary already used for options changes.
 

@@ -1315,10 +1315,88 @@ Recorded as accepted limitations in the README's Known Limitations, with
 "reload the config entry" as the documented resynchronization boundary —
 the same boundary already used for options changes.
 
-## 17. Test coverage (final)
+## 17. Test coverage (fourth round)
 
-Grew from 341 to 377 tests across the fourth audit round. Final: 377
-tests pass, ruff clean (lint + format), 64.2% overall coverage
-(`api.py` 90%, `coordinator.py` 89%, `diagnostics.py` 100%).
+Grew from 341 to 377 tests across the fourth audit round. 377 tests pass,
+ruff clean (lint + format), 64.2% overall coverage (`api.py` 90%,
+`coordinator.py` 89%, `diagnostics.py` 100%).
+
+## 18. `sensor.py` partially reinstated (user request, not an audit finding)
+
+After deploying v1.0.0 and living with it for the first time, the user
+reported that removing `sensor.py` entirely (§§1-3) went further than
+actually wanted: with zero sensor entities left, there was no at-a-glance
+visibility from this integration at all, even for data it was already
+retrieving for control purposes. Confirmed by inspecting a real deployed
+instance's diagnostics export and log: the underlying architecture was
+working exactly as designed (health check succeeding, circuits/programs/
+settings correctly populated), but nothing surfaced any of it as a sensor.
+
+This is scoped narrowly and deliberately, not a reversal of the "no
+scheduled telemetry polling" decision documented in §§1-3, which remains
+fully in effect:
+
+**What was added.** Two categories, both using data the coordinator
+already retrieves for other reasons — genuinely zero additional API calls:
+
+- Per-circuit `HovalCircuitActualValue`/`HovalCircuitTargetValue`, reading
+  `circuit.actual_value`/`circuit.target_value`. These fields have existed
+  on `HovalCircuitData` since the third audit round's HVC-003 fix (mapping
+  the circuits-list response's `actualValue`/`targetValue` fields, which
+  this integration was already fetching for control purposes) — they were
+  previously used only internally, as a fallback source for climate/fan/
+  water-heater's own current-value display properties, never exposed as
+  their own sensor entities. Scoped to HK/WW (temperature, °C) and HV
+  (air-volume, %); BL is excluded — its values are consistently null/0.0
+  in the confirmed real diagnostics export, not just in theory.
+- Four plant-level `_HovalApiHealthSensor` subclasses
+  (`HovalApiLastSuccess`, `HovalApiPollLatency`, `HovalApiFailureRate`,
+  `HovalApiLastError`), reading directly from
+  `coordinator.connection_health` — every value these expose was already
+  computed for the diagnostics export and the `cloud_api_problem` binary
+  sensor; nothing new is calculated either.
+
+**What was deliberately left out**, and why re-adding it would be a much
+bigger change than this one: `get_live_values()`, `get_weather()`,
+`get_plant_events()`/`get_latest_event()` remain deleted from `api.py` —
+restoring any of them means reintroducing scheduled polling of those
+endpoints, which is the actual thing the original v1.0.0 redesign
+removed. Bringing back a handful of already-fetched fields as sensors
+costs nothing; bringing back live-values/weather/events would mean
+undoing the core architectural decision, not extending it.
+
+**A privacy-scoping decision worth recording explicitly**:
+`HovalApiLastError` exposes only the error's *type* and *timestamp*, never
+`last_error_msg`. Several `_LOGGER`/error-message call sites elsewhere in
+this codebase format a circuit path or plant ID directly into their
+message text (see finding #9 in the "more" report, §13.9, which is the
+whole reason `diagnostics.py`'s export redacts this field). A live entity
+attribute is a different exposure surface than a one-time diagnostics
+export — visible in the Logbook and History, and to anyone with dashboard
+access — so forwarding the raw, unredacted message there would quietly
+undo that earlier redaction work. A test
+(`test_last_error_sensor_does_not_expose_raw_message`) guards this
+specifically by asserting `last_error_msg` never appears in the class's
+own source.
+
+**Test coverage**: new `tests/test_sensor.py`, 20 tests, constructing each
+entity class directly (bypassing `async_setup_entry`, consistent with
+this project's established entity-testing approach) and checking
+`native_value`/`extra_state_attributes` against a lightweight fake
+coordinator. `.available` is not exercised — it calls `super().available`,
+which the shared test-harness stub (`StubCoordinatorEntity` in
+`tests/ha_stubs.py`) does not implement, a pre-existing limitation shared
+identically by every other entity-platform file in this project
+(`climate.py`, `fan.py`, `number.py`, `select.py`, `water_heater.py`), not
+something specific to the new file. `CIRCUIT_PLATFORMS` in
+`tests/test_ha_compat.py` has `"sensor"` added back, since the new file
+follows the same `AddConfigEntryEntitiesCallback`/dynamic-discovery
+conventions as every other platform and passes that suite's existing
+baseline checks unmodified.
+
+Grew from 377 to 401 tests. Final: 401 tests pass, ruff clean (lint +
+format), 64.7% overall coverage (`api.py` 90%, `coordinator.py` 89%,
+`diagnostics.py` 100%, `sensor.py` 71% — notably higher than the other
+entity-platform files, precisely because of the behavioral tests above).
 
 

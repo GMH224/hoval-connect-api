@@ -46,11 +46,17 @@ CIRCUIT_PLATFORMS = [
     "fan",
     "number",
     "select",
+    "sensor",
     "water_heater",
 ]
-# v1.0.0 removed "sensor" from this list — sensor.py was deleted entirely
-# (every entity in it depended on telemetry this integration no longer
-# polls). See docs/audit-v1.0.0.md.
+# History: v1.0.0 originally removed "sensor" from this list when
+# sensor.py was deleted entirely (every entity in it depended on telemetry
+# this integration no longer polls). Reinstated when sensor.py was
+# recreated (same v1.0.0 release) as a deliberately narrow set of
+# current-value and API-health sensors — see sensor.py's own module
+# docstring and docs/audit-v1.0.0.md. The new file follows the same
+# AddConfigEntryEntitiesCallback / dynamic-discovery conventions as every
+# other platform here, so it belongs in this list's baseline checks again.
 
 
 # ---------------------------------------------------------------------------
@@ -720,8 +726,13 @@ class TestPlatformWiring:
 # ---------------------------------------------------------------------------
 # Units
 # ---------------------------------------------------------------------------
-# v1.0.0 deleted sensor.py entirely (see docs/audit-v1.0.0.md), which is
-# where every percentage-unit sensor this class guarded used to live.
+# History: v1.0.0 originally deleted sensor.py entirely, which is where a
+# whole class guarding a PERCENTAGE -> UnitOfRatio.PERCENTAGE migration
+# used to live (see docs/audit-v1.0.0.md). Not resurrected when sensor.py
+# was recreated: the new file's percentage usage is a direct
+# `_attr_native_unit_of_measurement = PERCENTAGE` (HV air-volume and the
+# API failure-rate sensor), not the more elaborate migration this class
+# guarded, so there is nothing equivalent left to test here.
 # TestPercentageUnits removed along with it.
 
 

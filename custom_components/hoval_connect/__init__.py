@@ -44,19 +44,28 @@ PLATFORMS = [
     Platform.FAN,
     Platform.NUMBER,
     Platform.SELECT,
+    Platform.SENSOR,
     Platform.WATER_HEATER,
 ]
-# v1.0.0 removed Platform.SENSOR entirely: every sensor entity depended on
-# telemetry (live-values, events, weather) this integration no longer polls
-# — a separate CAN-bus HACS integration is now the source for that data. See
-# docs/audit-v1.0.0.md and CHANGELOG.md. This is a breaking change: existing
-# sensor.* entities from this integration will stop updating and eventually
-# show as "not provided by the integration" in Settings > Devices & Services
-# > Entities; removing them from the registry is a manual step for the user
-# since Home Assistant does not do this automatically. The five entities the
-# user confirmed depending on for automations (2026-09-10) are unaffected —
-# select.*_program, number.*_weather_based_control_*, binary_sensor.*_error,
-# and water_heater.* were never sensor.py entities.
+# History: v1.0.0 originally removed Platform.SENSOR entirely, since every
+# sensor entity at the time depended on telemetry (live-values, events,
+# weather) this integration no longer polls — a separate CAN-bus HACS
+# integration is the source for that data. See docs/audit-v1.0.0.md and
+# CHANGELOG.md for the full "no telemetry polling" design.
+#
+# Reinstated (same v1.0.0 release, before deployment) at the user's
+# explicit request, after they found "zero telemetry visibility at all"
+# went further than actually wanted. sensor.py now exists again, but
+# deliberately narrow: only circuit current-value sensors
+# (actual_value/target_value, already fetched for control purposes — no
+# new API calls) and API-health diagnostics (last success, poll latency,
+# failure rate, last error type — already computed by the coordinator).
+# live_values/weather/events polling itself was NOT reintroduced; see
+# sensor.py's own module docstring for the exact scope. The five entities
+# the user confirmed depending on for automations (2026-09-10) were never
+# sensor.py entities and are unaffected either way — select.*_program,
+# number.*_weather_based_control_*, binary_sensor.*_error, and
+# water_heater.*.
 
 type HovalConnectConfigEntry = ConfigEntry[HovalRuntimeData]
 

@@ -331,6 +331,29 @@ future maintainers:
   Limitations) — consistent with the existing "static hardware" design.
   Don't "fix" this without revisiting that design decision explicitly.
 
+**`sensor.py` partially reinstated (same v1.0.0, user request after
+deployment):** see `docs/audit-v1.0.0.md` §18. Gotchas:
+- Only `actual_value`/`target_value` (HK/WW/HV) and `connection_health`-
+  derived API-health sensors exist. **Do not treat this as license to add
+  back live-values/weather/events polling** — that's the exact thing the
+  original v1.0.0 redesign removed, and this reinstatement was explicitly
+  scoped to "already-fetched data only, zero new API calls." If a future
+  request wants more telemetry than this, that's a new architectural
+  conversation, not an extension of this change.
+- `HovalApiLastError` exposes error *type* only, never `last_error_msg` —
+  guarded by a test asserting the string never appears in that class's
+  source. Don't add the raw message as an attribute; it can embed a
+  circuit path or plant ID, and a live attribute is visible in
+  Logbook/History, unlike the redacted diagnostics export.
+- BL circuits are deliberately excluded from the value sensors — confirmed
+  via a real deployed instance's diagnostics that their actual/target
+  values are consistently null/0.0, not just theoretically uninteresting.
+- `tests/test_sensor.py` is the first entity-platform test file in this
+  project with real behavioral coverage (constructing entities directly
+  against a fake coordinator) rather than only source-contract checks —
+  worth following that pattern if you add more sensors here, rather than
+  falling back to the thinner style used in climate.py/fan.py/etc.
+
 ### v0.24.0 — Transport rewrite: aiohttp -> requests-in-executor
 
 **This is the important one if you're reading this file to understand why

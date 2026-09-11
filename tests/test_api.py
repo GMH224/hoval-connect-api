@@ -1065,10 +1065,15 @@ class TestSourceContracts:
         src = self._read("climate.py")
         assert 'live_values.get("status")' in src
 
-    # v1.0.0 deleted sensor.py entirely (every entity in it depended on
-    # removed telemetry with no write capability) — the room_temp_actual
-    # descriptor contract test that used to live here went with it. See
-    # docs/audit-v1.0.0.md.
+    # History: v1.0.0 originally deleted sensor.py entirely (every entity
+    # in it depended on removed telemetry with no write capability), which
+    # is where the room_temp_actual descriptor contract test that used to
+    # live here went with it. Not resurrected when sensor.py was recreated
+    # (same v1.0.0 release, at the user's request): the new file's HK/WW/HV
+    # circuit-type filtering is a plain dict lookup
+    # (_VALUE_UNIT_BY_CIRCUIT_TYPE), not the entity-description-with-
+    # circuit_types pattern this test guarded, so there's nothing
+    # equivalent to test here. See docs/audit-v1.0.0.md.
 
     def test_bl_still_in_non_selectable_types(self):
         """BL must remain in the non-selectable types so selectable=False doesn't exclude it."""
