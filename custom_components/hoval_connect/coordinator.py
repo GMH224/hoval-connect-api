@@ -20,7 +20,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
-from .api import HovalApiError, HovalAuthError, HovalConnectApi
+from .api import HovalApiError, HovalAuthError, HovalConnectApi, _require_identifier
 from .const import (
     CIRCUIT_SETTINGS_CACHE_TTL,
     CIRCUIT_TYPE_BL,
@@ -38,6 +38,24 @@ from .const import (
 SIGNAL_NEW_CIRCUITS = f"{DOMAIN}_new_circuits"
 
 _LOGGER = logging.getLogger(__name__)
+
+# ICS-HIGH-007 (audit v1.0.1): number of consecutive health-check cycles a
+# circuit must be absent from the live topology before it is removed from
+# `plant_data.circuits`. >1 so a single transient/truncated response
+# doesn't remove (and thus make briefly unavailable) a circuit that is
+# actually still there.
+_STALE_CIRCUIT_CONFIRMATIONS = 2
+
+# ICS-CRIT-004 (audit v1.0.1): upper bound on simultaneous in-flight circuit
+# fetches across one full-refresh cycle. Generous relative to any real
+# installation (a handful of plants/circuits) — this is a safety cap on the
+# worst case, not a tuning knob for normal operation.
+_MAX_CONCURRENT_CIRCUIT_FETCHES = 8
+
+# ICS-HIGH-012 (audit v1.0.1): a get_plants() response reporting fewer than
+# this fraction of the previously-known plant count is treated with the
+# same suspicion as a fully empty one — see _guard_against_empty_plants().
+_PARTIAL_PLANTS_DROP_RATIO = 0.5
 
 # v1 API returns different activeProgram values than v3.
 # Normalize so entities always see v3 enum keys.
@@ -89,7 +107,7 @@ async def resolve_resume_program(
     if isinstance(circuits_raw, list):
         for raw_circuit in circuits_raw:
             if isinstance(raw_circuit, dict) and raw_circuit.get("path") == circuit_path:
-                raw_program = raw_circuit.get("activeProgram")
+                raw_program = _coerce_optional_str(raw_circuit.get("activeProgram"))
                 fresh_program = _V1_PROGRAM_MAP.get(raw_program, raw_program)
                 break
 
@@ -205,6 +223,33 @@ _NON_SELECTABLE_TYPES = frozenset({CIRCUIT_TYPE_BL, CIRCUIT_TYPE_WW})
 _LATENCY_HISTORY_SIZE = 60  # p95 needs enough samples to be meaningful
 
 
+def _coerce_bool(value: Any, *, default: bool) -> bool:
+    """Coerce an API boolean field strictly, or fall back to `default`.
+
+    ICS-HIGH-001 (audit v1.0.1): fields like `isOnline`/`hasError`/
+    `isSelectable` used to be accepted via bare truthiness (`bool(value)`
+    or an unchecked `.get(key, default)`), so a schema-drifted response
+    sending the STRING `"false"` — a real possibility for a boolean field
+    coming from a cloud API — would be treated as `True` by Python's
+    `bool("false")`. Only a genuine `bool` is accepted; anything else
+    (including a stringly-typed "false"/"true") falls back to `default`
+    rather than being silently reinterpreted.
+    """
+    return value if isinstance(value, bool) else default
+
+
+def _coerce_optional_str(value: Any) -> str | None:
+    """Return `value` if it's a string, else None (ICS-HIGH-020).
+
+    Guards enum-ish fields (`operationMode`, `activeProgram`) that are
+    otherwise passed straight through from the API to entity state/display
+    logic: a schema-drifted response sending a list/dict/number here must
+    degrade to "unknown" rather than reaching string-only consumers
+    (dispatcher keys, dict lookups, log formatting) with the wrong type.
+    """
+    return value if isinstance(value, str) else None
+
+
 def _coerce_finite_number(value: Any) -> float | None:
     """Coerce an API numeric field to a finite float, or None if it isn't one.
 
@@ -256,7 +301,7 @@ def _is_circuit_selectable(circuit: dict) -> bool:
     is_selectable = circuit.get("isSelectable")
     if is_selectable is None:
         is_selectable = circuit.get("selectable", False)
-    return bool(is_selectable)
+    return _coerce_bool(is_selectable, default=False)
 
 
 # Exponential-moving-average decay factor: 10 % weight to each new sample.
@@ -345,6 +390,15 @@ class HovalConnectionHealth:
     # turns on once this is more than CLOUD_API_PROBLEM_THRESHOLD stale.
     last_successful_contact_at: datetime | None = None
 
+    # --- ICS-CRIT-005 / ICS-MED-003 (audit v1.0.1, session-only) ---
+    # A write that returned HTTP success is not, by itself, proof the
+    # controller actually applied it — see `_confirm_write()`. These track
+    # how often the post-write follow-up read failed to confirm the
+    # expected state, surfaced in diagnostics so a persistent mismatch is
+    # visible rather than only ever logged.
+    last_unconfirmed_write_at: datetime | None = None
+    unconfirmed_write_count: int = 0
+
     def __post_init__(self) -> None:
         """Initialise rolling-history containers.
 
@@ -382,6 +436,21 @@ class HovalConnectionHealth:
         evidence the API is reachable.
         """
         self.last_successful_contact_at = ts
+
+    def record_unconfirmed_write(self, ts: datetime, message: str) -> None:
+        """Record that a write's follow-up read did not confirm it took effect.
+
+        ICS-CRIT-005 / ICS-MED-003: called by `_confirm_write()` when the
+        post-write refresh completes but the resulting state doesn't match
+        what was requested. Does not affect `last_successful_contact_at`
+        (the HTTP call itself still succeeded — this is about the
+        PHYSICAL outcome, a separate question) or entity state (which
+        stays optimistic per the existing UX design) — purely a
+        visibility/diagnostics signal.
+        """
+        self.last_unconfirmed_write_at = ts
+        self.unconfirmed_write_count += 1
+        _LOGGER.warning("Write not confirmed by follow-up read: %s", message)
 
     # ------------------------------------------------------------------
     # EMA update
@@ -555,7 +624,28 @@ class HovalConnectionHealth:
         # now validated (finite, non-negative) before conversion, and a
         # bad entry is skipped rather than aborting the whole dict.
         error_counts: dict[str, int] = {}
-        for k, v in data.get("error_counts", {}).items():
+        # ICS-006 (independent audit, 2026-09, v1.0.1 round): the CONTAINER
+        # itself must be type-checked, not just the values inside it. Round
+        # 4's HVC-012 fix validated every value (finite, non-negative) but
+        # still called `.items()` on whatever `error_counts` happened to be —
+        # a persisted list, string, or number raises AttributeError there.
+        # That matters because restore_from_store() is called OUTSIDE the
+        # try/except that guards health_store.async_load() in __init__.py
+        # (that guard covers the LOAD, not the PARSE), so this would
+        # propagate straight out of async_setup_entry and fail the whole
+        # integration's setup — on a corrupted file the user cannot easily
+        # inspect. A sweep of the other three persisted reads in this method
+        # found them already safe: they use data.get() into scalar checks,
+        # not container operations.
+        raw_error_counts = data.get("error_counts", {})
+        if not isinstance(raw_error_counts, dict):
+            _LOGGER.warning(
+                "Persisted error_counts is %s, not a mapping — discarding it and "
+                "starting those counters fresh.",
+                type(raw_error_counts).__name__,
+            )
+            raw_error_counts = {}
+        for k, v in raw_error_counts.items():
             if k not in _ALL_ERROR_TYPES:
                 continue
             if isinstance(v, bool) or not isinstance(v, (int, float)) or not isfinite(v):
@@ -616,6 +706,12 @@ class HovalConnectionHealth:
                 if self.last_successful_contact_at
                 else None
             ),
+            "last_unconfirmed_write_at": (
+                self.last_unconfirmed_write_at.isoformat()
+                if self.last_unconfirmed_write_at
+                else None
+            ),
+            "unconfirmed_write_count": self.unconfirmed_write_count,
             "last_error": {
                 "time": self.last_error_time.isoformat() if self.last_error_time else None,
                 "type": self.last_error_type,
@@ -720,6 +816,44 @@ class HovalData:
     """Top-level data returned by the coordinator."""
 
     plants: dict[str, HovalPlantData] = field(default_factory=dict)
+
+
+def normalize_weather_impact_outside_temperature(value: Any) -> int | None:
+    """Normalize an API-provided outside-temperature weighting for entity state.
+
+    Independent audit finding (2026-09, v1.0.1 round, ICS-004): the WRITE
+    path has had clamping helpers since v0.21.0, and round 4 added
+    _coerce_finite_number() for targetValue/actualValue — but the READ path
+    for weatherImpact assigned `weather_impact.get("outsideTemperature")`
+    straight into HovalCircuitData with no validation at all. A malformed
+    cloud response ("abc", [], NaN, or an out-of-band 500) became
+    NumberEntity state directly, violating that entity's declared
+    native_min_value/native_max_value contract.
+
+    A sweep for this shape found SIX assignment sites, not the four the
+    audit reported — the optimistic-override fold-back path was also
+    unvalidated. All six now route through these two helpers.
+
+    Returns None for anything non-numeric or non-finite; otherwise clamps
+    into the documented band, reusing the same clamp function the write
+    path uses so read and write agree on what "valid" means.
+    """
+    coerced = _coerce_finite_number(value)
+    if coerced is None:
+        return None
+    return clamp_weather_impact_outside_temperature(coerced)
+
+
+def normalize_weather_impact_solar_radiation(value: Any) -> float | None:
+    """Normalize an API-provided solar-radiation weighting for entity state.
+
+    See normalize_weather_impact_outside_temperature() for the rationale
+    (independent audit finding 2026-09, v1.0.1 round, ICS-004).
+    """
+    coerced = _coerce_finite_number(value)
+    if coerced is None:
+        return None
+    return clamp_weather_impact_solar_radiation(coerced)
 
 
 def _extract_weather_impact(settings: dict) -> tuple[Any, Any]:
@@ -841,7 +975,20 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         )
         self.api = api
         self._health_store = health_store
-        self.control_lock = asyncio.Lock()
+        # ICS-CRIT-003 (audit v1.0.1): was a single global asyncio.Lock()
+        # serializing EVERY control action for EVERY circuit on EVERY plant
+        # against each other. A slow/hung write to one circuit stalled
+        # every unrelated circuit's writes too. Replaced by one lock per
+        # (plant_id, circuit_path), created lazily — see
+        # `_get_circuit_lock()`. Concurrent writes to the SAME circuit are
+        # still fully serialized (that protection is still needed and
+        # unchanged); writes to DIFFERENT circuits no longer wait on each
+        # other at all.
+        self._circuit_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        # ICS-CRIT-004: shared across every _fetch_all_data() cycle so the
+        # bound is global, not "N per plant" (which would still be
+        # unbounded in aggregate for an account with many plants).
+        self._circuit_fetch_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_CIRCUIT_FETCHES)
         # Optimistic mode override per circuit (set by control actions, cleared
         # on next successful poll OR when it exceeds _MODE_OVERRIDE_TTL_S).
         # Value: (operation_mode_string, monotonic_timestamp).
@@ -881,7 +1028,11 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         # value=({"outsideTemperature": int|None, "solarRadiation": float|None}, monotonic_ts)
         self._weather_impact_override: dict[tuple[str, str], tuple[dict[str, Any], float]] = {}
         # Track known circuits for dynamic entity discovery
-        self._known_circuits: set[str] = set()
+        self._known_circuits: set[tuple[str, str]] = set()
+        # ICS-HIGH-007: consecutive-miss counter per (plant_id, path), used
+        # by _refresh_circuit_values() to decide when a circuit that has
+        # disappeared from the live topology should actually be removed.
+        self._circuit_miss_counts: dict[tuple[str, str], int] = {}
         # API connection health — persists across poll cycles
         self._connection_health = HovalConnectionHealth()
         # v1.0.0: dispatch flags for _async_update_data (see its docstring).
@@ -925,6 +1076,57 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
     def connection_health(self) -> HovalConnectionHealth:
         """Return the current API connection health snapshot."""
         return self._connection_health
+
+    def _confirm_write(
+        self, plant_id: str, circuit_path: str, *, field: str, expected: Any
+    ) -> None:
+        """Check a just-refreshed circuit against what a write requested.
+
+        ICS-CRIT-005 / ICS-MED-003 (audit v1.0.1): a write returning HTTP
+        success only proves the cloud API *accepted* the request, not that
+        the physical controller applied it. This is called from the
+        post-write background refresh (once real, non-optimistic data is
+        available) as a best-effort positive-confirmation check. It does
+        NOT raise, retry, or revert the (already-applied) optimistic
+        entity state — see the module-level design note this audit
+        accepted: reverting on mismatch would fight a state the user may
+        have already changed again, and there is no realtime push channel
+        to know when a slow-to-apply command finally lands. It DOES make a
+        persistent mismatch visible (WARNING log + diagnostics counter)
+        instead of silently trusting the HTTP 2xx forever.
+
+        Deliberately tolerant of "can't tell": if the plant/circuit isn't
+        present in the fresh data at all (e.g. the plant went offline
+        between the write and this check), that is a DIFFERENT, already
+        separately-surfaced problem (see CRIT-008 / `is_online`), not
+        treated as an unconfirmed write.
+        """
+        plant = self.data.plants.get(plant_id) if self.data else None
+        circuit = plant.circuits.get(circuit_path) if plant else None
+        if circuit is None:
+            return
+        actual = getattr(circuit, field, None)
+        if actual != expected:
+            self._connection_health.record_unconfirmed_write(
+                dt_util.utcnow(),
+                f"{plant_id}/{circuit_path}: expected {field}={expected!r}, got {actual!r}",
+            )
+
+    def _get_circuit_lock(self, plant_id: str, circuit_path: str) -> asyncio.Lock:
+        """Return the per-circuit control lock, creating it on first use.
+
+        ICS-CRIT-003: replaces the old single global `control_lock`. Safe
+        to call repeatedly with no `await` in between the dict lookup and
+        the (possible) creation — asyncio's single-threaded model means
+        nothing else can run between them, so two concurrent callers for a
+        brand-new circuit can never each create and use a different lock.
+        """
+        key = (plant_id, circuit_path)
+        lock = self._circuit_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._circuit_locks[key] = lock
+        return lock
 
     def create_tracked_task(self, coro) -> asyncio.Task:
         """Schedule a background task and track it for shutdown cancellation.
@@ -983,7 +1185,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
     _EMPTY_PLANTS_CONFIRMATION_THRESHOLD = 2
 
     def _guard_against_empty_plants(self, plants_raw: list) -> bool:
-        """Return True if an empty get_plants() response should be trusted.
+        """Return True if a get_plants() response should be trusted as-is.
 
         Independent audit finding (2026-09, "more" report, finding #3): both
         _health_check() and _fetch_all_data() used to rebuild the plant
@@ -995,37 +1197,54 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         a *successful* contact. This is a fail-open-into-a-destructive-state
         problem, not merely a display glitch.
 
-        Only distrusts an empty response when plants were PREVIOUSLY known
+        ICS-HIGH-012 (audit v1.0.1): the original guard only ever checked
+        `if not plants_raw` — a non-empty but suspiciously SHORT response
+        (e.g. 1 plant back when 10 were previously known) sailed straight
+        through as fully authoritative, silently dropping every plant not
+        in that response. Now applies the identical
+        distrust-until-confirmed logic to that case too: a response
+        reporting fewer than `_PARTIAL_PLANTS_DROP_RATIO` of the
+        previously-known plant count is treated exactly like an empty one.
+
+        Only distrusts a response when plants were PREVIOUSLY known
         (self.data already has at least one plant) — a genuinely new
         account, or a legitimate first-ever fetch, has nothing to lose by
-        accepting `[]` immediately. Once distrusted, requires
-        _EMPTY_PLANTS_CONFIRMATION_THRESHOLD consecutive empty responses
+        accepting whatever comes back immediately. Once distrusted, requires
+        _EMPTY_PLANTS_CONFIRMATION_THRESHOLD consecutive suspicious responses
         (via either code path — a health check or a full refresh both call
-        this) before actually accepting the wipe, so a real "the account
-        genuinely now has zero plants" transition still eventually takes
-        effect rather than being permanently refused.
+        this) before actually accepting the change, so a real "the account
+        genuinely now has fewer/zero plants" transition still eventually
+        takes effect rather than being permanently refused.
         """
-        if plants_raw:
+        previously_known = len(self.data.plants) if (self.data and self.data.plants) else 0
+        is_suspicious = (not plants_raw) or (
+            previously_known >= 2
+            and len(plants_raw) < previously_known * _PARTIAL_PLANTS_DROP_RATIO
+        )
+        if not is_suspicious:
             self._consecutive_empty_plants = 0
             return True
-        if not (self.data and self.data.plants):
-            return True  # nothing previously known — an empty result is unremarkable
+        if previously_known == 0:
+            return True  # nothing previously known — any result is unremarkable
         self._consecutive_empty_plants += 1
         if self._consecutive_empty_plants >= self._EMPTY_PLANTS_CONFIRMATION_THRESHOLD:
             _LOGGER.warning(
-                "get_plants() returned empty %d times in a row despite %d "
-                "previously known plant(s); accepting this as a genuine "
-                "topology change rather than a transient anomaly.",
+                "get_plants() returned a suspiciously short response (%d "
+                "plant(s)) %d times in a row despite %d previously known "
+                "plant(s); accepting this as a genuine topology change "
+                "rather than a transient anomaly.",
+                len(plants_raw),
                 self._consecutive_empty_plants,
-                len(self.data.plants),
+                previously_known,
             )
             return True
         _LOGGER.warning(
-            "get_plants() returned an empty list while %d plant(s) were "
+            "get_plants() returned only %d plant(s) while %d were "
             "previously known (%d/%d confirmations so far) — treating this "
             "as a likely transient/anomalous response and keeping the "
-            "existing topology rather than wiping it.",
-            len(self.data.plants),
+            "existing topology rather than dropping the missing plant(s).",
+            len(plants_raw),
+            previously_known,
             self._consecutive_empty_plants,
             self._EMPTY_PLANTS_CONFIRMATION_THRESHOLD,
         )
@@ -1104,8 +1323,21 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         age and now could otherwise be silently reverted by this PATCH,
         since both fields are always sent together (see
         api.update_circuit_settings's docstring for why).
+
+        ICS-CRIT-003: locks on this specific (plant_id, circuit_path), not
+        a global lock — see `_get_circuit_lock()`.
+
+        ICS-CRIT-007 (residual risk, documented and accepted — see
+        docs/audit-v1.0.2.md): this still cannot protect against a WRITE
+        from outside this integration (the Hoval app, another HA instance)
+        landing between the fresh GET above and the PATCH below. Closing
+        that gap completely would require the cloud API to support
+        conditional writes (ETag/If-Match or a version field on
+        CircuitSettingsDTO); nothing observed in the API so far offers
+        that. The per-circuit lock here only serializes writes *this
+        integration* originates.
         """
-        async with self.control_lock:
+        async with self._get_circuit_lock(plant_id, circuit_path):
             key = (plant_id, circuit_path)
             current = self.get_weather_impact_override(plant_id, circuit_path)
             cached = self._settings_cache.get(key)
@@ -1234,17 +1466,33 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
             try:
                 self._pending_full_refresh_since = time.monotonic()
                 await self.async_request_refresh()
+                self._confirm_write(
+                    plant_id,
+                    circuit_path,
+                    field="weather_impact_outside_temperature",
+                    expected=resolved_outside,
+                )
+                self._confirm_write(
+                    plant_id,
+                    circuit_path,
+                    field="weather_impact_solar_radiation",
+                    expected=resolved_solar,
+                )
             except Exception:  # noqa: BLE001
-                _LOGGER.debug(
+                # ICS-MED-003 (audit v1.0.1): WARNING, not DEBUG — a failed
+                # post-write refresh previously vanished entirely from a
+                # default-configured HA log, indistinguishable from success.
+                _LOGGER.warning(
                     "Post-control refresh failed for %s; coordinator will retry on next poll",
                     circuit_path,
+                    exc_info=True,
                 )
 
         self.create_tracked_task(_do_refresh())
 
     async def async_control_and_refresh(
         self,
-        coro: Any,
+        coro_factory: Any,
         *,
         plant_id: str,
         circuit_path: str,
@@ -1252,8 +1500,26 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
     ) -> None:
         """Execute a control command with lock, optimistic state, and refresh.
 
-        The API call and optimistic override are serialised inside control_lock
-        so concurrent control actions don't race each other.
+        The API call and optimistic override are serialised inside a
+        per-(plant_id, circuit_path) lock (ICS-CRIT-003 — see
+        `_get_circuit_lock()`) so concurrent control actions on the SAME
+        circuit don't race each other, without making unrelated circuits'
+        writes wait on each other too.
+
+        `coro_factory` is a ZERO-ARGUMENT CALLABLE that returns the
+        control-API coroutine when called — e.g.
+        `lambda: self.api.reset_circuit(plant_id, circuit_path)` — NOT an
+        already-created coroutine object (ICS-HIGH-006, audit v1.0.1): a
+        bare `self.api.reset_circuit(...)` argument is evaluated by Python
+        immediately, before this method (and its lock acquisition) ever
+        runs. If the caller's own task were cancelled while still waiting
+        to acquire the lock, that already-created-but-never-awaited
+        coroutine object would be silently garbage-collected mid-flight (a
+        `RuntimeWarning: coroutine was never awaited`, and a write the user
+        thought they'd made simply never happening, no differently from
+        any other cancellation — except silently). Calling the factory
+        only once the lock is held means no coroutine is ever created
+        before there is a live, immediate intention to await it.
 
         `plant_id` is required (independent audit finding, 2026-09, HVC-001):
         the optimistic mode override is keyed on (plant_id, circuit_path),
@@ -1276,12 +1542,14 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         API has time to commit the change before we fetch fresh state, without
         blocking the caller.
 
-        If the background refresh fails (transient timeout), it is silently
-        discarded — the coordinator will retry on its normal poll schedule and
-        entities remain at their optimistic state until then.
+        If the background refresh fails (transient timeout), it is logged
+        at WARNING (ICS-MED-003 — previously DEBUG, effectively invisible)
+        and the write's outcome is left unconfirmed; the coordinator will
+        retry on its normal poll schedule and entities remain at their
+        optimistic state until then. See `_confirm_write()`.
         """
-        async with self.control_lock:
-            await coro
+        async with self._get_circuit_lock(plant_id, circuit_path):
+            await coro_factory()
             self.set_mode_override(plant_id, circuit_path, mode_override)
             # See the equivalent comment in async_set_weather_impact: the
             # write succeeding is itself proof of cloud contact.
@@ -1308,10 +1576,16 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 # field's comment in __init__ (HVC-002).
                 self._pending_full_refresh_since = time.monotonic()
                 await self.async_request_refresh()
+                self._confirm_write(
+                    plant_id, circuit_path, field="operation_mode", expected=mode_override
+                )
             except Exception:  # noqa: BLE001
-                _LOGGER.debug(
+                # ICS-MED-003: WARNING, not DEBUG — see the identical note
+                # in async_set_weather_impact's _do_refresh.
+                _LOGGER.warning(
                     "Post-control refresh failed for %s; coordinator will retry on next poll",
                     circuit_path,
+                    exc_info=True,
                 )
 
         self.create_tracked_task(_do_refresh())
@@ -1504,7 +1778,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
             if not plant_id:
                 continue
             prior = existing.get(plant_id)
-            now_online = raw.get("isOnline", True)
+            now_online = _coerce_bool(raw.get("isOnline"), default=True)
             if prior is None or (not prior.is_online and now_online):
                 topology_changed = True
                 break
@@ -1543,7 +1817,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
             plants[plant_id] = HovalPlantData(
                 plant_id=plant_id,
                 name=raw.get("description") or (prior.name if prior is not None else plant_id),
-                is_online=raw.get("isOnline", True),
+                is_online=_coerce_bool(raw.get("isOnline"), default=True),
                 has_error=any(c.has_error for c in circuits.values()),
                 circuits=circuits,
             )
@@ -1607,29 +1881,106 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         if not isinstance(circuits_raw, list):
             return
 
+        # ICS-HIGH-007 (audit v1.0.1): track which paths this fresh response
+        # actually reports so a circuit that has genuinely disappeared from
+        # the plant (removed/reconfigured upstream) can be dropped below,
+        # instead of surviving forever in `plant_data.circuits` with
+        # whatever values it last had. Built from the raw response
+        # regardless of supported/selectable status — an unsupported-type
+        # circuit still occupying its path means the SUPPORTED one at that
+        # path really is gone, not just filtered out here.
+        seen_paths: set[str] = set()
+
         for raw_circuit in circuits_raw:
             if not isinstance(raw_circuit, dict):
                 continue
             path = raw_circuit.get("path")
             if not path:
                 continue
+            seen_paths.add(path)
             circuit = plant_data.circuits.get(path)
             if circuit is None:
-                # A circuit present in the response but not in our snapshot
-                # means the topology changed. Deliberately not handled here:
-                # discovering a NEW circuit needs the full path (programs,
-                # settings, entity creation, SIGNAL_NEW_CIRCUITS), which is
-                # _fetch_all_data()'s job, triggered by the plant-level
-                # topology detection above.
+                # ICS-002 (independent audit, 2026-09, v1.0.1 round). This
+                # branch previously just `continue`d, with a comment
+                # claiming discovery was "_fetch_all_data()'s job,
+                # triggered by the plant-level topology detection above".
+                # That claim was FALSE: plant-level detection fires only
+                # on a brand-new plant or an offline->online transition.
+                # A circuit added to an already-online plant matches
+                # neither, so it appeared in this response every single
+                # cycle and was silently discarded forever — no entity, no
+                # warning, until a restart or an unrelated write happened
+                # to trigger a full fetch.
+                #
+                # Worse, this got MORE wrong when the scheduled circuits
+                # fetch was added: before that, "new circuits aren't
+                # discovered" was an honest consequence of never looking.
+                # Afterwards we looked, saw it, and threw it away.
+                #
+                # The supported-type filter below is essential, not
+                # incidental: plant_data.circuits deliberately excludes
+                # types this integration does not implement (SOL, FRIWA,
+                # ...), so "absent from the snapshot" does NOT imply "new".
+                # Without this check, every unsupported circuit on the
+                # plant would look new on EVERY cycle and pin
+                # _pending_full_refresh_since permanently on, silently
+                # converting the lightweight health check into a
+                # full fetch forever — the exact cost the v1.0.0
+                # architecture exists to avoid. (Caught by
+                # test_no_unknown_circuit_does_not_schedule_a_refresh,
+                # which failed on the first version of this fix.)
+                ctype = raw_circuit.get("type", "")
+                is_supported = ctype in SUPPORTED_CIRCUIT_TYPES and (
+                    _is_circuit_selectable(raw_circuit) or ctype in _NON_SELECTABLE_TYPES
+                )
+                if is_supported and self._pending_full_refresh_since is None:
+                    _LOGGER.info(
+                        "Circuit %r on plant %s is not in the current snapshot; "
+                        "scheduling a full discovery refresh to create its entities.",
+                        path,
+                        plant_id,
+                    )
+                    self._pending_full_refresh_since = time.monotonic()
                 continue
-            raw_program = raw_circuit.get("activeProgram")
+            raw_program = _coerce_optional_str(raw_circuit.get("activeProgram"))
             circuit.active_program = _V1_PROGRAM_MAP.get(raw_program, raw_program)
-            circuit.operation_mode = raw_circuit.get("operationMode")
+            circuit.operation_mode = _coerce_optional_str(raw_circuit.get("operationMode"))
             circuit.target_value = _coerce_finite_number(raw_circuit.get("targetValue"))
             circuit.actual_value = _coerce_finite_number(raw_circuit.get("actualValue"))
             circuit.temporary_change_active = raw_circuit.get("temporaryChange") is not None
-            circuit.has_error = raw_circuit.get("hasError", False)
+            circuit.has_error = _coerce_bool(raw_circuit.get("hasError"), default=False)
             circuit.circuit_status = raw_circuit.get("circuitStatus")
+
+        # ICS-HIGH-007: drop any circuit this plant used to have that is no
+        # longer reported at all — the topology-drift gap HVC-007 (see
+        # class docstring reference above) fixed the "circuit appeared,
+        # never picked up" direction of; this is the symmetric "circuit
+        # vanished, never removed" direction, which was still open. A
+        # circuit missing from ONE response could just as easily be a
+        # transient upstream hiccup, so this only removes a path that has
+        # been absent for _STALE_CIRCUIT_CONFIRMATIONS consecutive health
+        # checks in a row, not on the first miss.
+        vanished = set(plant_data.circuits) - seen_paths
+        if vanished:
+            for path in vanished:
+                miss_count = self._circuit_miss_counts.get((plant_id, path), 0) + 1
+                self._circuit_miss_counts[(plant_id, path)] = miss_count
+                if miss_count >= _STALE_CIRCUIT_CONFIRMATIONS:
+                    _LOGGER.info(
+                        "Circuit %r on plant %s missing from %d consecutive health "
+                        "checks; removing it (entity will become unavailable until "
+                        "a full discovery refresh, if it reappears).",
+                        path,
+                        plant_id,
+                        miss_count,
+                    )
+                    plant_data.circuits.pop(path, None)
+                    self._circuit_miss_counts.pop((plant_id, path), None)
+        # Any path that WAS missing before but is present again this cycle
+        # (or every currently-present path) should not carry a stale miss
+        # count forward.
+        for path in seen_paths:
+            self._circuit_miss_counts.pop((plant_id, path), None)
 
     async def async_save_health(self) -> None:
         """Force an immediate health snapshot save to HA storage.
@@ -1771,6 +2122,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
 
             # Build list of supported circuits
             supported_circuits: list[tuple[str, str, dict]] = []
+            seen_supported_paths: set[str] = set()
             for circuit in valid_circuits_raw:
                 ctype = circuit.get("type", "")
                 if ctype not in SUPPORTED_CIRCUIT_TYPES:
@@ -1785,6 +2137,36 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                         {k: v for k, v in circuit.items() if k != "name"},
                     )
                     continue
+                # ICS-HIGH-002: malformed (non-string/oversized/control-char)
+                # paths are skipped with a warning rather than raised —
+                # raising here would fail the ENTIRE plant's refresh over
+                # one bad entry among potentially many good ones.
+                try:
+                    path = _require_identifier(path, "circuit path")
+                except HovalApiError as err:
+                    _LOGGER.warning(
+                        "Skipping circuit with invalid path for plant %s: %s", plant_id, err
+                    )
+                    continue
+                # ICS-HIGH-008 (audit v1.0.1): deduplicated HERE, before any
+                # fetch task for this path is even created — the version of
+                # this check that used to run only after `asyncio.gather()`
+                # completed still let every duplicate's concurrent fetch
+                # run and race to write the same (plant_id, path) cache
+                # entries. Skipping the second+ occurrence before launch
+                # means only one fetch (and one cache write) per path ever
+                # happens, full stop — the discard-after-gather logic
+                # further below now exists purely as defense in depth.
+                if path in seen_supported_paths:
+                    _LOGGER.warning(
+                        "Plant %s reported two circuits with the same path %r; "
+                        "fetching only the first one seen. This indicates an "
+                        "upstream data problem, not normal operation.",
+                        plant_id,
+                        path,
+                    )
+                    continue
+                seen_supported_paths.add(path)
                 if _LOGGER.isEnabledFor(logging.DEBUG):
                     _LOGGER.debug(
                         "Circuit %s raw: %s",
@@ -1800,7 +2182,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                 circuit: dict,
                 _plant_id: str = plant_id,
             ) -> HovalCircuitData:
-                raw_program = circuit.get("activeProgram")
+                raw_program = _coerce_optional_str(circuit.get("activeProgram"))
                 # Independent audit finding (2026-09, HVC-ICS-005): explicit
                 # isinstance check, not just `or {}`. A truthy NON-dict value
                 # (a string, list, or number) would pass through `or {}`
@@ -1818,7 +2200,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                     circuit_type=ctype,
                     path=path,
                     name=circuit.get("name") or ctype,
-                    operation_mode=circuit.get("operationMode"),
+                    operation_mode=_coerce_optional_str(circuit.get("operationMode")),
                     active_program=_V1_PROGRAM_MAP.get(raw_program, raw_program),
                     target_value=_coerce_finite_number(circuit.get("targetValue")),
                     # Free (already part of this same circuits-list response,
@@ -1827,7 +2209,7 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                     actual_value=_coerce_finite_number(circuit.get("actualValue")),
                     temporary_change_active=circuit.get("temporaryChange") is not None,
                     is_air_quality_guided=bool(air_quality.get("isAirQualityGuided")),
-                    has_error=circuit.get("hasError", False),
+                    has_error=_coerce_bool(circuit.get("hasError"), default=False),
                     circuit_status=circuit.get("circuitStatus"),
                 )
 
@@ -1966,11 +2348,17 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                             if not isinstance(weather_impact, dict):
                                 weather_impact = {}
                             circuit_data.weather_impact_supported = True
-                            circuit_data.weather_impact_outside_temperature = weather_impact.get(
-                                "outsideTemperature"
+                            # ICS-004: normalized, not raw — see
+                            # normalize_weather_impact_outside_temperature().
+                            circuit_data.weather_impact_outside_temperature = (
+                                normalize_weather_impact_outside_temperature(
+                                    weather_impact.get("outsideTemperature")
+                                )
                             )
-                            circuit_data.weather_impact_solar_radiation = weather_impact.get(
-                                "solarRadiation"
+                            circuit_data.weather_impact_solar_radiation = (
+                                normalize_weather_impact_solar_radiation(
+                                    weather_impact.get("solarRadiation")
+                                )
                             )
                         else:
                             _LOGGER.debug(
@@ -2019,11 +2407,17 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                             if not isinstance(weather_impact, dict):
                                 weather_impact = {}
                             circuit_data.weather_impact_supported = True
-                            circuit_data.weather_impact_outside_temperature = weather_impact.get(
-                                "outsideTemperature"
+                            # ICS-004: normalized, not raw — see
+                            # normalize_weather_impact_outside_temperature().
+                            circuit_data.weather_impact_outside_temperature = (
+                                normalize_weather_impact_outside_temperature(
+                                    weather_impact.get("outsideTemperature")
+                                )
                             )
-                            circuit_data.weather_impact_solar_radiation = weather_impact.get(
-                                "solarRadiation"
+                            circuit_data.weather_impact_solar_radiation = (
+                                normalize_weather_impact_solar_radiation(
+                                    weather_impact.get("solarRadiation")
+                                )
                             )
                     # else: settings is None (no cache and not fetched this cycle
                     # for a type that supports it, e.g. first poll ordering edge
@@ -2036,16 +2430,39 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
                     override = self.get_weather_impact_override(_plant_id, path)
                     if override is not None:
                         circuit_data.weather_impact_supported = True
-                        circuit_data.weather_impact_outside_temperature = override.get(
-                            "outsideTemperature"
+                        # ICS-004: the override path was NOT in the audit's list;
+                        # found by sweeping for the shape. An override is
+                        # built from already-clamped write values, so this is
+                        # belt-and-braces — but it must not be the one site
+                        # that silently diverges.
+                        circuit_data.weather_impact_outside_temperature = (
+                            normalize_weather_impact_outside_temperature(
+                                override.get("outsideTemperature")
+                            )
                         )
-                        circuit_data.weather_impact_solar_radiation = override.get("solarRadiation")
+                        circuit_data.weather_impact_solar_radiation = (
+                            normalize_weather_impact_solar_radiation(override.get("solarRadiation"))
+                        )
 
                 return circuit_data
 
-            # Run circuits in parallel.
+            # ICS-CRIT-004 (audit v1.0.1): fan-out was previously fully
+            # unbounded — one `asyncio.gather()` task per circuit, with no
+            # limit on how many ran concurrently. An account with a large
+            # number of plants/circuits (or several accounts polled close
+            # together) could open a burst of simultaneous connections/
+            # executor jobs. Bounded to _MAX_CONCURRENT_CIRCUIT_FETCHES via
+            # a semaphore shared across this whole fetch cycle; well above
+            # any real installation's circuit count, so normal operation is
+            # unaffected — this only caps the worst case.
+            async def _fetch_circuit_bounded(path, ctype, circ):
+                async with self._circuit_fetch_semaphore:
+                    return await _fetch_circuit(path, ctype, circ)
+
+            # Run circuits in parallel (bounded — see above).
             all_tasks = [
-                _fetch_circuit(path, ctype, circ) for path, ctype, circ in supported_circuits
+                _fetch_circuit_bounded(path, ctype, circ)
+                for path, ctype, circ in supported_circuits
             ]
             all_results = await asyncio.gather(*all_tasks, return_exceptions=True)
 
@@ -2089,6 +2506,28 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
 
             data.plants[plant_id] = plant_data
 
+        # ICS-HIGH-011 (audit v1.0.1): reconcile per-circuit caches/locks/
+        # overrides against the live topology just fetched, instead of
+        # letting them grow forever as circuits are added/removed/renamed
+        # over the integration's lifetime. Skips a lock that is currently
+        # HELD (`.locked()`) — a topology change mid-write must never evict
+        # the lock a control action is actively relying on for mutual
+        # exclusion.
+        live_keys = {(pid, path) for pid, plant in data.plants.items() for path in plant.circuits}
+        for cache in (
+            self._program_cache,
+            self._settings_cache,
+            self._weather_impact_override,
+            self._mode_override,
+        ):
+            for key in [k for k in cache if k not in live_keys]:
+                del cache[key]
+        for key in [
+            k for k, lock in self._circuit_locks.items() if k not in live_keys and not lock.locked()
+        ]:
+            del self._circuit_locks[key]
+        self.api.prune_plant_caches(set(data.plants))  # ICS-HIGH-010
+
         # Detect new circuits for dynamic entity discovery.
         # Fire on any newly seen circuit, including the first one. Skipping the
         # initial set (when `_known_circuits` was still empty) used to leave
@@ -2097,8 +2536,13 @@ class HovalDataCoordinator(DataUpdateCoordinator[HovalData]):
         # and the dispatcher then suppressed the catch-up signal. Each platform
         # already deduplicates via its `known` set, so firing on the first
         # discovery is a no-op when entities are already present.
+        # ICS-HIGH-009 (audit v1.0.1): tuples, not an underscore-joined
+        # string. `f"{pid}_{path}"` could collide if either half contained
+        # an underscore (e.g. plant "a" circuit "b_c" vs plant "a_b"
+        # circuit "c") — a real new circuit could then be masked as
+        # already-known, or vice versa. A tuple key can't collide this way.
         current_circuits = {
-            f"{pid}_{path}" for pid, plant in data.plants.items() for path in plant.circuits
+            (pid, path) for pid, plant in data.plants.items() for path in plant.circuits
         }
         new_circuits = current_circuits - self._known_circuits
         if new_circuits:

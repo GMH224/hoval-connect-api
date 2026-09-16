@@ -125,4 +125,9 @@ def main(src_root: str) -> int:
 
 
 if __name__ == "__main__":
+    # ICS-LOW-001 (audit v1.0.1): guarded — running this with no argument
+    # used to raise a bare, confusing IndexError instead of a usage message.
+    if len(sys.argv) != 2:
+        print(f"Usage: python {sys.argv[0]} <path-to-custom_components-dir>", file=sys.stderr)
+        sys.exit(2)
     sys.exit(main(sys.argv[1]))

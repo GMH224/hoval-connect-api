@@ -138,6 +138,10 @@ class FakeApi:
     def invalidate_plant_token(self, plant_id):
         self.invalidated.append(plant_id)
 
+    def prune_plant_caches(self, valid_plant_ids):
+        """No-op stand-in for the real client's ICS-HIGH-010 cache pruning."""
+        self.pruned_plant_ids = set(valid_plant_ids)
+
 
 def _make_coordinator(api: FakeApi | None = None) -> tuple[HovalDataCoordinator, FakeApi]:
     api = api or FakeApi()
@@ -790,7 +794,7 @@ class TestBackgroundTaskTracking:
             return None
 
         await coordinator.async_control_and_refresh(
-            _noop_coro(), plant_id="p1", circuit_path="hv-1", mode_override="standby"
+            _noop_coro, plant_id="p1", circuit_path="hv-1", mode_override="standby"
         )
         assert len(coordinator._background_tasks) == 1
 
@@ -1323,6 +1327,121 @@ class TestCircuitValuesRefreshOnHealthCheck:
         circuit = second.plants["p1"].circuits["hv-1"]
         assert circuit.actual_value is None
         assert circuit.target_value is None
+
+
+class TestIcs002NewCircuitDiscovery:
+    """ICS-001..008 round (v1.0.1). ICS-002: a circuit added to an
+    ALREADY-ONLINE plant matched neither topology trigger (new plant /
+    offline->online), so the scheduled refresh saw it in the response
+    every cycle and silently discarded it forever.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unknown_circuit_schedules_a_full_discovery(self):
+        coordinator, api = _make_coordinator()
+        first = await coordinator._async_update_data()
+        coordinator.data = first
+        coordinator._pending_full_refresh_since = None
+
+        api.circuits_response = [
+            {"type": "HV", "path": "hv-1", "name": "Ventilation", "selectable": True},
+            {"type": "HK", "path": "brand-new", "name": "New Circuit", "selectable": True},
+        ]
+        await coordinator._async_update_data()
+
+        assert coordinator._pending_full_refresh_since is not None
+
+    @pytest.mark.asyncio
+    async def test_new_circuit_actually_appears_on_the_following_cycle(self):
+        """End-to-end: the escalation must genuinely produce the entity's
+        data, not merely set a flag.
+        """
+        coordinator, api = _make_coordinator()
+        first = await coordinator._async_update_data()
+        coordinator.data = first
+
+        api.circuits_response = [
+            {"type": "HV", "path": "hv-1", "name": "Ventilation", "selectable": True},
+            {"type": "HK", "path": "brand-new", "name": "New Circuit", "selectable": True},
+        ]
+        second = await coordinator._async_update_data()  # detects, schedules
+        coordinator.data = second
+        third = await coordinator._async_update_data()  # full discovery runs
+
+        assert "brand-new" in third.plants["p1"].circuits
+
+    @pytest.mark.asyncio
+    async def test_no_unknown_circuit_does_not_schedule_a_refresh(self):
+        """Regression guard: this must not fire every cycle, or the
+        scheduled check silently becomes a permanent full fetch.
+        """
+        coordinator, _api = _make_coordinator()
+        first = await coordinator._async_update_data()
+        coordinator.data = first
+        coordinator._pending_full_refresh_since = None
+
+        await coordinator._async_update_data()
+
+        assert coordinator._pending_full_refresh_since is None
+
+
+class TestIcs004WeatherImpactReadValidation:
+    """ICS-004: the WRITE path clamped, the READ path did not — malformed
+    API values became NumberEntity state directly. A sweep for the shape
+    found six assignment sites, two more than the audit reported.
+    """
+
+    @staticmethod
+    def _hk_coordinator(weather_impact):
+        """weatherImpact is only fetched for HK circuits (SUPPORTS_WEATHER_IMPACT)."""
+        api = FakeApi()
+        api.circuits_response = [
+            {
+                "type": "HK",
+                "path": "hk-1",
+                "name": "Heating",
+                "selectable": True,
+                "operationMode": "REGULAR",
+            }
+        ]
+        api.settings_response = {"circuitName": "HK", "weatherImpact": weather_impact}
+        return _make_coordinator(api)
+
+    @pytest.mark.asyncio
+    async def test_non_numeric_values_become_none(self):
+        coordinator, _api = self._hk_coordinator(
+            {"outsideTemperature": "abc", "solarRadiation": []}
+        )
+        data = await coordinator._fetch_all_data()
+        hk = data.plants["p1"].circuits["hk-1"]
+        assert hk.weather_impact_outside_temperature is None
+        assert hk.weather_impact_solar_radiation is None
+
+    @pytest.mark.asyncio
+    async def test_non_finite_values_become_none(self):
+        coordinator, _api = self._hk_coordinator(
+            {"outsideTemperature": float("nan"), "solarRadiation": float("inf")}
+        )
+        data = await coordinator._fetch_all_data()
+        hk = data.plants["p1"].circuits["hk-1"]
+        assert hk.weather_impact_outside_temperature is None
+        assert hk.weather_impact_solar_radiation is None
+
+    @pytest.mark.asyncio
+    async def test_out_of_range_values_are_clamped_into_the_entity_band(self):
+        coordinator, _api = self._hk_coordinator({"outsideTemperature": 500, "solarRadiation": 99})
+        data = await coordinator._fetch_all_data()
+        hk = data.plants["p1"].circuits["hk-1"]
+        assert hk.weather_impact_outside_temperature == 100
+        assert hk.weather_impact_solar_radiation == 0.0
+
+    @pytest.mark.asyncio
+    async def test_valid_values_pass_through_unchanged(self):
+        coordinator, _api = self._hk_coordinator({"outsideTemperature": 70, "solarRadiation": -3.5})
+        data = await coordinator._fetch_all_data()
+        hk = data.plants["p1"].circuits["hk-1"]
+        assert hk.weather_impact_outside_temperature == 70
+        assert hk.weather_impact_solar_radiation == -3.5
 
 
 class TestTopologyChangeDetection:

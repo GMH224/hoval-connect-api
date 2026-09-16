@@ -14,6 +14,12 @@
 
 set -e
 
+# ICS-MED-007 (audit v1.0.1): every curl call below is given explicit
+# --connect-timeout/--max-time bounds. Without them, curl has NO
+# default timeout at all — a diagnostic script whose whole purpose is
+# probing a possibly-misbehaving endpoint could hang indefinitely on
+# exactly the kind of slow/wedged connection it exists to investigate.
+
 EMAIL="${1:?Usage: $0 <email> <password> <plantId> <circuitPath>}"
 PASSWORD="${2:?}"
 PLANT_ID="${3:?}"
@@ -41,7 +47,7 @@ UA="hoval-connect-forensic-crawler/1.0 (+https://github.com/; diagnostic tool)"
 
 # Step 1: Get ID token
 echo "Authenticating..."
-TOKEN_RESP=$(curl -s -X POST "$IDP" \
+TOKEN_RESP=$(curl -s --connect-timeout 10 --max-time 30 -X POST "$IDP" \
   -H "Content-Type: application/x-www-form-urlencoded" \
   -H "User-Agent: $UA" \
   -d "grant_type=password&client_id=$CLIENT_ID&username=$EMAIL&password=$PASSWORD&scope=openid")
@@ -50,7 +56,7 @@ ID_TOKEN=$(echo "$TOKEN_RESP" | python3 -c "import sys,json; print(json.load(sys
 
 # Step 2: Get Plant Access Token
 echo "Getting plant access token..."
-PAT=$(curl -s "$BASE/v1/plants/$PLANT_ID/settings" \
+PAT=$(curl -s --connect-timeout 10 --max-time 30 "$BASE/v1/plants/$PLANT_ID/settings" \
   -H "Authorization: Bearer $ID_TOKEN" \
   -H "User-Agent: $UA" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
@@ -63,7 +69,7 @@ PAT=$(curl -s "$BASE/v1/plants/$PLANT_ID/settings" \
 # appears to be accepted-and-ignored rather than wrong — but the contract is
 # the contract, and an example should demonstrate the documented call.
 echo "Fetching live values for circuit $CIRCUIT_PATH..."
-curl -s "$BASE/v3/api/statistics/live-values/$PLANT_ID?circuitPath=$CIRCUIT_PATH" \
+curl -s --connect-timeout 10 --max-time 30 "$BASE/v3/api/statistics/live-values/$PLANT_ID?circuitPath=$CIRCUIT_PATH" \
   -H "Authorization: Bearer $ID_TOKEN" \
   -H "X-Plant-Access-Token: $PAT" \
   -H "User-Agent: $UA" | python3 -m json.tool

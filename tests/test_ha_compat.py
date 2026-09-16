@@ -743,6 +743,36 @@ class TestPlantDeviceResolver:
         )
         assert circuit.via_device_id == plant_device_id
 
+    def test_prune_drops_ids_for_plants_no_longer_present(
+        self, plant_devices: HovalPlantDevices, registry: ha_stubs.StubDeviceRegistry
+    ) -> None:
+        """ICS-MED-004 (audit v1.0.1): _device_ids must not grow forever."""
+        plant_devices.async_get_device_id("plant1", _plant("plant1"))
+        plant_devices.async_get_device_id("plant2", _plant("plant2"))
+        assert set(plant_devices._device_ids) == {"plant1", "plant2"}
+
+        plant_devices.async_prune({"plant1"})
+        assert set(plant_devices._device_ids) == {"plant1"}
+
+    def test_prune_keeps_a_plant_that_reappears(
+        self, plant_devices: HovalPlantDevices, registry: ha_stubs.StubDeviceRegistry
+    ) -> None:
+        first = plant_devices.async_get_device_id("plant1", _plant("plant1"))
+        plant_devices.async_prune(set())
+        assert plant_devices._device_ids == {}
+
+        # If the plant reappears, it re-resolves (and, since the registry
+        # entry itself was never touched, reuses) the same device ID.
+        again = plant_devices.async_get_device_id("plant1", _plant("plant1"))
+        assert again == first
+
+    def test_prune_with_no_stale_entries_is_a_no_op(
+        self, plant_devices: HovalPlantDevices, registry: ha_stubs.StubDeviceRegistry
+    ) -> None:
+        plant_devices.async_get_device_id("plant1", _plant("plant1"))
+        plant_devices.async_prune({"plant1", "plant2"})
+        assert set(plant_devices._device_ids) == {"plant1"}
+
     def test_unregistered_parent_is_rejected(self, registry: ha_stubs.StubDeviceRegistry) -> None:
         with pytest.raises(ValueError, match="not a registered device id"):
             registry.async_get_or_create(
@@ -975,20 +1005,31 @@ class TestManifestAndMetadata:
     def test_version_is_bumped(self) -> None:
         """
         Version history (see CHANGELOG.md for the full story of the earlier
-        typo/correction cycle): 0.21.1 -> 0.23.0 -> 0.24.0 -> now 1.0.0.
+        typo/correction cycle): 0.21.1 -> 0.23.0 -> 0.24.0 -> 0.24.1 ->
+        1.0.0 -> 1.0.1 -> now 1.0.2.
 
-        1.0.0 is a deliberate major-version jump, not a routine increment:
-        v1.0.0 is a genuine architecture change (this integration no longer
-        polls telemetry on any schedule — see docs/audit-v1.0.0.md) that the
-        user explicitly wanted a clean, distinct version number for, so a
-        previously-deployed 0.24.0 install is never silently overwritten by
-        an in-place update. Bump this string (and manifest.json) together on
-        release.
+        1.0.0 was a deliberate major-version jump, not a routine increment:
+        a genuine architecture change (this integration no longer polls
+        telemetry on any schedule — see docs/audit-v1.0.0.md) that the user
+        wanted a clean, distinct version number for, so a previously-
+        deployed 0.24.0 install was never silently overwritten in place.
+
+        1.0.1 was a patch of the first deployed 1.0.0, with no architecture
+        change and no new capability (docs/audit-v1.0.1.md). 1.0.2 is a
+        full-codebase remediation release — all 40 findings from an
+        independent audit run across the whole integration, including one
+        (offline-plant availability) that 1.0.1 explicitly deferred as too
+        large a behaviour change for a patch release — see
+        docs/audit-v1.0.2.md. 0.24.1 remains the supported rollback target
+        from 1.0.1; 1.0.1 is the rollback target from 1.0.2.
+
+        Bump this string, manifest.json, and tools/mutation_check.py
+        together on release.
         """
         import json
 
         manifest = json.loads((COMPONENT_DIR / "manifest.json").read_text())
-        assert manifest["version"] == "1.0.0"
+        assert manifest["version"] == "1.0.2"
 
     def test_hacs_minimum_ha_covers_via_device_id(self) -> None:
         """via_device_id landed in HA 2026.8; earlier versions raise TypeError.
@@ -1015,3 +1056,142 @@ class TestSourceIntegrity:
     def test_every_platform_module_is_importable(self) -> None:
         for platform in [*CIRCUIT_PLATFORMS, "binary_sensor", "diagnostics", "config_flow"]:
             __import__(f"custom_components.hoval_connect.{platform}", fromlist=["x"])
+
+
+class TestIcs001CommittedWriteIsNotCancelled:
+    """ICS-001 (v1.0.1): cancelling a debounce task that has already begun
+    its HTTP request does NOT stop that request — it only unwinds the
+    coroutine, releasing control_lock so a newer write can overtake it.
+    The older value could then land last and win.
+
+    Source-contract tests: exercising the real race needs a live executor
+    and a controllable slow request, which this project's harness does not
+    provide. These pin the mechanism instead, in both files that have it.
+    """
+
+    def test_both_debounced_platforms_track_a_committed_task(self) -> None:
+        for platform in ("number", "fan"):
+            src = _source(platform)
+            assert "_committed_task" in src, f"{platform}.py lost committed-task tracking"
+
+    def test_cancel_refuses_to_cancel_the_committed_task(self) -> None:
+        for platform in ("number", "fan"):
+            src = _source(platform)
+            assert "task is not self._committed_task" in src, (
+                f"{platform}.py's _cancel_debounce no longer protects a committed write"
+            )
+
+    def test_commit_marker_is_set_after_the_debounce_sleep(self) -> None:
+        """Order matters: marking before the sleep would make the whole
+        debounce window non-cancellable, defeating debouncing entirely.
+        """
+        for platform in ("number", "fan"):
+            src = _source(platform)
+            sleep_idx = src.index("await asyncio.sleep(DEBOUNCE_SECONDS)")
+            commit_idx = src.index("self._committed_task = asyncio.current_task()")
+            assert commit_idx > sleep_idx, (
+                f"{platform}.py marks the write committed before the debounce sleep"
+            )
+
+    def test_commit_marker_is_cleared_in_a_finally(self) -> None:
+        """A marker left set would make the entity permanently
+        un-debounceable after its first write.
+        """
+        for platform in ("number", "fan"):
+            src = _source(platform)
+            assert "if self._committed_task is asyncio.current_task():" in src, (
+                f"{platform}.py does not clear its committed marker"
+            )
+
+
+class TestIcs007OptionsFlowToleratesCorruptOptions:
+    """ICS-007 (v1.0.1): every value read to build the options form is
+    persisted config-entry data. The audit reported the unguarded int(); a
+    sweep found all three reads needed treatment.
+    """
+
+    @staticmethod
+    def _form_with(options):
+        flow = HovalConnectOptionsFlow()
+        flow.config_entry = MagicMock(options=options)
+        return asyncio.run(flow.async_step_init(None))
+
+    def test_non_numeric_interval_does_not_crash_the_form(self) -> None:
+        from custom_components.hoval_connect.const import DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+
+        result = self._form_with({"health_check_interval": "not-a-number"})
+        assert result["type"] == "form"
+        marker = next(k for k in result["data_schema"].schema if k == "health_check_interval")
+        assert marker.default() == DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+
+    def test_out_of_band_interval_falls_back(self) -> None:
+        from custom_components.hoval_connect.const import DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+
+        result = self._form_with({"health_check_interval": 7})
+        marker = next(k for k in result["data_schema"].schema if k == "health_check_interval")
+        assert marker.default() == DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+
+    def test_corrupt_turn_on_mode_falls_back_to_a_valid_choice(self) -> None:
+        """Not a crash but the v0.23.0 'renders empty' shape: a default that
+        is not one of the vol.In keys shows a blank selector.
+        """
+        from custom_components.hoval_connect.const import (
+            DEFAULT_TURN_ON_MODE,
+            VALID_TURN_ON_MODES,
+        )
+
+        result = self._form_with({"turn_on_mode": "garbage"})
+        marker = next(k for k in result["data_schema"].schema if k == "turn_on_mode")
+        assert marker.default() == DEFAULT_TURN_ON_MODE
+        assert marker.default() in VALID_TURN_ON_MODES
+
+    def test_corrupt_override_duration_falls_back_to_a_valid_choice(self) -> None:
+        from custom_components.hoval_connect.const import (
+            DEFAULT_OVERRIDE_DURATION,
+            VALID_OVERRIDE_DURATIONS,
+        )
+
+        result = self._form_with({"override_duration": "garbage"})
+        marker = next(k for k in result["data_schema"].schema if k == "override_duration")
+        assert marker.default() == DEFAULT_OVERRIDE_DURATION
+        assert marker.default() in VALID_OVERRIDE_DURATIONS
+
+    def test_all_three_corrupt_at_once_still_opens(self) -> None:
+        result = self._form_with(
+            {
+                "health_check_interval": [],
+                "turn_on_mode": 42,
+                "override_duration": None,
+            }
+        )
+        assert result["type"] == "form"
+
+
+class TestIcs008UnloadCleanupIsResilient:
+    """ICS-008 (v1.0.1): a health-save failure must not skip task
+    cancellation and session close — and must not fail the unload, which
+    would also block a reload.
+    """
+
+    def test_save_health_is_wrapped_in_try_except(self) -> None:
+        src = _source("__init__")
+        idx = src.index("await coordinator.async_save_health()")
+        assert "try:" in src[idx - 200 : idx], "async_save_health() is not inside a try block"
+        assert "except" in src[idx : idx + 400]
+
+    def test_cleanup_steps_run_after_the_guarded_save(self) -> None:
+        src = _source("__init__")
+        save_idx = src.index("await coordinator.async_save_health()")
+        shutdown_idx = src.index("await coordinator.async_shutdown()")
+        close_idx = src.index("await entry.runtime_data.api.aclose()")
+        assert save_idx < shutdown_idx < close_idx, (
+            "unload ordering changed: tasks must be cancelled before the session closes"
+        )
+
+    def test_restore_from_store_is_also_guarded(self) -> None:
+        """The load was guarded; the PARSE was not — which is how ICS-006's
+        container bug could have blocked setup entirely.
+        """
+        src = _source("__init__")
+        idx = src.index("restore_from_store(stored_health)")
+        assert "try:" in src[idx - 300 : idx]

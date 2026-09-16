@@ -883,3 +883,107 @@ class TestConnectionHealthPollRecording:
         assert h.consecutive_failures == 0
         assert h.total_failures == 1
         assert h.failure_rate_1h == 50.0
+
+
+# ---------------------------------------------------------------------------
+# ICS-006 (v1.0.1): malformed error_counts CONTAINER
+# ---------------------------------------------------------------------------
+
+
+class TestIcs006ErrorCountsContainer:
+    """Round 4's HVC-012 validated every VALUE inside error_counts but still
+    called .items() on whatever the container happened to be. A persisted
+    list/string/number raised AttributeError — and restore_from_store() is
+    called outside the try/except guarding the LOAD, so it propagated out of
+    async_setup_entry and blocked the integration from loading at all.
+    """
+
+    def test_list_container_does_not_raise(self):
+        h = HovalConnectionHealth()
+        h.restore_from_store({"error_counts": ["timeout", "api"]})
+        assert h.error_counts == {}
+
+    def test_string_container_does_not_raise(self):
+        h = HovalConnectionHealth()
+        h.restore_from_store({"error_counts": "corrupted"})
+        assert h.error_counts == {}
+
+    def test_numeric_container_does_not_raise(self):
+        h = HovalConnectionHealth()
+        h.restore_from_store({"error_counts": 42})
+        assert h.error_counts == {}
+
+    def test_null_container_does_not_raise(self):
+        h = HovalConnectionHealth()
+        h.restore_from_store({"error_counts": None})
+        assert h.error_counts == {}
+
+    def test_other_counters_still_restore_despite_bad_container(self):
+        """A corrupted error_counts must not cost the counters around it."""
+        h = HovalConnectionHealth()
+        h.restore_from_store({"error_counts": "corrupted", "total_polls": 50})
+        assert h.total_polls == 50
+
+    def test_valid_container_still_works(self):
+        h = HovalConnectionHealth()
+        h.restore_from_store({"error_counts": {"timeout": 3}})
+        assert h.error_counts == {"timeout": 3}
+
+
+# ---------------------------------------------------------------------------
+# ICS-004 (v1.0.1): weather-impact READ-path normalizers
+# ---------------------------------------------------------------------------
+
+
+class TestIcs004Normalizers:
+    """Unit-level coverage of the two helpers the six read sites now share."""
+
+    def test_outside_temperature_rejects_non_numeric(self):
+        from custom_components.hoval_connect.coordinator import (
+            normalize_weather_impact_outside_temperature as norm,
+        )
+
+        for bad in ("abc", [], {}, None, True):
+            assert norm(bad) is None
+
+    def test_outside_temperature_rejects_non_finite(self):
+        from custom_components.hoval_connect.coordinator import (
+            normalize_weather_impact_outside_temperature as norm,
+        )
+
+        assert norm(float("nan")) is None
+        assert norm(float("inf")) is None
+
+    def test_outside_temperature_clamps_into_band(self):
+        from custom_components.hoval_connect.coordinator import (
+            normalize_weather_impact_outside_temperature as norm,
+        )
+
+        assert norm(500) == 100
+        assert norm(-500) == 0
+
+    def test_outside_temperature_passes_valid_through(self):
+        from custom_components.hoval_connect.coordinator import (
+            normalize_weather_impact_outside_temperature as norm,
+        )
+
+        assert norm(70) == 70
+
+    def test_solar_radiation_rejects_and_clamps(self):
+        from custom_components.hoval_connect.coordinator import (
+            normalize_weather_impact_solar_radiation as norm,
+        )
+
+        assert norm("abc") is None
+        assert norm(float("nan")) is None
+        assert norm(99) == 0.0
+        assert norm(-99) == -10.0
+        assert norm(-3.5) == -3.5
+
+    def test_numeric_strings_are_accepted(self):
+        """Defensive nicety inherited from _coerce_finite_number()."""
+        from custom_components.hoval_connect.coordinator import (
+            normalize_weather_impact_outside_temperature as norm,
+        )
+
+        assert norm("70") == 70

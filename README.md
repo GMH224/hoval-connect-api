@@ -620,6 +620,6 @@ rather than silently rewritten, so the record matches what was actually
 shipped at the time.
 
 Read the lineage as: `… → 0.21.0 → [2.2.0, i.e. a 0.2x release] → 0.21.1 →
-0.23.0 → 0.24.0 → 0.24.1 → 1.0.0`.
+0.23.0 → 0.24.0 → 0.24.1 → 1.0.0 → 1.0.1`.
 
-If you are rolling back, **0.24.1** is the supported fallback from 1.0.0.
+If you are rolling back, **0.24.1** is the supported fallback from either 1.0.x release.

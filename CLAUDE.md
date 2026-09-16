@@ -386,6 +386,44 @@ mistakes made *in this project* rather than the API:
   back to a bare MagicMock — that reintroduces the un-awaited-coroutine
   warning, and CI now fails on `RuntimeWarning`.
 
+### v1.0.1 — Audit patch (ICS-001/002/004/006/007/008)
+
+Full detail in `docs/audit-v1.0.1.md`. Gotchas:
+
+- **`_committed_task` in number.py/fan.py is load-bearing.** Once a
+  debounced write reaches its API call, `_cancel_debounce()` deliberately
+  refuses to cancel it. Cancelling would not stop the in-flight executor
+  request anyway — it would only release `control_lock` and let a newer
+  write overtake it, so the older value lands last. It is a *task
+  reference*, not a boolean, on purpose: a boolean would make a sleeping
+  task non-cancellable whenever another task was mid-send, silently
+  breaking debouncing under rapid input. Marker must be set AFTER the
+  sleep and cleared in a `finally` — tests pin both.
+- **`_refresh_circuit_values()` escalates on unknown circuits, but only
+  for SUPPORTED types.** Dropping that filter makes every unsupported
+  circuit (SOL, FRIWA) look new every cycle, pinning
+  `_pending_full_refresh_since` on permanently and turning the
+  lightweight health check into a perpetual full fetch. That bug was in
+  the first version of this very fix; its test is the guard.
+- **The six weather-impact read sites share two normalizers.** If you add
+  a seventh place that assigns `weather_impact_*`, route it through them —
+  read and write must agree on what "valid" means.
+- **`restore_from_store()` is guarded at BOTH ends now**: the load and the
+  parse, in `__init__.py`. The load-only guard is what let ICS-006's
+  container bug reach `async_setup_entry`.
+- **`config_flow.py` validates all three persisted options.** Two of them
+  fail *silently* when corrupt (blank selector, the v0.23.0 shape), not
+  loudly — don't assume "no crash" means "no bug" here.
+- **Unload ordering is pinned by a test**: guarded save → cancel tasks →
+  close session → unload platforms. The save must stay the only step
+  allowed to fail silently.
+
+**Method note worth keeping.** ICS-004/006/007 were the same mistake three
+times: fixing the reported line without sweeping for the same shape
+elsewhere. Sweeping first is what found two extra sites in ICS-004 and two
+extra reads in ICS-007. Do the grep before declaring a fix done, and write
+down what you swept.
+
 ### v0.24.0 — Transport rewrite: aiohttp -> requests-in-executor
 
 **This is the important one if you're reading this file to understand why

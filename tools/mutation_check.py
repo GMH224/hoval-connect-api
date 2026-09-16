@@ -68,7 +68,7 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     (
         "revert manifest version to 0.21.1",
         "custom_components/hoval_connect/manifest.json",
-        '"version": "1.0.0"',
+        '"version": "1.0.2"',
         '"version": "0.21.1"',
     ),
     (
@@ -128,8 +128,17 @@ def main() -> int:
             survivors.append(f"{name} [anchor missing]")
             continue
         target.write_text(original.replace(find, replace, 1))
-        caught = not run_suite()
-        target.write_text(original)
+        # ICS-MED-008 (audit v1.0.1): restore in `finally` — if run_suite()
+        # raises (e.g. the subprocess call itself errors) or this script is
+        # interrupted (Ctrl-C) between the mutation write and the restore,
+        # the mutated source was previously left in place on disk. A
+        # backup of the whole tree is still taken above for full recovery,
+        # but this ensures the common case (an exception mid-loop) self-
+        # heals without needing it.
+        try:
+            caught = not run_suite()
+        finally:
+            target.write_text(original)
         print(f"  {'CAUGHT' if caught else 'SURVIVED'}  {name}")
         if not caught:
             survivors.append(name)

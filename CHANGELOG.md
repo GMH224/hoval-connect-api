@@ -4,6 +4,159 @@ All notable changes to the `hoval_connect` integration are documented here.
 This project follows a loose [Semantic Versioning](https://semver.org/) scheme
 while pre-1.0 (minor = behavioural/feature change, patch = internal fix).
 
+## [1.0.2] - 2026-09-16
+
+Full-codebase remediation release. A commissioned, independent ICS-style
+defect analysis covering the entire integration (not triggered by a
+specific incident) returned 40 findings (8 Critical, 23 High, 8 Medium, 1
+Low). Every finding was re-verified against source before any fix was
+written; two were corrected first (see `docs/audit-v1.0.2.md` §1 — one
+downgraded from High to Medium and retitled after finding the code already
+had a partial safeguard the auditor's excerpt hadn't accounted for, one
+reworded because the described data staleness was narrower than the code
+actually allows). All 40 are fixed in this release, including ICS-003 from
+the v1.0.1 changelog above, which was confirmed real at the time and
+deliberately deferred as too large a behaviour change for a patch release.
+
+Full detail, fix-by-fix, in `docs/audit-v1.0.2.md`. Highlights:
+
+- **Cancellation vs. session lifetime (was ICS-CRIT-001/002).** Cancelling
+  the coroutine awaiting a blocking API call never stopped the underlying
+  thread — it kept running against `self._session` regardless, which could
+  race a session close during shutdown/unload. Every blocking job is now
+  wrapped in its own shielded task; the client's `aclose()` genuinely waits
+  for real in-flight work (bounded, so it can't hang unload forever)
+  instead of a caller's cancellation being mistaken for completion.
+- **One global control lock → one lock per circuit (was ICS-CRIT-003).**
+  A slow write to one circuit no longer blocks every other circuit's
+  writes.
+- **Unbounded circuit fan-out (was ICS-CRIT-004).** Concurrent circuit
+  fetches are now capped at 8 in flight.
+- **No positive write confirmation (was ICS-CRIT-005/MED-003).** A write
+  returning HTTP success is not proof the controller applied it. A
+  post-write follow-up read now checks and, on mismatch, surfaces a
+  WARNING and a diagnostics counter instead of silently trusting the 2xx
+  forever. Entity state stays optimistic by design; this is visibility,
+  not a revert.
+- **Retries could duplicate a write (was ICS-CRIT-006).** A
+  timeout/connection-error/retryable-status on a POST/PATCH/DELETE now
+  gets exactly one attempt — repeating it risked executing the same
+  physical command twice. GET/HEAD retry exactly as before.
+- **Offline plant, still-controllable entities (was ICS-CRIT-008 / the
+  v1.0.1 changelog's deferred ICS-003).** Every control entity's
+  `available` now requires its plant to be online, not just its circuit to
+  exist.
+- Plus: identifier validation and URL percent-encoding, a response-size
+  cap, per-page pagination validation, program/duration enum validation,
+  JSON parsing moved off the event loop, retry jitter and `Retry-After`
+  handling, a circuit breaker, a coroutine-factory fix that closed a
+  separate TOCTOU race as a side effect, stale-circuit removal, duplicate-
+  circuit-path handling fixed before the race instead of after, cache/lock
+  reconciliation against live topology, a partial-plant-list guard, an
+  explicit reject path for an unsupported HVAC mode, a UI pending-value
+  race in the fan entity, device-registry cache pruning, log redaction,
+  credential handling in the example script, CI timeouts in the example
+  shell script, exception-safety in the mutation-check tool, a friendlier
+  CLI usage message, and CI hardening (a tag push can no longer bypass
+  tests/lint/HACS/hassfest, and every GitHub Action is now pinned to a
+  commit SHA instead of a floating branch/tag).
+
+497 tests (up from 446), zero warnings under `-W error::RuntimeWarning`,
+`ruff check`/`ruff format --check` clean.
+
+**Rollback target: 1.0.1.** No `HEALTH_STORAGE_VERSION` change. One
+behavioural change relative to 1.0.1 is intentional and documented above:
+offline-plant entities now report unavailable (previously deferred from
+v1.0.1's ICS-003 specifically to avoid this in a patch release — this is
+not a patch release).
+
+## [1.0.1] - 2026-09-11
+
+Patch release. No architecture change, no new capability — six defects
+fixed from an independent ICS-style audit run against the **deployed**
+v1.0.0, commissioned after a real automation raised concrete concurrency
+questions. Full detail in `docs/audit-v1.0.1.md`.
+
+**Rollback target is unchanged: 0.24.1.** Nothing here touches
+`HEALTH_STORAGE_VERSION` or any entity `unique_id`.
+
+### First, what was NOT wrong
+
+The automation that prompted this round — writing outside-temperature
+weighting, then solar-radiation weighting, then program, in close
+succession — **was already safe in v1.0.0**, and the audit's own analysis
+says so. The two number entities hold separate debounce tasks so they
+never cancel each other, `select.py` does not debounce, and all three
+funnel through the coordinator's single `control_lock`. The audit's
+summary nonetheless flagged ICS-001 as the top risk for that scenario,
+which contradicts its own trace. ICS-001 is real, but it needs *the same
+entity* written twice inside 1.5 s — not three different ones.
+
+### Fixed
+
+- **ICS-001 — a cancelled write could still land, and land last.**
+  Cancelling a debounce task that has already begun its HTTP request does
+  not stop the request (it is running in an executor thread), but it does
+  release `control_lock`, letting a newer write overtake it. Cancellation
+  is now refused once a write has committed to its API call; the newer
+  write queues behind it and lands after. Ordering comes from the lock
+  rather than from a cancellation that cannot deliver it. Costs an extra
+  write in that narrow window — strictly better than the wrong final
+  value.
+- **ICS-002 — new circuits were seen every cycle and thrown away.** A
+  circuit added to an already-online plant matched neither topology
+  trigger, so it was silently discarded forever. Self-inflicted one
+  release earlier, and accompanied by a comment claiming a discovery
+  mechanism that did not exist. Now schedules a real discovery refresh.
+  The first version of this fix had its own bug — unsupported circuit
+  types looked "new" every cycle and would have pinned the health check
+  into a permanent full fetch — caught by its own test and fixed.
+- **ICS-004 — malformed weather-impact values could become entity
+  state.** The write path clamped; the read path assigned raw API values
+  straight into `NumberEntity`, so `"abc"`, `NaN`, or `500` could violate
+  the entity's own declared range. A sweep found **six** assignment sites,
+  two more than reported; all now share normalizers that reuse the write
+  path's clamp functions.
+- **ICS-006 — a corrupted diagnostics file could block startup.** Values
+  inside `error_counts` were validated, but not that `error_counts` is a
+  mapping; `.items()` on a persisted list raised through
+  `async_setup_entry`. The container is checked, and the **parse** is now
+  guarded in `__init__.py` — previously only the **load** was.
+- **ICS-007 — corrupt options could crash or blank the options dialog.**
+  The reported unguarded `int()` crashed the form, leaving no UI route to
+  fix the value that caused it. A sweep found **three** unguarded reads;
+  the other two fail quietly instead — a `default=` outside the `vol.In()`
+  keys renders the selector empty, the same shape as the v0.23.0 "Polling
+  interval field renders empty" bug, recurring twice more. All three now
+  validate and fall back.
+- **ICS-008 — a diagnostics save failure could block cleanup.** An
+  exception from `async_save_health()` skipped task cancellation and
+  session close, and failed the unload — which also blocks a reload,
+  escalating a diagnostics-only problem into a stuck integration. Now
+  wrapped; ordering pinned by a test.
+
+### Deferred, deliberately
+
+**ICS-003** (an offline plant leaves control entities available) is
+confirmed real and a genuine v1.0.0 regression — v0.24.x cleared circuits
+on every poll, so entities correctly went unavailable. Held back as a
+behaviour change that does not belong in a patch release. **ICS-009**
+through **ICS-012** confirmed, none affecting the automation above.
+
+### On the pattern
+
+ICS-004, -006 and -007 are the same mistake three times: an earlier fix
+landed on the line it was pointed at without sweeping for the same shape
+elsewhere. That weakness was already named in this project's own v1.0.0
+quality assessment. For this round every fix was preceded by an explicit
+codebase-wide sweep, and what was swept is recorded in the audit document
+— which is how the extra two sites in ICS-004 and the extra two reads in
+ICS-007 were found at all.
+
+446 tests (up from 415), zero warnings under `-W error::RuntimeWarning`,
+ruff clean, 65% coverage (`config_flow.py` 27% → 46%). Still not validated
+against the live API.
+
 ## [1.0.0] - 2026-09-10
 
 **Pre-deployment note:** this entry was amended after an independent code

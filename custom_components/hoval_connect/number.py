@@ -156,12 +156,40 @@ class HovalWeatherImpactNumber(CoordinatorEntity[HovalDataCoordinator], NumberEn
         self._attr_unique_id = f"{plant_id}_{circuit_path}_{description.key}"
         self._attr_device_info = circuit_device_info(plant_id, plant_device_id, circuit_data)
         self._debounce_task: asyncio.Task | None = None
+        # ICS-001: the task (if any) that has passed the debounce sleep and
+        # committed to its API call — see _cancel_debounce().
+        self._committed_task: asyncio.Task | None = None
         self._pending_value: float | None = None
 
     def _cancel_debounce(self) -> None:
-        """Cancel any pending debounce task safely."""
+        """Cancel any pending debounce task — unless it has already committed.
+
+        ICS-001 (independent audit, 2026-09, v1.0.1 round). Cancelling a
+        task that has already begun its HTTP request does NOT stop that
+        request: it was handed to Home Assistant's executor thread pool
+        (see api.py's requests-in-executor transport), and
+        concurrent.futures cancellation only works before a worker picks
+        the job up. What cancellation DOES do is unwind the coroutine,
+        releasing the coordinator's control_lock — which lets the newer
+        write acquire it, run, and finish while the older request is still
+        in flight. The older value can then land LAST and win.
+
+        Fix: cancellation stays effective during the debounce sleep, where
+        it belongs and where nothing has been sent yet. Once a task has
+        committed to the API call it is left alone to complete. The newer
+        write then queues behind it on control_lock and lands after it, so
+        ordering is preserved by the lock rather than by a cancellation
+        that cannot deliver it.
+
+        Cost: in that narrow window both writes are sent instead of one.
+        An extra write with the correct final state is strictly better
+        than one write with the wrong one.
+
+        Tracked per-task (not a bare boolean) so that a task still sleeping
+        remains cancellable even while a different, older task is mid-send.
+        """
         task = self._debounce_task
-        if task is not None and not task.done():
+        if task is not None and not task.done() and task is not self._committed_task:
             task.cancel()
         self._debounce_task = None
 
@@ -171,9 +199,14 @@ class HovalWeatherImpactNumber(CoordinatorEntity[HovalDataCoordinator], NumberEn
         await super().async_will_remove_from_hass()
 
     @property
+    def _plant(self):
+        """Get current plant data from coordinator."""
+        return self.coordinator.data.plants.get(self._plant_id)
+
+    @property
     def _circuit(self) -> HovalCircuitData | None:
         """Get current circuit data from coordinator."""
-        plant = self.coordinator.data.plants.get(self._plant_id)
+        plant = self._plant
         if plant is None:
             return None
         return plant.circuits.get(self._circuit_path)
@@ -186,7 +219,13 @@ class HovalWeatherImpactNumber(CoordinatorEntity[HovalDataCoordinator], NumberEn
         have confirmed this circuit reports weatherImpact, or a still-fresh
         optimistic override to exist (covers the edge case of a control
         action landing before the very first settings poll completes).
+
+        ICS-CRIT-008 (audit v1.0.1): now also requires the plant itself to
+        be online — see the identical fix/rationale in climate.py.
         """
+        plant = self._plant
+        if plant is None or not plant.is_online:
+            return False
         circuit = self._circuit
         if not super().available or circuit is None:
             return False
@@ -246,6 +285,10 @@ class HovalWeatherImpactNumber(CoordinatorEntity[HovalDataCoordinator], NumberEn
         """
         await asyncio.sleep(DEBOUNCE_SECONDS)
         _LOGGER.debug("Debounce complete, sending %s=%s", self.entity_description.key, value)
+        # ICS-001: past this point the write is committed — cancelling it
+        # could no longer stop the HTTP request, only corrupt the ordering.
+        # See _cancel_debounce() for the full reasoning.
+        self._committed_task = asyncio.current_task()
         try:
             await self._send_value(value)
         except HomeAssistantError as err:
@@ -257,6 +300,9 @@ class HovalWeatherImpactNumber(CoordinatorEntity[HovalDataCoordinator], NumberEn
                 self._circuit_path,
                 err,
             )
+        finally:
+            if self._committed_task is asyncio.current_task():
+                self._committed_task = None
 
     async def async_set_native_value(self, value: float) -> None:
         """Set the weighting value (debounced)."""

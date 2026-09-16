@@ -230,13 +230,32 @@ class HovalClient:
 
 
 if __name__ == "__main__":
+    import getpass
+    import os
     import sys
 
-    if len(sys.argv) < 3:
-        print(f"Usage: python {sys.argv[0]} <email> <password>")
-        sys.exit(1)
+    # ICS-MED-006 (audit v1.0.1): credentials are no longer accepted as
+    # positional CLI arguments — those are visible to every other process
+    # on the machine via `ps`/`/proc`, and typically end up in shell
+    # history. Read from the environment (scriptable/CI-friendly) or,
+    # failing that, prompted interactively with `getpass` so the password
+    # is never echoed or persisted anywhere by this example.
+    email = os.environ.get("HOVAL_EMAIL")
+    password = os.environ.get("HOVAL_PASSWORD")
+    if not email:
+        if len(sys.argv) > 1:
+            print(
+                "Note: passing credentials as command-line arguments is no "
+                "longer supported (they'd be visible to other processes on "
+                "this machine). Set HOVAL_EMAIL/HOVAL_PASSWORD, or answer "
+                "the prompts below.",
+                file=sys.stderr,
+            )
+        email = input("Hoval account email: ")
+    if not password:
+        password = getpass.getpass("Hoval account password: ")
 
-    client = HovalClient(sys.argv[1], sys.argv[2])
+    client = HovalClient(email, password)
 
     plants = client.get_plants()
     print(f"Plants: {plants}")

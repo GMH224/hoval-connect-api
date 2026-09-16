@@ -147,17 +147,32 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
         self._attr_device_info = circuit_device_info(plant_id, plant_device_id, circuit_data)
 
     @property
+    def _plant(self):
+        """Get current plant data from coordinator."""
+        return self.coordinator.data.plants.get(self._plant_id)
+
+    @property
     def _circuit(self) -> HovalCircuitData | None:
         """Get current circuit data from coordinator."""
-        plant = self.coordinator.data.plants.get(self._plant_id)
+        plant = self._plant
         if plant is None:
             return None
         return plant.circuits.get(self._circuit_path)
 
     @property
     def available(self) -> bool:
-        """Return if entity is available."""
-        return super().available and self._circuit is not None
+        """Return if entity is available.
+
+        ICS-CRIT-008 (audit v1.0.1): now also requires the plant itself to
+        be online — see the identical fix/rationale in climate.py.
+        """
+        plant = self._plant
+        return (
+            super().available
+            and plant is not None
+            and plant.is_online
+            and self._circuit is not None
+        )
 
     @property
     def current_temperature(self) -> float | None:
@@ -254,7 +269,7 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
         )
         try:
             await self.coordinator.async_control_and_refresh(
-                self.coordinator.api.set_temporary_change(
+                lambda: self.coordinator.api.set_temporary_change(
                     self._plant_id,
                     self._circuit_path,
                     value=float(temperature),
@@ -281,7 +296,7 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
         try:
             if operation_mode == _OP_OFF:
                 await self.coordinator.async_control_and_refresh(
-                    self.coordinator.api.set_program(
+                    lambda: self.coordinator.api.set_program(
                         self._plant_id,
                         self._circuit_path,
                         "standby",
@@ -295,15 +310,22 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
                 # finding (2026-09, HVC-ICS-008 + "more" report finding
                 # #8): preserve week2 if that's actually (freshly-
                 # confirmed) active — see resolve_resume_program().
-                resume_program = await resolve_resume_program(
-                    self.coordinator.api, self._plant_id, self._circuit_path, self._circuit
-                )
-                await self.coordinator.async_control_and_refresh(
-                    self.coordinator.api.reset_circuit(
+                #
+                # ICS-HIGH-018 (audit v1.0.1): the fresh read now happens
+                # inside the factory, under this circuit's lock — see the
+                # identical fix/rationale in climate.py's AUTO branch.
+                async def _resume_and_reset():
+                    resume_program = await resolve_resume_program(
+                        self.coordinator.api, self._plant_id, self._circuit_path, self._circuit
+                    )
+                    return await self.coordinator.api.reset_circuit(
                         self._plant_id,
                         self._circuit_path,
                         program=resume_program,
-                    ),
+                    )
+
+                await self.coordinator.async_control_and_refresh(
+                    _resume_and_reset,
                     plant_id=self._plant_id,
                     circuit_path=self._circuit_path,
                     mode_override=OPERATION_MODE_REGULAR,
@@ -335,7 +357,7 @@ class HovalWaterHeater(CoordinatorEntity[HovalDataCoordinator], WaterHeaterEntit
         )
         try:
             await self.coordinator.async_control_and_refresh(
-                self.coordinator.api.reset_temporary_change(
+                lambda: self.coordinator.api.reset_temporary_change(
                     self._plant_id,
                     self._circuit_path,
                 ),

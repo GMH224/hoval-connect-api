@@ -129,9 +129,14 @@ class HovalProgramSelect(CoordinatorEntity[HovalDataCoordinator], SelectEntity):
         self._attr_device_info = circuit_device_info(plant_id, plant_device_id, circuit_data)
 
     @property
+    def _plant(self):
+        """Get current plant data from coordinator."""
+        return self.coordinator.data.plants.get(self._plant_id)
+
+    @property
     def _circuit(self) -> HovalCircuitData | None:
         """Get current circuit data from coordinator."""
-        plant = self.coordinator.data.plants.get(self._plant_id)
+        plant = self._plant
         if plant is None:
             return None
         return plant.circuits.get(self._circuit_path)
@@ -154,8 +159,18 @@ class HovalProgramSelect(CoordinatorEntity[HovalDataCoordinator], SelectEntity):
 
     @property
     def available(self) -> bool:
-        """Return if entity is available."""
-        return super().available and self._circuit is not None
+        """Return if entity is available.
+
+        ICS-CRIT-008 (audit v1.0.1): now also requires the plant itself to
+        be online — see the identical fix/rationale in climate.py.
+        """
+        plant = self._plant
+        return (
+            super().available
+            and plant is not None
+            and plant.is_online
+            and self._circuit is not None
+        )
 
     @property
     def current_option(self) -> str | None:
@@ -199,7 +214,7 @@ class HovalProgramSelect(CoordinatorEntity[HovalDataCoordinator], SelectEntity):
         mode = OPERATION_MODE_REGULAR if api_program != "standby" else "standby"
         try:
             await self.coordinator.async_control_and_refresh(
-                self.coordinator.api.set_program(
+                lambda: self.coordinator.api.set_program(
                     self._plant_id,
                     self._circuit_path,
                     api_program,

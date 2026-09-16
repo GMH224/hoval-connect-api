@@ -102,17 +102,39 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
         self._attr_device_info = circuit_device_info(plant_id, plant_device_id, circuit_data)
 
     @property
+    def _plant(self):
+        """Get current plant data from coordinator."""
+        return self.coordinator.data.plants.get(self._plant_id)
+
+    @property
     def _circuit(self) -> HovalCircuitData | None:
         """Get current circuit data from coordinator."""
-        plant = self.coordinator.data.plants.get(self._plant_id)
+        plant = self._plant
         if plant is None:
             return None
         return plant.circuits.get(self._circuit_path)
 
     @property
     def available(self) -> bool:
-        """Return if entity is available."""
-        return super().available and self._circuit is not None
+        """Return if entity is available.
+
+        ICS-CRIT-008 (audit v1.0.1): previously only checked that the
+        circuit exists, never that its plant is actually reachable — a
+        plant reporting isOnline=False still had every one of its control
+        entities reporting available and accepting commands the physical
+        controller cannot currently execute. `plant.is_online` also
+        carries forward from the last successful contact (see
+        coordinator.py's topology-carry-forward comments in
+        _health_check()/_fetch_all_data()), so this goes unavailable
+        rather than silently freezing at stale values while offline.
+        """
+        plant = self._plant
+        return (
+            super().available
+            and plant is not None
+            and plant.is_online
+            and self._circuit is not None
+        )
 
     @property
     def current_temperature(self) -> float | None:
@@ -246,7 +268,7 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
         try:
             if hvac_mode == HVACMode.OFF:
                 await self.coordinator.async_control_and_refresh(
-                    self.coordinator.api.set_circuit_mode(
+                    lambda: self.coordinator.api.set_circuit_mode(
                         self._plant_id,
                         self._circuit_path,
                         OPERATION_MODE_STANDBY,
@@ -257,7 +279,7 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
                 )
             elif hvac_mode == HVACMode.HEAT:
                 await self.coordinator.async_control_and_refresh(
-                    self.coordinator.api.set_program(
+                    lambda: self.coordinator.api.set_program(
                         self._plant_id,
                         self._circuit_path,
                         "constant",
@@ -270,18 +292,42 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
                 # Independent audit finding (2026-09, HVC-ICS-008 + "more"
                 # report finding #8): preserve week2 if that's actually
                 # (freshly-confirmed) active — see resolve_resume_program().
-                resume_program = await resolve_resume_program(
-                    self.coordinator.api, self._plant_id, self._circuit_path, self._circuit
-                )
-                await self.coordinator.async_control_and_refresh(
-                    self.coordinator.api.reset_circuit(
+                #
+                # ICS-HIGH-018 (audit v1.0.1): the resolve_resume_program()
+                # fresh read now happens INSIDE the factory, which
+                # async_control_and_refresh only calls once it holds this
+                # circuit's lock — previously the read happened before the
+                # lock was even requested, leaving a window where another
+                # control action on this same circuit could land between
+                # the read and the write it was meant to inform.
+                async def _resume_and_reset():
+                    resume_program = await resolve_resume_program(
+                        self.coordinator.api, self._plant_id, self._circuit_path, self._circuit
+                    )
+                    return await self.coordinator.api.reset_circuit(
                         self._plant_id,
                         self._circuit_path,
                         program=resume_program,
-                    ),
+                    )
+
+                await self.coordinator.async_control_and_refresh(
+                    _resume_and_reset,
                     plant_id=self._plant_id,
                     circuit_path=self._circuit_path,
                     mode_override=OPERATION_MODE_REGULAR,
+                )
+            else:
+                # ICS-HIGH-019 (audit v1.0.1): every other branch above is an
+                # explicit `elif`, so an hvac_mode this entity does not
+                # actually advertise (HA's climate base class does not
+                # enforce hvac_mode against hvac_modes at the entity-method
+                # level; a broken automation/service call, or a future
+                # HVACMode added to a caller's assumptions, can reach here)
+                # used to fall through silently: no write, no error, no
+                # indication anything went wrong. Now rejected explicitly.
+                raise HomeAssistantError(
+                    f"Unsupported HVAC mode for this entity: {hvac_mode!r}. "
+                    f"Supported modes: {self._attr_hvac_modes}"
                 )
         except HovalApiError as err:
             raise HomeAssistantError(f"Failed to set HVAC mode: {err}") from err
@@ -318,7 +364,7 @@ class HovalClimate(CoordinatorEntity[HovalDataCoordinator], ClimateEntity):
             duration = DEFAULT_OVERRIDE_DURATION
         try:
             await self.coordinator.async_control_and_refresh(
-                self.coordinator.api.set_temporary_change(
+                lambda: self.coordinator.api.set_temporary_change(
                     self._plant_id,
                     self._circuit_path,
                     value=float(temperature),

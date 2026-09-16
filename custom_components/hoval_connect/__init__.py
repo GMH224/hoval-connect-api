@@ -104,6 +104,24 @@ class HovalPlantDevices:
         self._device_ids[plant_id] = device.id
         return device.id
 
+    @callback
+    def async_prune(self, valid_plant_ids: set[str]) -> None:
+        """Forget cached device IDs for plants no longer part of the account.
+
+        ICS-MED-004 (audit v1.0.1): `_device_ids` previously grew forever —
+        a plant permanently removed from the Hoval account (not just
+        temporarily offline) stayed cached here indefinitely. Only clears
+        the LOCAL cache; the actual device-registry entry (and any
+        orphaned circuit devices under it) is left for HA's own device-
+        registry cleanup, since removing it here without also removing/
+        reassigning any entities still pointing at it via `via_device_id`
+        could raise `DeviceInfoError` on the next entity update. If the
+        plant reappears later, `async_get_device_id()` will re-resolve
+        (and, if it still exists, reuse) the same registry entry.
+        """
+        for plant_id in [p for p in self._device_ids if p not in valid_plant_ids]:
+            del self._device_ids[plant_id]
+
 
 @dataclass
 class HovalRuntimeData:
@@ -281,13 +299,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: HovalConnectConfigEntry)
             )
             stored_health = None
         if stored_health and isinstance(stored_health, dict):
-            coordinator.connection_health.restore_from_store(stored_health)
-            _LOGGER.debug(
-                "Restored health counters: total_polls=%d total_failures=%d ema=%.0f ms",
-                coordinator.connection_health.total_polls,
-                coordinator.connection_health.total_failures,
-                coordinator.connection_health.ema_latency_ms or 0,
-            )
+            # ICS-006 (independent audit, 2026-09, v1.0.1 round): the parse
+            # is guarded too, not just the load above. restore_from_store()
+            # is defensive field-by-field, but it is the LAST line of
+            # defence for a file this integration does not control — and
+            # the audit found a container-type gap in it that would have
+            # propagated straight out of async_setup_entry and blocked the
+            # whole integration from loading. Persisted health counters are
+            # diagnostics: losing them is a non-event, failing setup over
+            # them is not. Belt-and-braces on purpose.
+            try:
+                coordinator.connection_health.restore_from_store(stored_health)
+            except Exception:  # noqa: BLE001 — corrupted diagnostics must never block setup
+                _LOGGER.warning(
+                    "Persisted health counters could not be parsed — starting fresh.",
+                    exc_info=True,
+                )
+            else:
+                _LOGGER.debug(
+                    "Restored health counters: total_polls=%d total_failures=%d ema=%.0f ms",
+                    coordinator.connection_health.total_polls,
+                    coordinator.connection_health.total_failures,
+                    coordinator.connection_health.ema_latency_ms or 0,
+                )
 
         await coordinator.async_config_entry_first_refresh()
 
@@ -307,6 +341,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: HovalConnectConfigEntry)
     for plant_id, plant_data in coordinator.data.plants.items():
         plant_devices.async_get_device_id(plant_id, plant_data)
 
+    # ICS-MED-004 (audit v1.0.1): prune cached plant-device IDs for plants no
+    # longer reported, on every subsequent successful update — see
+    # HovalPlantDevices.async_prune()'s docstring. Registered AFTER the
+    # initial registration loop above so it never races the very first
+    # population of `_device_ids`.
+    entry.async_on_unload(
+        coordinator.async_add_listener(
+            lambda: plant_devices.async_prune(set(coordinator.data.plants))
+        )
+    )
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # NOTE: deliberately no entry.add_update_listener() here. The options flow is
@@ -319,11 +364,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: HovalConnectConfigEntry)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: HovalConnectConfigEntry) -> bool:
-    """Unload a config entry, flushing health counters to storage first."""
+    """Unload a config entry, flushing health counters to storage first.
+
+    ICS-008 (independent audit, 2026-09, v1.0.1 round): the health-counter
+    save is wrapped so that a failure there cannot skip the two cleanup
+    steps that follow. Previously an exception from async_save_health()
+    (a full disk, a permissions problem, a serialisation bug) propagated
+    straight out of this function, leaving pending background tasks
+    uncancelled AND the requests.Session unclosed — and, because unload
+    failed, Home Assistant would also refuse to complete a reload,
+    compounding a diagnostics-only problem into a stuck integration.
+
+    Ordering is deliberate and must not be "tidied": cancel background
+    tasks BEFORE closing the session (a post-write refresh sleeping
+    through its settle delay would otherwise wake into a closed session —
+    "more" report finding #7), and close the session before unloading
+    platforms.
+
+    Priority when things go wrong: losing persisted diagnostics counters
+    is a non-event; leaking a connection pool or leaving orphaned tasks is
+    not. The save is therefore the only step allowed to fail silently.
+    """
     coordinator = entry.runtime_data.coordinator
     # Force an immediate save so counters are not lost on a clean shutdown even
     # if the debounced save (triggered after each successful poll) hasn't fired.
-    await coordinator.async_save_health()
+    try:
+        await coordinator.async_save_health()
+    except Exception:  # noqa: BLE001 — see docstring: never block cleanup for diagnostics
+        _LOGGER.warning(
+            "Could not persist health counters during unload; continuing with "
+            "cleanup (counters will restart from zero).",
+            exc_info=True,
+        )
     # Independent audit finding (2026-09, "more" report, finding #7): cancel
     # any post-write refresh task that might still be sleeping through its
     # 2-second settle delay BEFORE closing the API session below — otherwise

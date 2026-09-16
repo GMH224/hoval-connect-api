@@ -28,6 +28,8 @@ from .const import (
     TURN_ON_RESUME,
     TURN_ON_WEEK1,
     TURN_ON_WEEK2,
+    VALID_OVERRIDE_DURATIONS,
+    VALID_TURN_ON_MODES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -93,7 +95,9 @@ class HovalConnectConfigFlow(ConfigFlow, domain=DOMAIN):
                     },
                 )
             finally:
-                await api.aclose()
+                # ICS-HIGH-021 (audit v1.0.1): shielded — see the identical
+                # fix/rationale in async_step_reauth_confirm() below.
+                await asyncio.shield(api.aclose())
 
         return self.async_show_form(
             step_id="user",
@@ -142,7 +146,15 @@ class HovalConnectConfigFlow(ConfigFlow, domain=DOMAIN):
                         },
                     )
                 finally:
-                    await api.aclose()
+                    # ICS-HIGH-021 (audit v1.0.1): this `finally` can run
+                    # while still inside the `asyncio.timeout()` scope above
+                    # (e.g. right after it expired) — an unshielded await
+                    # here could be cancelled again by that same expired
+                    # deadline before the session actually closes.
+                    # `asyncio.shield()` lets aclose()'s own bounded
+                    # drain-then-close (ICS-CRIT-002, api.py) run to
+                    # completion regardless.
+                    await asyncio.shield(api.aclose())
 
         return self.async_show_form(
             step_id="reauth_confirm",
@@ -178,15 +190,47 @@ class HovalConnectOptionsFlow(OptionsFlowWithReload):
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
+        # ICS-007 (independent audit, 2026-09, v1.0.1 round): every value
+        # read here is persisted config-entry data — i.e. untrusted input
+        # from this code's point of view, reachable via hand-edited
+        # storage, a migration bug, or a build that offered different
+        # choices. The audit reported the unguarded int() below; a sweep
+        # for the same shape found all THREE reads needed treatment, not
+        # one.
+        #
+        # The int() case is the loud one: a non-numeric persisted value
+        # raises ValueError inside async_step_init, which crashes the
+        # options dialog and leaves the user no UI route to correct the
+        # bad value that caused it — precisely the state where they most
+        # need the form to open.
+        #
+        # The other two fail quietly instead, and that shape has bitten
+        # this project before: a `default=` that is not one of the
+        # vol.In() keys renders the selector EMPTY rather than erroring
+        # (see the v0.23.0 "Polling interval field renders empty" fix in
+        # CHANGELOG.md). Falling back to the documented default keeps the
+        # form usable and self-correcting — saving it writes a valid value
+        # back.
         current_duration = self.config_entry.options.get(
             CONF_OVERRIDE_DURATION, DEFAULT_OVERRIDE_DURATION
         )
+        if current_duration not in VALID_OVERRIDE_DURATIONS:
+            current_duration = DEFAULT_OVERRIDE_DURATION
+
         current_turn_on = self.config_entry.options.get(CONF_TURN_ON_MODE, DEFAULT_TURN_ON_MODE)
-        current_interval = int(
-            self.config_entry.options.get(
-                CONF_HEALTH_CHECK_INTERVAL, DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+        if current_turn_on not in VALID_TURN_ON_MODES:
+            current_turn_on = DEFAULT_TURN_ON_MODE
+
+        try:
+            current_interval = int(
+                self.config_entry.options.get(
+                    CONF_HEALTH_CHECK_INTERVAL, DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+                )
             )
-        )
+        except (TypeError, ValueError):
+            current_interval = DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
+        if current_interval not in HEALTH_CHECK_INTERVAL_OPTIONS:
+            current_interval = DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(

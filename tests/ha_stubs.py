@@ -299,6 +299,15 @@ class StubCoordinatorEntity(StubEntity):
         """CoordinatorEntity[HovalDataCoordinator] -> the class itself."""
         return cls
 
+    @property
+    def available(self) -> bool:
+        """Mirror the real CoordinatorEntity.available: tracks the
+        coordinator's last update success. Entity subclasses that
+        override `available` (all of this integration's do, ANDing in
+        their own circuit/plant checks) call `super().available` into
+        this."""
+        return getattr(self.coordinator, "last_update_success", True)
+
     def async_write_ha_state(self) -> None:
         """No-op state write."""
 
